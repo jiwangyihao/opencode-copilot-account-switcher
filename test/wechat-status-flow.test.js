@@ -11,17 +11,10 @@ const DIST_BROKER_CLIENT_MODULE = "../dist/wechat/broker-client.js"
 const DIST_BRIDGE_MODULE = "../dist/wechat/bridge.js"
 const DIST_BROKER_MUTATION_QUEUE_MODULE = "../dist/wechat/broker-mutation-queue.js"
 
-const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-status-flow-config-"))
-const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-process.env.XDG_CONFIG_HOME = sandboxConfigHome
+const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-status-flow-config-")
 
 after(async () => {
-  if (previousXdgConfigHome === undefined) {
-    delete process.env.XDG_CONFIG_HOME
-  } else {
-    process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-  }
-  await rm(sandboxConfigHome, { recursive: true, force: true })
+  await isolatedWechatStateRoot.restore()
 })
 
 function createBrokerEndpoint(tempDir) {

@@ -143,9 +143,7 @@ test("两个实例出现相同 question/permission/session 标识时不会互相
 })
 
 test("同一 retry 状态持续不重复新增，但新 retry 事件应生成新 sessionError 记录", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-retry-event-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-retry-event-")
 
   const bridgeModule = await import(`${DIST_BRIDGE_MODULE}?reload=${Date.now()}`)
   const operatorStore = await import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}`)
@@ -189,12 +187,7 @@ test("同一 retry 状态持续不重复新增，但新 retry 事件应生成新
     assert.equal(secondKey, firstKey)
     assert.notEqual(thirdKey, secondKey)
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
@@ -325,9 +318,7 @@ test("register 时 collectNotificationCandidates 抛错不应拖垮主链路", a
 })
 
 test("重复同步同一请求复用 canonical request handle，且终态不视为 open/replyable", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-canonical-request-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-canonical-request-")
 
   const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}`)
   const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}`)
@@ -468,19 +459,12 @@ test("重复同步同一请求复用 canonical request handle，且终态不视�
   } finally {
     socket.destroy()
     await server.close().catch(() => {})
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("并发 sync 新请求时 broker 分配的 open handle 必须唯一", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-concurrent-handle-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-concurrent-handle-")
 
   const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}`)
   const operatorStore = await import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}`)
@@ -588,19 +572,12 @@ test("并发 sync 新请求时 broker 分配的 open handle 必须唯一", async
     first.socket.destroy()
     second.socket.destroy()
     await server.close().catch(() => {})
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：总开关关闭时不发送任何通知", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-global-off-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-global-off-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -653,19 +630,12 @@ test("通知分发：总开关关闭时不发送任何通知", async () => {
     const record = JSON.parse(await readFile(statePaths.notificationStatePath("task4-global-off-question-1"), "utf8"))
     assert.equal(record.status, "pending")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：question/permission/sessionError 各自受子开关控制", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-kind-switch-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-kind-switch-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -749,19 +719,12 @@ test("通知分发：question/permission/sessionError 各自受子开关控制",
     assert.equal(permissionRecord.status, "sent")
     assert.equal(sessionErrorRecord.status, "pending")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：缺少 primaryBinding.userId 时不发送", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-missing-user-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-missing-user-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -804,19 +767,12 @@ test("通知分发：缺少 primaryBinding.userId 时不发送", async () => {
     const record = JSON.parse(await readFile(statePaths.notificationStatePath("task4-missing-user-question"), "utf8"))
     assert.equal(record.status, "pending")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：发送成功后记录 sent", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-sent-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-sent-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -866,19 +822,12 @@ test("通知分发：发送成功后记录 sent", async () => {
     assert.equal(record.status, "sent")
     assert.equal(typeof record.sentAt, "number")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：发送失败后记录 failed，且同一轮 drain 不会无限重试", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-failed-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-failed-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -922,19 +871,12 @@ test("通知分发：发送失败后记录 failed，且同一轮 drain 不会无
     assert.equal(typeof record.failedAt, "number")
     assert.match(String(record.failureReason), /mock-send-failed/i)
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：failed 记录只有在 token 已重新激活后才会回到 pending，并携带 live contextToken 发送", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-reactivate-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-reactivate-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -1056,19 +998,12 @@ test("通知分发：failed 记录只有在 token 已重新激活后才会回到
     const sentRecord = JSON.parse(await readFile(statePaths.notificationStatePath("task4-reactivated-question"), "utf8"))
     assert.equal(sentRecord.status, "sent")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：token stale 时 pending 保持不可发送，token live 后才会使用持久化 contextToken 发送", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-stale-skip-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-stale-skip-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -1142,19 +1077,12 @@ test("通知分发：token stale 时 pending 保持不可发送，token live 后
     const sentAfterReactivation = JSON.parse(await readFile(statePaths.notificationStatePath("task4-stale-pending-question"), "utf8"))
     assert.equal(sentAfterReactivation.status, "sent")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：stale 期间积压的 sessionError 在重新激活后不会被补发为陈旧告警", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-session-error-reactivation-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-session-error-reactivation-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -1218,19 +1146,12 @@ test("通知分发：stale 期间积压的 sessionError 在重新激活后不会
     assert.equal(suppressedAfterReactivation.status, "suppressed")
     assert.equal(typeof suppressedAfterReactivation.suppressedAt, "number")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：并发 drain 竞争下，已 sent 记录不会被失败分支回写成 failed", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-concurrent-race-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-concurrent-race-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -1328,12 +1249,7 @@ test("通知分发：并发 drain 竞争下，已 sent 记录不会被失败分�
     assert.equal(record.status, "sent")
     assert.equal(record.failureReason, undefined)
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
@@ -1472,9 +1388,7 @@ test("通知文案格式化：permission 输出标题 类型 与 allow 动作说
 })
 
 test("通知分发：发送成功后若 markNotificationSent 因竞争失败，不应降级写成 failed", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-race-sent-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-race-sent-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -1533,19 +1447,12 @@ test("通知分发：发送成功后若 markNotificationSent 因竞争失败，�
     assert.equal(record.status, "sent")
     assert.equal(record.failureReason, undefined)
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：rebind 后 binding 与记录不一致时，旧 pending 不应发送给新用户", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-rebind-filter-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-rebind-filter-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -1599,19 +1506,12 @@ test("通知分发：rebind 后 binding 与记录不一致时，旧 pending 不�
     const record = JSON.parse(await readFile(statePaths.notificationStatePath("task4-rebind-old-user-question"), "utf8"))
     assert.equal(record.status, "pending")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：已终态 request 对应的 pending 通知会被 suppress，不会后续补发", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-terminal-suppress-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-terminal-suppress-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -1671,19 +1571,12 @@ test("通知分发：已终态 request 对应的 pending 通知会被 suppress�
     assert.equal(record.status, "suppressed")
     assert.equal(typeof record.suppressedAt, "number")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：同一 sessionError 在未恢复前跨多轮 drain 仅发送一次", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-session-error-no-spam-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-session-error-no-spam-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}`)
@@ -1726,20 +1619,13 @@ test("通知分发：同一 sessionError 在未恢复前跨多轮 drain 仅发�
     const record = JSON.parse(await readFile(statePaths.notificationStatePath("task6-session-error-no-spam"), "utf8"))
     assert.equal(record.status, "sent")
   } finally {
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("通知分发：drain 会按保留窗口清理过期终态通知", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-dispatch-retention-cleanup-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-retention-cleanup-")
   const previousRetentionMs = process.env.WECHAT_NOTIFICATION_TERMINAL_RETENTION_MS
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
   process.env.WECHAT_NOTIFICATION_TERMINAL_RETENTION_MS = "500"
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
@@ -1819,19 +1705,12 @@ test("通知分发：drain 会按保留窗口清理过期终态通知", async ()
     } else {
       process.env.WECHAT_NOTIFICATION_TERMINAL_RETENTION_MS = previousRetentionMs
     }
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })
 
 test("broker 重启后重复同步同一 open request 不重发；出现新 open requestID 后可再次发送", async () => {
-  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-restart-dedupe-"))
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxConfigHome
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-restart-dedupe-")
 
   const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}`)
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
@@ -1971,11 +1850,6 @@ test("broker 重启后重复同步同一 open request 不重发；出现新 open
     assert.equal(sendCalls, 2)
   } finally {
     await server.close().catch(() => {})
-    await rm(statePaths.wechatStateRoot(), { recursive: true, force: true }).catch(() => {})
-    if (previousXdgConfigHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME
-    } else {
-      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-    }
+    await isolatedWechatStateRoot.restore()
   }
 })

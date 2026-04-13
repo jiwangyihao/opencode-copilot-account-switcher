@@ -198,6 +198,7 @@ export async function loadOpenClawWeixinBindHelpers(): Promise<OpenClawWeixinBin
             activeLogins.delete(sessionKey)
             return {
               connected: true,
+              botToken: asNonEmptyString(statusResponse.bot_token),
               accountId: asNonEmptyString(statusResponse.ilink_bot_id),
               baseUrl: asNonEmptyString(statusResponse.baseurl),
               userId: asNonEmptyString(statusResponse.ilink_user_id),

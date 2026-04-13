@@ -59,6 +59,10 @@ export function tokenStatePath(wechatAccountId: string, userId: string) {
   return path.join(tokensDir(), wechatAccountId, `${userId}.json`)
 }
 
+export function latestAccountStatePath(stateRoot: string = wechatStateRoot()) {
+  return path.join(stateRoot, "latest-account.json")
+}
+
 export function notificationsDir() {
   return path.join(wechatStateRoot(), "notifications")
 }

@@ -1,16 +1,13 @@
 import test, { after, beforeEach } from "node:test"
 import assert from "node:assert/strict"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
-import os from "node:os"
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
-const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-token-store-"))
-const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-process.env.XDG_CONFIG_HOME = sandboxConfigHome
+const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-token-store-")
 
-after(() => {
-  if (previousXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
-  else process.env.XDG_CONFIG_HOME = previousXdgConfigHome
+after(async () => {
+  await isolatedWechatStateRoot.restore()
 })
 
 const tokenStore = await import("../dist/wechat/token-store.js")

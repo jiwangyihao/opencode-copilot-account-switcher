@@ -4,6 +4,7 @@ import { buildOpenClawMenuAccount } from "./openclaw-account-adapter.js"
 import { loadQrCodeTerminal } from "./compat/qrcode-terminal-loader.js"
 import type { CommonSettingsStore } from "../common-settings-store.js"
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id"
+import { writeWechatLatestAccountState } from "./latest-account-state-store.js"
 
 type BindAction = "wechat-bind" | "wechat-rebind"
 const DEFAULT_QR_WAIT_TIMEOUT_MS = 480000
@@ -154,6 +155,9 @@ export async function runWechatBindFlow(input: WechatBindFlowInput): Promise<Wec
     )
     let menuAccount: Awaited<ReturnType<typeof buildOpenClawMenuAccount>>
     let boundUserId = ""
+    const botToken = pickFirstNonEmptyString(
+      (waited as { botToken?: unknown } | null | undefined)?.botToken,
+    )
     let shouldRollbackBinding = false
     let attemptedOperatorBinding: Awaited<ReturnType<typeof readOperatorBinding>>
     try {
@@ -209,6 +213,14 @@ export async function runWechatBindFlow(input: WechatBindFlowInput): Promise<Wec
       }
 
       await input.writeCommonSettings(settings)
+
+      if (botToken) {
+        await writeWechatLatestAccountState({
+          accountId,
+          token: botToken,
+          baseUrl: pickFirstNonEmptyString((waited as { baseUrl?: unknown } | null | undefined)?.baseUrl, menuAccountState.baseUrl) ?? "https://ilinkai.weixin.qq.com",
+        })
+      }
     } catch (error) {
       if (shouldRollbackBinding) {
         const currentOperatorBinding = await loadOperatorBinding().catch(() => undefined)

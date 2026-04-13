@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises"
 import { createRequire } from "node:module"
 import path from "node:path"
 import { loadModuleWithTsFallback } from "./jiti-loader.js"
+import { readWechatLatestAccountState } from "../latest-account-state-store.js"
 
 export type PublicWeixinPersistGetUpdatesBuf = (params: {
   accountId: string
@@ -54,6 +55,11 @@ export async function loadLatestWeixinAccountState(options: {
   stateDirModulePath?: string
   syncBufModulePath?: string
 } = {}): Promise<{ accountId: string; token: string; baseUrl: string; getUpdatesBuf?: string } | null> {
+  const pluginOwned = await readWechatLatestAccountState()
+  if (pluginOwned) {
+    return pluginOwned
+  }
+
   const require = createRequire(import.meta.url)
   const stateDirModulePath = require.resolve(options.stateDirModulePath ?? OPENCLAW_STATE_DIR_MODULE)
   const stateDirModule = await loadModuleWithTsFallback(stateDirModulePath, { parentURL: import.meta.url }) as { resolveStateDir?: () => string }

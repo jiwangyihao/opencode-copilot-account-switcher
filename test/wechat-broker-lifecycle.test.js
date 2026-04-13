@@ -8,6 +8,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { mkdtemp, readFile, stat, access, writeFile, rm, readdir } from "node:fs/promises"
 import { mkdirSync, readFileSync } from "node:fs"
+import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
 const DIST_PROTOCOL_MODULE = "../dist/wechat/protocol.js"
 const DIST_AUTH_MODULE = "../dist/wechat/ipc-auth.js"
@@ -1380,14 +1381,14 @@ test("broker-entry 支持 tcp endpoint 并把 broker.json 写成真实监听地�
 test("真实默认 spawn + 自定义 stateRoot 时，broker.json 写入自定义 root 且不触碰默认 wechat 根目录", async () => {
   const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-launcher-real-custom-root-"))
-  const sandboxDefaultConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-default-root-"))
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-broker-default-root-")
+  const sandboxDefaultConfigHome = isolatedWechatStateRoot.sandboxConfigHome
   const customStateRoot = path.join(sandboxConfigHome, "custom", "wechat")
   const customBrokerJsonPath = path.join(customStateRoot, "broker.json")
   const defaultWechatRoot = path.join(sandboxDefaultConfigHome, "opencode", "account-switcher", "wechat")
   const defaultBrokerJsonPath = path.join(defaultWechatRoot, "broker.json")
 
-  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
-  process.env.XDG_CONFIG_HOME = sandboxDefaultConfigHome
+  delete process.env.WECHAT_STATE_ROOT_OVERRIDE
 
   let metadata = null
   try {
@@ -1405,12 +1406,11 @@ test("真实默认 spawn + 自定义 stateRoot 时，broker.json 写入自定义
     await assert.rejects(() => access(defaultWechatRoot), (error) => error?.code === "ENOENT")
     await assert.rejects(() => access(defaultBrokerJsonPath), (error) => error?.code === "ENOENT")
   } finally {
-    process.env.XDG_CONFIG_HOME = previousXdgConfigHome
-
     const pid = metadata?.pid
     if (typeof pid === "number" && isProcessAlive(pid)) {
       await killProcessByPid(pid)
     }
+    await isolatedWechatStateRoot.restore()
   }
 })
 

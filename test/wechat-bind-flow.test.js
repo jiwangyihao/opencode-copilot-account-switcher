@@ -1,5 +1,8 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { readFile } from "node:fs/promises"
+import path from "node:path"
+import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
 async function loadBindFlowOrFail() {
   try {
@@ -149,6 +152,42 @@ test("wechat bind flow writes binding status to common settings", async () => {
     configured: true,
     boundAt: 1711000000000,
   })
+})
+
+test("wechat bind flow persists latest account state for runtime polling", async () => {
+  const { runWechatBindFlow } = await loadBindFlowOrFail()
+  const isolated = await setupIsolatedWechatStateRoot("wechat-bind-flow-account-state-")
+
+  try {
+    await runWechatBindFlow({
+      action: "wechat-bind",
+      loadPublicHelpers: async () => ({
+        qrGateway: {
+          loginWithQrStart: () => ({ sessionKey: "s-runtime", qrDataUrl: "https://example.test/qr-runtime" }),
+          loginWithQrWait: () => ({ connected: true, accountId: "acc-runtime", userId: "user-runtime", botToken: "token-runtime", baseUrl: "https://runtime.example" }),
+        },
+        accountHelpers: {
+          listAccountIds: async () => ["acc-runtime"],
+          resolveAccount: async () => ({ enabled: true, name: "Runtime Account", userId: "user-runtime" }),
+          describeAccount: async () => ({ configured: true }),
+        },
+      }),
+      bindOperator: async (binding) => binding,
+      readCommonSettings: async () => ({ wechat: { notifications: { enabled: true, question: true, permission: true, sessionError: true } } }),
+      writeCommonSettings: async () => {},
+      now: () => 1711000001234,
+    })
+
+    const latestAccountPath = path.join(isolated.stateRoot, "latest-account.json")
+    const latestAccount = JSON.parse(await readFile(latestAccountPath, "utf8"))
+    assert.deepEqual(latestAccount, {
+      accountId: "acc-runtime",
+      token: "token-runtime",
+      baseUrl: "https://runtime.example",
+    })
+  } finally {
+    await isolated.restore()
+  }
 })
 
 test("wechat bind flow throws explicit error when binding fails", async () => {
