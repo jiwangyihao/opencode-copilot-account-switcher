@@ -1292,6 +1292,50 @@ test("launcher 遇到版本落后的 broker 会先退役旧进程再拉起当前
   assert.match(diagnosticsRaw, /"nextVersion":"0.14.9"/)
 })
 
+test("launcher 遇到同 minor 下更高补丁版本 broker 时直接复用，不回退接管", async () => {
+  const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-launcher-higher-patch-"))
+  const stateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+  const brokerJsonPath = path.join(stateRoot, "broker.json")
+  const diagnosticsPath = path.join(stateRoot, "wechat-broker.diagnostics.jsonl")
+  const endpoint = createBrokerEndpoint(sandboxConfigHome)
+
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  await writeFile(
+    brokerJsonPath,
+    JSON.stringify({ pid: 48001, endpoint, startedAt: Date.now() - 1000, version: "0.14.40" }, null, 2),
+    "utf8",
+  )
+
+  let spawned = 0
+  const retired = []
+
+  const result = await launcher.connectOrSpawnBroker({
+    stateRoot,
+    brokerJsonPath,
+    expectedVersion: "0.14.39",
+    backoffMs: 10,
+    maxAttempts: 3,
+    endpointFactory: () => createBrokerEndpoint(`${sandboxConfigHome}-unused`),
+    pingImpl: async (candidateEndpoint) => candidateEndpoint === endpoint,
+    spawnImpl: () => {
+      spawned += 1
+      return { pid: 49001, unref() {} }
+    },
+    retireBrokerImpl: async (candidate) => {
+      retired.push(candidate)
+    },
+  })
+
+  assert.equal(result.endpoint, endpoint)
+  assert.equal(result.version, "0.14.40")
+  assert.equal(spawned, 0)
+  assert.equal(retired.length, 0)
+
+  const diagnosticsExists = await access(diagnosticsPath).then(() => true).catch(() => false)
+  assert.equal(diagnosticsExists, false)
+})
+
 test("Windows Bun runtime 下默认 broker endpoint 应切到 tcp 回环地址", async () => {
   const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
 

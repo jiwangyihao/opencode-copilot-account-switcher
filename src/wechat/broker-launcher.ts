@@ -86,6 +86,53 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value)
 }
 
+type ParsedBrokerVersion = {
+  major: number
+  minor: number
+  patch: number
+}
+
+function parseBrokerVersion(version: string): ParsedBrokerVersion | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version.trim())
+  if (!match) {
+    return null
+  }
+
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+  }
+}
+
+function isBrokerVersionCompatible(candidateVersion: string, expectedVersion: string): boolean {
+  const candidate = parseBrokerVersion(candidateVersion)
+  const expected = parseBrokerVersion(expectedVersion)
+  if (!candidate || !expected) {
+    return candidateVersion === expectedVersion
+  }
+
+  if (candidate.major !== expected.major || candidate.minor !== expected.minor) {
+    return false
+  }
+
+  return candidate.patch >= expected.patch
+}
+
+function shouldRetireBrokerForVersion(candidateVersion: string, expectedVersion: string): boolean {
+  const candidate = parseBrokerVersion(candidateVersion)
+  const expected = parseBrokerVersion(expectedVersion)
+  if (!candidate || !expected) {
+    return candidateVersion !== expectedVersion
+  }
+
+  if (candidate.major !== expected.major || candidate.minor !== expected.minor) {
+    return true
+  }
+
+  return candidate.patch < expected.patch
+}
+
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -229,7 +276,7 @@ async function isBrokerAlive(
     return null
   }
 
-  if (isNonEmptyString(expectedVersion) && metadata.version !== expectedVersion) {
+  if (isNonEmptyString(expectedVersion) && !isBrokerVersionCompatible(metadata.version, expectedVersion)) {
     return null
   }
 
@@ -249,7 +296,7 @@ async function readVersionMismatchedBroker(
     return null
   }
 
-  if (!isNonEmptyString(expectedVersion) || metadata.version === expectedVersion) {
+  if (!isNonEmptyString(expectedVersion) || !shouldRetireBrokerForVersion(metadata.version, expectedVersion)) {
     return null
   }
 
