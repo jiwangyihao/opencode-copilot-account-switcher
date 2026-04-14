@@ -71,7 +71,14 @@
 
 ### 1. 协议边界
 
-这次不是重做整套协议名，而是**增量扩展现有 `src/wechat/protocol.ts`**。如果当前文件里已经有 `replyQuestion` / `replyPermission` 之类占位类型，则应直接把它们落成真实可用消息，不再另起一套平行命名。
+这次不是重做整套协议名，而是**增量扩展现有 `src/wechat/protocol.ts`**。如果当前文件里已经有 `replyQuestion` / `replyPermission` 之类占位类型，则应直接把它们落成真实可用消息，不再另起一套平行命名。为避免歧义，这份 spec 后文统一使用：
+
+- `replyQuestionRequest`
+- `replyQuestionResult`
+- `replyPermissionRequest`
+- `replyPermissionResult`
+
+如果实现时决定沿用更短的现有字段名，也必须在 `protocol.ts` 里保持一套名字前后一致，不能一半叫 `replyQuestion`、一半叫 `questionReplyRequest`。
 
 无论最终沿用现名还是做一次统一重命名，协议都必须明确包含两类消息：
 
@@ -104,7 +111,7 @@ type ReplyMutationResult = {
    - `answers`
    - `mutationId`
 3. bridge 收到请求后，在本进程里调用真实宿主的 `input.client.question.reply()`。
-4. bridge 将成功/失败结果回传给 broker。
+4. bridge 将成功/失败结果回传给 broker，结果一律使用规范化的 `ReplyMutationResult`，而不是 SDK 原始 `{ data, error, ... }`。
 5. broker 只有在 `ok: true` 时，才本地写：
    - `markRequestAnswered(...)`
    - `resolveNotificationForOpenRequest(...)`
@@ -125,7 +132,7 @@ type ReplyMutationResult = {
 这次 spec 明确补齐“插件侧到底怎么回复”：
 
 1. broker 只负责把 slash 命令翻译成 RPC 请求，不再直接碰宿主 client。
-2. bridge 收到 `questionReplyRequest` / `permissionReplyRequest` 后，使用**当前进程内已经存在的宿主 client** 执行真实回复。
+2. bridge 收到 `replyQuestionRequest` / `replyPermissionRequest` 后，使用**当前进程内已经存在的宿主 client** 执行真实回复。
 3. 也就是说，OpenCode 插件侧回复动作发生在：
    - 当前实例进程内
    - 当前实例持有的真实 `input.client`
@@ -148,6 +155,10 @@ type ReplyMutationResult = {
    - `/reply q4 你的自定义回答`
 5. question 的简写只用于状态汇总场景，不用于 question 本身的首次通知。
 6. 这意味着实现时必须明确补一层“题目是否允许自定义回复”的元数据提取与展示，而不能只改文案不改语义判断。
+7. 对 `single` / `multiple` 且允许自定义的题目，这次也要把回复语义写死：
+   - 用户回复编号时，仍按现有题型逻辑转成结构化选项答案
+   - 用户回复自由文本时，broker 直接把整段文本作为自定义答案传给 bridge，再由 bridge 在宿主 client 的真实 question 语义里提交
+   - 如果题目不允许自定义，自由文本必须返回稳定中文错误，而不是静默降级成文本题
 
 #### permission 文案
 
@@ -188,19 +199,22 @@ type ReplyMutationResult = {
 
 关键原则：
 
-1. 上游返回 `{ error }` 视为失败
-2. bridge RPC 超时视为失败
-3. 只有真正成功回执才视为成功
-4. broker 本地状态更新永远晚于真实宿主动作成功
+1. bridge 侧必须先把 SDK 原始返回转换成规范化结果：
+   - 成功：`{ mutationId, ok: true }`
+   - 失败：`{ mutationId, ok: false, errorMessage }`
+2. broker 只认这条规范化结果，不再直接理解 SDK 原始 `{ error }`
+3. bridge RPC 超时视为失败
+4. 只有真正成功回执才视为成功
+5. broker 本地状态更新永远晚于真实宿主动作成功
 
 ## 测试策略
 
 至少覆盖：
 
 1. `/reply` 在 bridge 返回 `ok: true` 时才写本地 `answered`
-2. `/reply` 在 bridge 返回 `{ error }` 或超时时不会本地误写 `answered`
+2. `/reply` 在 bridge 返回 `ok: false` 或超时时不会本地误写 `answered`
 3. `/allow` 在 bridge 返回 `ok: true` 时才写 `answered/rejected`
-4. `/allow` 在失败时不会本地误写终态
+4. `/allow` 在 bridge 返回 `ok: false` 或超时时不会本地误写终态
 5. broker 不再创建硬编码 `localhost:4096` 的 reply 客户端路径
 6. question 文案同时覆盖：完整题面、编号选项、自定义回复提示
 7. permission 文案覆盖批准对象和动作语义
