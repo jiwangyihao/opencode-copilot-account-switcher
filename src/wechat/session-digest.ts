@@ -32,6 +32,8 @@ export type SessionDigest = {
   }
   unavailable?: Array<"messages" | "todo">
   highlights: SessionDigestHighlight[]
+  todoItems?: string[]
+  questionHighlights?: string[]
 }
 
 export type BuildSessionDigestInput = {
@@ -123,6 +125,18 @@ function pushIfDefined(highlights: SessionDigestHighlight[], kind: SessionDigest
   highlights.push({ kind, text })
 }
 
+function summarizeQuestionHighlight(question: QuestionRequest): string | undefined {
+  const first = Array.isArray(question.questions) ? question.questions[0] : undefined
+  if (first && typeof first.question === "string" && first.question.trim().length > 0) {
+    return `问题：${first.question.trim()}`
+  }
+  const fallback = (question as { text?: unknown }).text
+  if (typeof fallback === "string" && fallback.trim().length > 0) {
+    return `问题：${fallback.trim()}`
+  }
+  return undefined
+}
+
 export function groupQuestionsBySession(
   questions: QuestionRequest[] = [],
 ): Map<string, QuestionRequest[]> {
@@ -165,6 +179,12 @@ export function buildSessionDigest(input: BuildSessionDigestInput): SessionDiges
   const toolSlices = collectToolSlices(messages)
   const status = asSessionState(input.statusBySession[sessionID])
   const highlights: SessionDigestHighlight[] = []
+  const todoItems = todos
+    .map((todo) => (typeof todo.content === "string" ? todo.content.trim() : ""))
+    .filter((item) => item.length > 0)
+  const questionHighlights = questions
+    .map((question) => summarizeQuestionHighlight(question))
+    .filter((item): item is string => typeof item === "string" && item.length > 0)
 
   if (permissions.length > 0) {
     highlights.push({ kind: "permission", text: `pending permission: ${permissions.length}` })
@@ -201,6 +221,8 @@ export function buildSessionDigest(input: BuildSessionDigestInput): SessionDiges
     todoSummary,
     unavailable: unavailable.length > 0 ? unavailable : undefined,
     highlights,
+    ...(todoItems.length > 0 ? { todoItems } : {}),
+    ...(questionHighlights.length > 0 ? { questionHighlights } : {}),
   }
 }
 

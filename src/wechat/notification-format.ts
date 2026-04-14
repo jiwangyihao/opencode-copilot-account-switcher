@@ -33,6 +33,24 @@ function formatQuestionType(mode: string | undefined) {
   return "文本"
 }
 
+function formatQuestionOptions(options: Array<{ index: number; label: string }> = []) {
+  return options.map((option) => `${option.index}. ${option.label}`)
+}
+
+function formatQuestionReplyExamples(handle: string, mode: string | undefined, allowCustom: boolean) {
+  const examples: string[] = []
+  if (mode === "single") {
+    examples.push(`回复示例：/reply ${handle} 1`)
+  }
+  if (mode === "multiple") {
+    examples.push(`回复示例：/reply ${handle} 1,2`)
+  }
+  if (mode === "text" || allowCustom) {
+    examples.push(`回复示例：/reply ${handle} 你的自定义回答`)
+  }
+  return examples
+}
+
 export function formatWechatNotificationText(record: NotificationRecord): string {
   if (record.kind === "question") {
     const handle = formatHandle(record.handle, "q?")
@@ -41,20 +59,11 @@ export function formatWechatNotificationText(record: NotificationRecord): string
       const lines = [
         `收到新的问题请求（${handle}）`,
         prompt.title ?? prompt.body ?? "请在 OpenCode 中处理该问题。",
+        prompt.body && prompt.title ? prompt.body : undefined,
         `类型：${formatQuestionType(prompt.mode)}`,
-      ]
-      if (Array.isArray(prompt.options) && prompt.options.length > 0) {
-        for (const option of prompt.options) {
-          lines.push(`${option.index}. ${option.label}`)
-        }
-      }
-      if (prompt.mode === "single") {
-        lines.push(`回复示例：/reply ${handle} 1`)
-      } else if (prompt.mode === "multiple") {
-        lines.push(`回复示例：/reply ${handle} 1,2`)
-      } else {
-        lines.push(`回复示例：/reply ${handle} 你的回答`)
-      }
+        ...formatQuestionOptions(prompt.options),
+        ...formatQuestionReplyExamples(handle, prompt.mode, prompt.custom === true),
+      ].filter(Boolean)
       return lines.join("\n")
     }
     return `收到新的问题请求（${handle}），请在 OpenCode 中处理。`
@@ -68,10 +77,11 @@ export function formatWechatNotificationText(record: NotificationRecord): string
         `收到新的权限请求（${handle}）`,
         prompt.title ?? "请在 OpenCode 中处理该权限请求。",
         `类型：${prompt.type ?? "unknown"}`,
+        prompt.description,
         `允许一次：/allow ${handle} once`,
         `始终允许：/allow ${handle} always`,
         `拒绝：/allow ${handle} reject`,
-      ]
+      ].filter(Boolean)
       return lines.join("\n")
     }
     return `收到新的权限请求（${handle}），请在 OpenCode 中处理。`

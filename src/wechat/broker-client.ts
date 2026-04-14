@@ -321,6 +321,29 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
     void Promise.resolve(options.bridge?.showFallbackToast?.(payload)).catch(() => {})
   }
 
+  function handleReplyEnvelope(envelope: BrokerEnvelope): boolean {
+    if (!options.bridge?.handleBrokerEnvelope) {
+      return false
+    }
+    if (envelope.type !== "replyQuestion" && envelope.type !== "replyPermission") {
+      return false
+    }
+
+    void Promise.resolve(options.bridge.handleBrokerEnvelope(envelope))
+      .then((response) => {
+        if (!response || !session) {
+          return
+        }
+        socket.write(serializeEnvelope({
+          ...response,
+          instanceID: session.instanceID,
+          sessionToken: session.sessionToken,
+        }))
+      })
+      .catch(() => {})
+    return true
+  }
+
   function handleServerPush(envelope: BrokerEnvelope): boolean {
     if (envelope.type === "collectStatus") {
       handleCollectStatus(envelope)
@@ -328,6 +351,9 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
     }
     if (envelope.type === "showFallbackToast") {
       handleShowFallbackToast(envelope)
+      return true
+    }
+    if (handleReplyEnvelope(envelope)) {
       return true
     }
     return false

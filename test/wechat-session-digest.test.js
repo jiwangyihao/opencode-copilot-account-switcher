@@ -99,6 +99,8 @@ test("buildSessionDigest: permission/question/tool/todo/status 可并行展示�
   assert.equal(digest.todoSummary.total, 2)
   assert.equal(digest.todoSummary.inProgress, 1)
   assert.equal(digest.todoSummary.completed, 1)
+  assert.deepEqual(digest.todoItems, ["实现分类器", "补充测试"])
+  assert.deepEqual(digest.questionHighlights, ["问题：是否继续执行下一步？"])
 
   const kinds = digest.highlights.map((item) => item.kind)
   assert.deepEqual(kinds, [

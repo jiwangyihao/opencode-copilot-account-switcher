@@ -3,7 +3,7 @@ import process from "node:process"
 import { readFileSync, rmSync } from "node:fs"
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
-import { createOpencodeClient as createOpencodeClientV2, type QuestionAnswer } from "@opencode-ai/sdk/v2"
+import type { QuestionAnswer } from "@opencode-ai/sdk/v2"
 import { startBrokerServer } from "./broker-server.js"
 import { WECHAT_FILE_MODE, wechatStateRoot, wechatStatusRuntimeDiagnosticsPath } from "./state-paths.js"
 import {
@@ -48,6 +48,12 @@ import {
   type RecoveryMutation,
 } from "./broker-mutation-queue.js"
 import { buildQuestionAnswersFromReply } from "./question-interaction.js"
+
+type ReplyMutationResult = {
+  mutationId: string
+  ok: boolean
+  errorMessage?: string
+}
 
 type BrokerState = {
   pid: number
@@ -145,6 +151,19 @@ type BrokerWechatStatusRuntimeLifecycleDeps = {
     drainOutboundMessages: () => Promise<void>
   }
   handleWechatSlashCommand?: (command: import("./command-parser.js").WechatSlashCommand) => Promise<string>
+  sendReplyQuestionRpc?: (input: {
+    instanceID: string
+    mutationId: string
+    requestID: string
+    answers: QuestionAnswer[]
+  }) => Promise<ReplyMutationResult>
+  sendReplyPermissionRpc?: (input: {
+    instanceID: string
+    mutationId: string
+    requestID: string
+    reply: "once" | "always" | "reject"
+    message?: string
+  }) => Promise<ReplyMutationResult>
   handleNotificationDeliveryFailure?: (input: {
     instanceID: string
     wechatAccountId: string
@@ -216,6 +235,17 @@ function toErrorMessage(error: unknown): string {
   return String(error)
 }
 
+function getSdkMutationError(result: unknown): string | undefined {
+  if (!result || typeof result !== "object") {
+    return undefined
+  }
+  const error = (result as { error?: unknown }).error
+  if (!error) {
+    return undefined
+  }
+  return toErrorMessage(error)
+}
+
 function createRecoveryFailureToken(): string {
   return `recovery-failure-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
@@ -225,6 +255,19 @@ const brokerEntryMutationQueue = createBrokerMutationQueue()
 export function createBrokerWechatSlashCommandHandler(input: {
   handleStatusCommand: () => Promise<string>
   client?: BrokerWechatSlashHandlerClient
+  sendReplyQuestionRpc?: (input: {
+    instanceID: string
+    mutationId: string
+    requestID: string
+    answers: QuestionAnswer[]
+  }) => Promise<ReplyMutationResult>
+  sendReplyPermissionRpc?: (input: {
+    instanceID: string
+    mutationId: string
+    requestID: string
+    reply: "once" | "always" | "reject"
+    message?: string
+  }) => Promise<ReplyMutationResult>
   directory?: string
   mutationQueue?: BrokerMutationQueue
   markDeadLetterRecoveryFailedImpl?: typeof markDeadLetterRecoveryFailed
@@ -589,10 +632,35 @@ export function createBrokerWechatSlashCommandHandler(input: {
       } catch (error) {
         return error instanceof Error ? error.message : "问题回复格式无效"
       }
-      await input.client?.question?.reply?.(withOptionalDirectory({
-        requestID: openQuestion.requestID,
-        answers,
-      }, input.directory))
+      const mutationId = `reply-question-${Date.now()}-${Math.random().toString(16).slice(2)}`
+      let result: ReplyMutationResult
+      if (input.sendReplyQuestionRpc) {
+        if (!openQuestion.scopeKey) {
+          return `回复问题失败：bridge unavailable`
+        }
+        try {
+          result = await input.sendReplyQuestionRpc({
+            instanceID: openQuestion.scopeKey,
+            mutationId,
+            requestID: openQuestion.requestID,
+            answers,
+          })
+        } catch (error) {
+          result = { mutationId, ok: false, errorMessage: toErrorMessage(error) }
+        }
+      } else {
+        const replyResult = await input.client?.question?.reply?.(withOptionalDirectory({
+          requestID: openQuestion.requestID,
+          answers,
+        }, input.directory))
+        const replyError = getSdkMutationError(replyResult)
+        result = replyError
+          ? { mutationId, ok: false, errorMessage: replyError }
+          : { mutationId, ok: true }
+      }
+      if (result.ok !== true) {
+        return `回复问题失败：${result.errorMessage ?? "unknown"}`
+      }
       await markRequestAnswered({
         kind: "question",
         routeKey: openQuestion.routeKey,
@@ -699,11 +767,37 @@ export function createBrokerWechatSlashCommandHandler(input: {
     if (!openPermission) {
       return `未找到待处理权限请求：${command.handle}`
     }
-    await input.client?.permission?.reply?.(withOptionalDirectory({
-      requestID: openPermission.requestID,
-      reply: command.reply,
-      ...(command.message ? { message: command.message } : {}),
-    }, input.directory))
+    const mutationId = `reply-permission-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    let result: ReplyMutationResult
+    if (input.sendReplyPermissionRpc) {
+      if (!openPermission.scopeKey) {
+        return `处理权限请求失败：bridge unavailable`
+      }
+      try {
+        result = await input.sendReplyPermissionRpc({
+          instanceID: openPermission.scopeKey,
+          mutationId,
+          requestID: openPermission.requestID,
+          reply: command.reply,
+          ...(command.message ? { message: command.message } : {}),
+        })
+      } catch (error) {
+        result = { mutationId, ok: false, errorMessage: toErrorMessage(error) }
+      }
+    } else {
+      const permissionReplyResult = await input.client?.permission?.reply?.(withOptionalDirectory({
+        requestID: openPermission.requestID,
+        reply: command.reply,
+        ...(command.message ? { message: command.message } : {}),
+      }, input.directory))
+      const permissionReplyError = getSdkMutationError(permissionReplyResult)
+      result = permissionReplyError
+        ? { mutationId, ok: false, errorMessage: permissionReplyError }
+        : { mutationId, ok: true }
+    }
+    if (result.ok !== true) {
+      return `处理权限请求失败：${result.errorMessage ?? "unknown"}`
+    }
     if (command.reply === "reject") {
       await markRequestRejected({
         kind: "permission",
@@ -729,13 +823,10 @@ export function createBrokerWechatStatusRuntimeLifecycle(
   const stateRoot = deps.stateRoot ?? wechatStateRoot()
   const onDiagnosticEvent =
     deps.onDiagnosticEvent ?? createWechatStatusRuntimeDiagnosticsFileWriter({ stateRoot, onRuntimeError })
-  const v2Client = createOpencodeClientV2({
-    baseUrl: "http://localhost:4096",
-    directory: process.cwd(),
-  })
   const handleWechatSlashCommand = deps.handleWechatSlashCommand ?? createBrokerWechatSlashCommandHandler({
     handleStatusCommand: async () => "命令暂未实现：/status",
-    client: v2Client,
+    sendReplyQuestionRpc: deps.sendReplyQuestionRpc,
+    sendReplyPermissionRpc: deps.sendReplyPermissionRpc,
     directory: process.cwd(),
   })
   const createStatusRuntime =
@@ -873,12 +964,12 @@ async function run() {
   const wechatRuntimeLifecycle = createBrokerWechatStatusRuntimeLifecycle({
     handleWechatSlashCommand: createBrokerWechatSlashCommandHandler({
       handleStatusCommand: async () => server.handleWechatSlashCommand({ type: "status" }),
-      client: createOpencodeClientV2({
-        baseUrl: "http://localhost:4096",
-        directory: stateRoot,
-      }),
+      sendReplyQuestionRpc: server.dispatchReplyQuestionToInstance,
+      sendReplyPermissionRpc: server.dispatchReplyPermissionToInstance,
       directory: stateRoot,
     }),
+    sendReplyQuestionRpc: server.dispatchReplyQuestionToInstance,
+    sendReplyPermissionRpc: server.dispatchReplyPermissionToInstance,
     handleNotificationDeliveryFailure: server.handleNotificationDeliveryFailure,
   })
   if (shouldEnableBrokerWechatStatusRuntime()) {

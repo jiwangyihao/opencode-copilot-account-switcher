@@ -1362,6 +1362,90 @@ test("通知文案格式化：question 输出题面 题型 选项 与回复格�
   assert.match(questionText, /\/reply q8 1/)
 })
 
+test("通知文案格式化：question 在文本题时展示完整题面与自由文本回复示例", async () => {
+  const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-question-text-copy`)
+
+  const questionText = notificationFormat.formatWechatNotificationText({
+    idempotencyKey: "question-text-1",
+    kind: "question",
+    wechatAccountId: "wx-main",
+    userId: "u-main",
+    routeKey: "route-question-text-1",
+    handle: "qtext1",
+    createdAt: 1_700_600_100_010,
+    status: "pending",
+    prompt: {
+      title: "请补充发布说明",
+      body: "请直接写出这次发布最重要的一句价值总结。",
+      mode: "text",
+      custom: true,
+    },
+  })
+
+  assert.match(questionText, /请直接写出这次发布最重要的一句价值总结/)
+  assert.match(questionText, /\/reply qtext1 你的自定义回答/)
+  assert.doesNotMatch(questionText, /1\./)
+})
+
+test("通知文案格式化：question 在多选题时展示编号选项与多选回复示例", async () => {
+  const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-question-multiple-copy`)
+
+  const questionText = notificationFormat.formatWechatNotificationText({
+    idempotencyKey: "question-multiple-1",
+    kind: "question",
+    wechatAccountId: "wx-main",
+    userId: "u-main",
+    routeKey: "route-question-multiple-1",
+    handle: "qmulti1",
+    createdAt: 1_700_600_100_020,
+    status: "pending",
+    prompt: {
+      title: "请选择需要通知的环境",
+      body: "可以同时选择多个环境。",
+      mode: "multiple",
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  assert.match(questionText, /可以同时选择多个环境/)
+  assert.match(questionText, /1\. staging/)
+  assert.match(questionText, /3\. preview/)
+  assert.match(questionText, /\/reply qmulti1 1,2/)
+})
+
+test("通知文案格式化：question 在多选且允许自定义时同时展示多选与自定义回复示例", async () => {
+  const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-question-multiple-custom-copy`)
+
+  const questionText = notificationFormat.formatWechatNotificationText({
+    idempotencyKey: "question-multiple-custom-1",
+    kind: "question",
+    wechatAccountId: "wx-main",
+    userId: "u-main",
+    routeKey: "route-question-multiple-custom-1",
+    handle: "qmulti2",
+    createdAt: 1_700_600_100_030,
+    status: "pending",
+    prompt: {
+      title: "请选择需要通知的环境",
+      body: "可以多选，也可以直接输入其他环境说明。",
+      mode: "multiple",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  assert.match(questionText, /\/reply qmulti2 1,2/)
+  assert.match(questionText, /\/reply qmulti2 你的自定义回答/)
+})
+
 test("通知文案格式化：permission 输出标题 类型 与 allow 动作说明", async () => {
   const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}`)
 
@@ -1377,11 +1461,13 @@ test("通知文案格式化：permission 输出标题 类型 与 allow 动作说
     prompt: {
       title: "允许执行 shell 命令",
       type: "command",
+      description: "目标：npm publish --tag latest",
     },
   })
 
   assert.match(permissionText, /允许执行 shell 命令/)
   assert.match(permissionText, /类型：command/)
+  assert.match(permissionText, /目标：npm publish --tag latest/)
   assert.match(permissionText, /\/allow p3 once/)
   assert.match(permissionText, /\/allow p3 always/)
   assert.match(permissionText, /\/allow p3 reject/)

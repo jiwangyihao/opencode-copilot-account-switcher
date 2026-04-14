@@ -6,6 +6,7 @@ export type QuestionPromptSummary = {
   title?: string
   body?: string
   mode: QuestionPromptMode
+  custom?: boolean
   options?: Array<{
     index: number
     label: string
@@ -54,6 +55,7 @@ function normalizeQuestionPromptSummary(input: unknown): QuestionPromptSummary {
     ...(isNonEmptyString(record.title) ? { title: record.title.trim() } : {}),
     ...(isNonEmptyString(record.body) ? { body: record.body.trim() } : {}),
     mode,
+    ...(record.custom === true ? { custom: true } : {}),
     ...(options && options.length > 0 ? { options } : {}),
   }
 }
@@ -98,6 +100,7 @@ export function extractQuestionPromptSummary(question: QuestionRequest): Questio
     title: isNonEmptyString(first.header) ? first.header : undefined,
     body: isNonEmptyString(first.question) ? first.question : undefined,
     mode,
+    custom: first.custom === true,
     options,
   })
 }
@@ -152,9 +155,17 @@ export function buildQuestionAnswersFromReply(
     return [[text]]
   }
 
+  if (prompt.custom === true && !/^\d+(,\d+)*$/.test(text)) {
+    return [[text]]
+  }
+
   if (prompt.mode === "single") {
     if (!/^\d+$/.test(text)) {
-      throw new Error("单选题请回复单个选项编号")
+      throw new Error(
+        prompt.custom === true
+          ? "单选题请回复单个选项编号，或直接输入自定义回答"
+          : "该问题不支持自定义回复，请按题目提示填写选项编号",
+      )
     }
     return [[findOptionValue(options, text)]]
   }
@@ -168,7 +179,11 @@ export function buildQuestionAnswersFromReply(
   const values: string[] = []
   for (const token of tokens) {
     if (!/^\d+$/.test(token)) {
-      throw new Error("多选题请使用逗号分隔的选项编号")
+      throw new Error(
+        prompt.custom === true
+          ? "多选题请使用逗号分隔的选项编号，或直接输入自定义回答"
+          : "该问题不支持自定义回复，请按题目提示填写选项编号",
+      )
     }
     if (seen.has(token)) {
       throw new Error(`选项编号不能重复：${token}`)

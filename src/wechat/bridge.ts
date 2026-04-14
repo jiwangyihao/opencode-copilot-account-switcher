@@ -2,6 +2,7 @@ import type {
   Message,
   Part,
   PermissionRequest,
+  QuestionAnswer,
   QuestionRequest,
   Session,
   SessionStatus,
@@ -22,7 +23,14 @@ import {
 } from "./session-digest.js"
 import { readOperatorBinding } from "./operator-store.js"
 import { createHandle, createRouteKey } from "./handle.js"
-import type { ShowFallbackToastPayload, WechatNotificationCandidate } from "./protocol.js"
+import type {
+  BrokerEnvelope,
+  ReplyMutationResult,
+  ReplyPermissionPayload,
+  ReplyQuestionPayload,
+  ShowFallbackToastPayload,
+  WechatNotificationCandidate,
+} from "./protocol.js"
 import { extractPermissionPromptSummary, extractQuestionPromptSummary } from "./question-interaction.js"
 
 type SessionMessages = Array<{ info: Message; parts: Part[] }>
@@ -47,9 +55,11 @@ type WechatBridgeClient = {
   }
   question: {
     list: () => Promise<SdkReadResult<QuestionRequest[]>>
+    reply?: (input: { requestID: string; answers: QuestionAnswer[] }) => Promise<SdkReadResult<unknown>>
   }
   permission: {
     list: () => Promise<SdkReadResult<PermissionRequest[]>>
+    reply?: (input: { requestID: string; reply: "once" | "always" | "reject"; message?: string }) => Promise<SdkReadResult<unknown>>
   }
 }
 
@@ -84,6 +94,7 @@ export type WechatBridge = {
   collectNotificationCandidates: () => Promise<WechatNotificationCandidate[]>
   resyncBrokerState?: (input?: { reason?: "brokerReconnect" | "manual" }) => Promise<WechatInstanceStatusSnapshot>
   showFallbackToast?: (payload: ShowFallbackToastPayload) => Promise<void>
+  handleBrokerEnvelope?: (envelope: BrokerEnvelope) => Promise<BrokerEnvelope | null>
 }
 
 export type WechatBridgeLifecycleInput = {
@@ -315,6 +326,20 @@ function unwrapSdkReadResult<T>(value: SdkReadResult<T>, name: string): T {
   }
 
   return value.data
+}
+
+function normalizeReplyMutationResult(mutationId: string, value: unknown): ReplyMutationResult {
+  if (isSdkFieldsResult(value) && value.error != null) {
+    return {
+      mutationId,
+      ok: false,
+      errorMessage: toDiagnosticErrorMessage(value.error),
+    }
+  }
+  return {
+    mutationId,
+    ok: true,
+  }
 }
 
 export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
@@ -624,6 +649,59 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
     }
   }
 
+  const handleBrokerEnvelope = async (envelope: BrokerEnvelope): Promise<BrokerEnvelope | null> => {
+    if (envelope.type === "replyQuestion") {
+      const payload = envelope.payload as ReplyQuestionPayload
+      if (!input.client.question.reply) {
+        return {
+          id: envelope.id,
+          type: "replyQuestionResult",
+          payload: {
+            mutationId: payload.mutationId,
+            ok: false,
+            errorMessage: "question.reply unavailable",
+          },
+        }
+      }
+      const response = await input.client.question.reply({
+        requestID: payload.requestID,
+        answers: payload.answers as QuestionAnswer[],
+      })
+      return {
+        id: envelope.id,
+        type: "replyQuestionResult",
+        payload: normalizeReplyMutationResult(payload.mutationId, response),
+      }
+    }
+
+    if (envelope.type === "replyPermission") {
+      const payload = envelope.payload as ReplyPermissionPayload
+      if (!input.client.permission.reply) {
+        return {
+          id: envelope.id,
+          type: "replyPermissionResult",
+          payload: {
+            mutationId: payload.mutationId,
+            ok: false,
+            errorMessage: "permission.reply unavailable",
+          },
+        }
+      }
+      const response = await input.client.permission.reply({
+        requestID: payload.requestID,
+        reply: payload.reply,
+        ...(payload.message ? { message: payload.message } : {}),
+      })
+      return {
+        id: envelope.id,
+        type: "replyPermissionResult",
+        payload: normalizeReplyMutationResult(payload.mutationId, response),
+      }
+    }
+
+    return null
+  }
+
   return {
     collectStatusSnapshot,
     collectNotificationCandidates,
@@ -631,6 +709,7 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
     showFallbackToast: async (payload: ShowFallbackToastPayload) => {
       await Promise.resolve(input.onFallbackToast?.(payload))
     },
+    handleBrokerEnvelope,
   }
 }
 
