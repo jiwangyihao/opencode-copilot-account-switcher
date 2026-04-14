@@ -33,9 +33,9 @@
 
 做法：
 
-- broker 通过现有 socket 向目标 bridge 实例发送 `replyQuestionRequest` / `replyPermissionRequest`
+- broker 通过现有 socket 向目标 bridge 实例发送 `replyQuestion` / `replyPermission`
 - bridge 在本进程里使用真实宿主 client 执行 `question.reply()` / `permission.reply()`
-- bridge 把结果通过同一通道回给 broker
+- bridge 把结果通过 `replyQuestionResult` / `replyPermissionResult` 回给 broker
 
 优点：
 
@@ -78,9 +78,9 @@
 - `replyPermission`
 - `replyPermissionResult`
 
-后文一律只使用这组名字；不再出现 `questionReplyRequest` / `permissionReplyRequest` 这类平行命名。
+后文一律只使用这组名字；不再出现 `questionReplyRequest` / `permissionReplyRequest` 这类平行命名，也不再为实现阶段保留“另选一套协议名”的空间。
 
-无论最终沿用现名还是做一次统一重命名，协议都必须明确包含两类消息：
+协议必须明确包含两类消息：
 
 - 请求消息：broker -> bridge
 - 结果消息：bridge -> broker
