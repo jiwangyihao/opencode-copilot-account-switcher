@@ -13,8 +13,10 @@ export type BrokerImplementedMessageType =
 export type BrokerFutureMessageType =
   | "collectStatus"
   | "replyQuestion"
+  | "replyQuestionResult"
   | "rejectQuestion"
   | "replyPermission"
+  | "replyPermissionResult"
   | "showFallbackToast"
 
 export type BrokerMessageType = BrokerImplementedMessageType | BrokerFutureMessageType
@@ -36,6 +38,25 @@ export type ShowFallbackToastPayload = {
   message: string
   reason: typeof SHOW_FALLBACK_TOAST_DELIVERY_FAILED_REASON
   registrationEpoch: string
+}
+
+export type ReplyMutationResult = {
+  mutationId: string
+  ok: boolean
+  errorMessage?: string
+}
+
+export type ReplyQuestionPayload = {
+  mutationId: string
+  requestID: string
+  answers: unknown[]
+}
+
+export type ReplyPermissionPayload = {
+  mutationId: string
+  requestID: string
+  reply: "once" | "always" | "reject"
+  message?: string
 }
 
 export type WechatNotificationCandidate =
@@ -93,8 +114,10 @@ function isMessageType(value: unknown): value is BrokerMessageType {
     value === "error" ||
     value === "collectStatus" ||
     value === "replyQuestion" ||
+    value === "replyQuestionResult" ||
     value === "rejectQuestion" ||
     value === "replyPermission" ||
+    value === "replyPermissionResult" ||
     value === "showFallbackToast"
   )
 }

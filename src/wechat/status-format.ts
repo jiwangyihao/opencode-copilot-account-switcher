@@ -105,6 +105,20 @@ function normalizeSessionDigest(value: unknown): SessionDigest | null {
     },
     unavailable: toSessionUnavailable(record.unavailable),
     highlights,
+    ...(Array.isArray(record.todoItems)
+      ? {
+          todoItems: record.todoItems
+            .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+            .map((item) => item.trim()),
+        }
+      : {}),
+    ...(Array.isArray(record.questionHighlights)
+      ? {
+          questionHighlights: record.questionHighlights
+            .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+            .map((item) => item.trim()),
+        }
+      : {}),
   }
 }
 
@@ -169,6 +183,15 @@ function pickTopSessions(sessions: SessionDigest[]): SessionDigest[] {
     .slice(0, 3)
 }
 
+function formatSessionTags(session: SessionDigest): string {
+  return [
+    session.status === "busy" ? "#busy" : session.status === "idle" ? "#idle" : `#${session.status}`,
+    `#todo:${session.todoSummary.total}`,
+    `#question:${session.pendingQuestionCount}`,
+    `#permission:${session.pendingPermissionCount}`,
+  ].join(" ")
+}
+
 export function formatInstanceStatusSnapshot(snapshotInput: unknown): string {
   const snapshot = normalizeSnapshot(snapshotInput)
   const lines: string[] = []
@@ -215,12 +238,45 @@ export function formatAggregatedStatusReply(input: AggregatedStatusReplyInput): 
 
   for (const instance of input.instances) {
     if (instance.status === "timeout/unreachable") {
-      sections.push(`instance: ${instance.instanceID}`)
+      sections.push("实例状态")
       sections.push("timeout/unreachable")
       continue
     }
 
-    sections.push(formatInstanceStatusSnapshot(instance.snapshot))
+    const snapshot = normalizeSnapshot(instance.snapshot)
+    const sessions = pickTopSessions(snapshot.sessions)
+    if (sessions.length === 0) {
+      sections.push(snapshot.instanceName || "未命名实例")
+      sections.push("- no active sessions")
+      continue
+    }
+
+    for (const session of sessions) {
+      sections.push(session.title || "未命名会话")
+      sections.push(formatSessionTags(session))
+      for (const todo of session.todoItems ?? []) {
+        sections.push(`todo: ${todo}`)
+      }
+      for (const question of session.questionHighlights ?? []) {
+        sections.push(question)
+      }
+
+      const sessionUnavailable = toSessionUnavailable(session.unavailable)
+      if (sessionUnavailable.length > 0) {
+        sections.push(`session unavailable: ${sessionUnavailable.join(", ")}`)
+      }
+
+      for (const highlight of sortHighlights(session.highlights)) {
+        if (highlight.kind !== "todo" && highlight.kind !== "question" && highlight.kind !== "status") {
+          sections.push(highlight.text)
+        }
+      }
+    }
+
+    const instanceUnavailable = toInstanceUnavailable(snapshot.unavailable)
+    if (instanceUnavailable.length > 0) {
+      sections.push(`instance unavailable: ${instanceUnavailable.join(", ")}`)
+    }
   }
 
   return sections.join("\n")

@@ -11,6 +11,9 @@ import {
   type BrokerEnvelope,
   type BrokerMessageType,
   type CollectStatusPayload,
+  type ReplyMutationResult,
+  type ReplyPermissionPayload,
+  type ReplyQuestionPayload,
   SHOW_FALLBACK_TOAST_DELIVERY_FAILED_REASON,
   type SyncWechatNotificationsPayload,
   type ShowFallbackToastPayload,
@@ -156,11 +159,18 @@ type PendingCollectStatus = {
   timer: NodeJS.Timeout
 }
 
+type PendingReplyMutation = {
+  mutationId: string
+  resolve: (result: ReplyMutationResult) => void
+  timer: NodeJS.Timeout
+}
+
 const registrationByInstanceID = new Map<string, RegistrationRecord>()
 const instanceIDsBySocket = new Map<net.Socket, Set<string>>()
 const snapshotByInstanceID = new Map<string, InstanceSnapshot>()
 const snapshotPersistQueueByInstanceID = new Map<string, Promise<void>>()
 const pendingCollectStatusByRequestId = new Map<string, PendingCollectStatus>()
+const pendingReplyMutationsByRequestId = new Map<string, PendingReplyMutation>()
 let syncWechatNotificationsChain: Promise<void> = Promise.resolve()
 let brokerMutationQueue = createBrokerMutationQueue()
 
@@ -782,6 +792,32 @@ async function handleMessage(envelope: BrokerEnvelope, socket: net.Socket): Prom
     return
   }
 
+  if (envelope.type === "replyQuestionResult" || envelope.type === "replyPermissionResult") {
+    if (!requireAuthorized(envelope)) {
+      writeError(socket, "unauthorized", "session token is invalid", requestId)
+      return
+    }
+
+    const pending = pendingReplyMutationsByRequestId.get(requestId)
+    if (!pending) {
+      return
+    }
+
+    const payload = envelope.payload as Partial<ReplyMutationResult>
+    pendingReplyMutationsByRequestId.delete(requestId)
+    clearTimeout(pending.timer)
+    if (!isNonEmptyString(payload.mutationId) || payload.mutationId !== pending.mutationId || payload.ok !== true && payload.ok !== false) {
+      pending.resolve({ mutationId: pending.mutationId, ok: false, errorMessage: "invalid bridge reply result" })
+      return
+    }
+    pending.resolve({
+      mutationId: payload.mutationId,
+      ok: payload.ok,
+      ...(isNonEmptyString(payload.errorMessage) ? { errorMessage: payload.errorMessage } : {}),
+    })
+    return
+  }
+
   if (envelope.type === "syncWechatNotifications") {
     if (!requireAuthorized(envelope)) {
       writeError(socket, "unauthorized", "session token is invalid", requestId)
@@ -955,6 +991,19 @@ export type BrokerServerHandle = {
     userId: string
     registrationEpoch?: string
   }) => Promise<void>
+  dispatchReplyQuestionToInstance: (input: {
+    instanceID: string
+    mutationId: string
+    requestID: string
+    answers: unknown[]
+  }) => Promise<ReplyMutationResult>
+  dispatchReplyPermissionToInstance: (input: {
+    instanceID: string
+    mutationId: string
+    requestID: string
+    reply: "once" | "always" | "reject"
+    message?: string
+  }) => Promise<ReplyMutationResult>
   hasBlockingActivity: () => Promise<boolean>
   close: () => Promise<void>
 }
@@ -1180,6 +1229,84 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     }).catch(() => {})
   }
 
+  const dispatchReplyQuestionToInstance = async (input: {
+    instanceID: string
+    mutationId: string
+    requestID: string
+    answers: unknown[]
+  }): Promise<ReplyMutationResult> => {
+    const registration = registrationByInstanceID.get(input.instanceID)
+    if (!registration) {
+      return { mutationId: input.mutationId, ok: false, errorMessage: `bridge unavailable: ${input.instanceID}` }
+    }
+
+    const requestId = `replyQuestion-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    return new Promise<ReplyMutationResult>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingReplyMutationsByRequestId.delete(requestId)
+        resolve({ mutationId: input.mutationId, ok: false, errorMessage: `replyQuestion timeout: ${input.mutationId}` })
+      }, 10_000)
+
+      pendingReplyMutationsByRequestId.set(requestId, {
+        mutationId: input.mutationId,
+        resolve,
+        timer,
+      })
+
+      writeEnvelope(registration.socket, {
+        id: requestId,
+        type: "replyQuestion",
+        instanceID: input.instanceID,
+        sessionToken: registration.sessionToken,
+        payload: {
+          mutationId: input.mutationId,
+          requestID: input.requestID,
+          answers: input.answers,
+        } satisfies ReplyQuestionPayload,
+      })
+    })
+  }
+
+  const dispatchReplyPermissionToInstance = async (input: {
+    instanceID: string
+    mutationId: string
+    requestID: string
+    reply: "once" | "always" | "reject"
+    message?: string
+  }): Promise<ReplyMutationResult> => {
+    const registration = registrationByInstanceID.get(input.instanceID)
+    if (!registration) {
+      return { mutationId: input.mutationId, ok: false, errorMessage: `bridge unavailable: ${input.instanceID}` }
+    }
+
+    const requestId = `replyPermission-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    return new Promise<ReplyMutationResult>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingReplyMutationsByRequestId.delete(requestId)
+        resolve({ mutationId: input.mutationId, ok: false, errorMessage: `replyPermission timeout: ${input.mutationId}` })
+      }, 10_000)
+
+      pendingReplyMutationsByRequestId.set(requestId, {
+        mutationId: input.mutationId,
+        resolve,
+        timer,
+      })
+
+      writeEnvelope(registration.socket, {
+        id: requestId,
+        type: "replyPermission",
+        instanceID: input.instanceID,
+        sessionToken: registration.sessionToken,
+        payload: {
+          mutationId: input.mutationId,
+          requestID: input.requestID,
+          reply: input.reply,
+          ...(input.message ? { message: input.message } : {}),
+        } satisfies ReplyPermissionPayload,
+      })
+    })
+  }
+
   const close = async () => {
     if (closed) {
       return
@@ -1228,6 +1355,8 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     collectStatus,
     handleWechatSlashCommand,
     handleNotificationDeliveryFailure,
+    dispatchReplyQuestionToInstance,
+    dispatchReplyPermissionToInstance,
     hasBlockingActivity,
     close,
   }
