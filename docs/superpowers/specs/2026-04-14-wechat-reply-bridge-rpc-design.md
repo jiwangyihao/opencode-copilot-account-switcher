@@ -33,7 +33,7 @@
 
 做法：
 
-- broker 通过现有 socket 向目标 bridge 实例发送 `questionReplyRequest` / `permissionReplyRequest`
+- broker 通过现有 socket 向目标 bridge 实例发送 `replyQuestionRequest` / `replyPermissionRequest`
 - bridge 在本进程里使用真实宿主 client 执行 `question.reply()` / `permission.reply()`
 - bridge 把结果通过同一通道回给 broker
 
@@ -106,7 +106,7 @@ type ReplyMutationResult = {
 1. broker 仍然负责：
    - 根据 `handle` 找到 open request
    - 按题型把文本转换成结构化 `answers`
-2. broker 不再直接调用 `question.reply()`，而是向目标 `instanceID` 发送：
+2. broker 不再直接调用 `question.reply()`，而是向目标 `instanceID` 发送 `replyQuestionRequest`，其中带：
    - `requestID`
    - `answers`
    - `mutationId`
@@ -122,7 +122,7 @@ type ReplyMutationResult = {
 `/allow` 和 `/reply` 完全同一原则：
 
 1. broker 根据 handle 找到 open permission request
-2. broker 向目标 bridge 发送 `permissionReplyRequest`
+2. broker 向目标 bridge 发送 `replyPermissionRequest`
 3. bridge 在本进程里调用真实宿主 `input.client.permission.reply()`
 4. broker 只在成功结果返回后，才写 `answered` 或 `rejected`，并 resolve 通知
 5. 否则返回稳定错误文案，不本地误写状态
@@ -219,6 +219,12 @@ type ReplyMutationResult = {
 6. question 文案同时覆盖：完整题面、编号选项、自定义回复提示
 7. permission 文案覆盖批准对象和动作语义
 8. `/status` 输出不再让内部 ID/秒级时间占主导，而改为标题 + 短标签 + 完整 todo 内容
+9. `single` / `multiple` 且**不允许**自定义时：
+   - 微信文案不得展示自定义回复示例
+   - 用户发自由文本时必须返回稳定中文错误
+10. `single` / `multiple` 且**允许**自定义时：
+   - 微信文案必须同时展示编号回复和自定义回复示例
+   - 用户发自由文本时必须走自定义 answers 语义，而不是被错误当成编号题失败
 
 ## 成功判定
 
