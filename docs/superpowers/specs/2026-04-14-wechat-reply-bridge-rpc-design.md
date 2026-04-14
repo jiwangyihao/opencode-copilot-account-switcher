@@ -71,14 +71,14 @@
 
 ### 1. 协议边界
 
-这次不是重做整套协议名，而是**增量扩展现有 `src/wechat/protocol.ts`**。如果当前文件里已经有 `replyQuestion` / `replyPermission` 之类占位类型，则应直接把它们落成真实可用消息，不再另起一套平行命名。为避免歧义，这份 spec 后文统一使用：
+这次不是重做整套协议名，而是**增量扩展现有 `src/wechat/protocol.ts`**。为避免名字漂移，这份 spec 在这里直接定死最终 canonical wire name：
 
-- `replyQuestionRequest`
+- `replyQuestion`
 - `replyQuestionResult`
-- `replyPermissionRequest`
+- `replyPermission`
 - `replyPermissionResult`
 
-如果实现时决定沿用更短的现有字段名，也必须在 `protocol.ts` 里保持一套名字前后一致，不能一半叫 `replyQuestion`、一半叫 `questionReplyRequest`。
+后文一律只使用这组名字；不再出现 `questionReplyRequest` / `permissionReplyRequest` 这类平行命名。
 
 无论最终沿用现名还是做一次统一重命名，协议都必须明确包含两类消息：
 
@@ -106,12 +106,16 @@ type ReplyMutationResult = {
 1. broker 仍然负责：
    - 根据 `handle` 找到 open request
    - 按题型把文本转换成结构化 `answers`
-2. broker 不再直接调用 `question.reply()`，而是向目标 `instanceID` 发送 `replyQuestionRequest`，其中带：
+2. broker 不再直接调用 `question.reply()`，而是向目标 `instanceID` 发送 `replyQuestion`，其中带：
    - `requestID`
    - `answers`
    - `mutationId`
-3. bridge 收到请求后，在本进程里调用真实宿主的 `input.client.question.reply()`。
-4. bridge 将成功/失败结果回传给 broker，结果一律使用规范化的 `ReplyMutationResult`，而不是 SDK 原始 `{ data, error, ... }`。
+3. broker 在发出这条 RPC 前，就必须把用户输入统一转换成最终 `answers`；bridge 侧不再重新解释自由文本还是编号输入。
+4. 这意味着：
+   - 编号回复 -> broker 转成结构化选项答案
+   - 自定义回复 -> broker 也直接转成最终 `answers`（例如 `[[trimmedText]]`）
+5. bridge 收到请求后，只负责在本进程里调用真实宿主的 `input.client.question.reply()`。
+6. bridge 将成功/失败结果通过 `replyQuestionResult` 回给 broker，结果一律使用规范化的 `ReplyMutationResult`，而不是 SDK 原始 `{ data, error, ... }`。
 5. broker 只有在 `ok: true` 时，才本地写：
    - `markRequestAnswered(...)`
    - `resolveNotificationForOpenRequest(...)`
@@ -122,7 +126,7 @@ type ReplyMutationResult = {
 `/allow` 和 `/reply` 完全同一原则：
 
 1. broker 根据 handle 找到 open permission request
-2. broker 向目标 bridge 发送 `replyPermissionRequest`
+2. broker 向目标 bridge 发送 `replyPermission`
 3. bridge 在本进程里调用真实宿主 `input.client.permission.reply()`
 4. broker 只在成功结果返回后，才写 `answered` 或 `rejected`，并 resolve 通知
 5. 否则返回稳定错误文案，不本地误写状态
@@ -132,7 +136,7 @@ type ReplyMutationResult = {
 这次 spec 明确补齐“插件侧到底怎么回复”：
 
 1. broker 只负责把 slash 命令翻译成 RPC 请求，不再直接碰宿主 client。
-2. bridge 收到 `replyQuestionRequest` / `replyPermissionRequest` 后，使用**当前进程内已经存在的宿主 client** 执行真实回复。
+2. bridge 收到 `replyQuestion` / `replyPermission` 后，使用**当前进程内已经存在的宿主 client** 执行真实回复。
 3. 也就是说，OpenCode 插件侧回复动作发生在：
    - 当前实例进程内
    - 当前实例持有的真实 `input.client`
@@ -157,7 +161,7 @@ type ReplyMutationResult = {
 6. 这意味着实现时必须明确补一层“题目是否允许自定义回复”的元数据提取与展示，而不能只改文案不改语义判断。
 7. 对 `single` / `multiple` 且允许自定义的题目，这次也要把回复语义写死：
    - 用户回复编号时，仍按现有题型逻辑转成结构化选项答案
-   - 用户回复自由文本时，broker 直接把整段文本作为自定义答案传给 bridge，再由 bridge 在宿主 client 的真实 question 语义里提交
+   - 用户回复自由文本时，broker 直接把整段文本转换成最终 `answers`（例如 `[[trimmedText]]`），bridge 不再二次判断
    - 如果题目不允许自定义，自由文本必须返回稳定中文错误，而不是静默降级成文本题
 
 #### permission 文案
@@ -203,9 +207,13 @@ type ReplyMutationResult = {
    - 成功：`{ mutationId, ok: true }`
    - 失败：`{ mutationId, ok: false, errorMessage }`
 2. broker 只认这条规范化结果，不再直接理解 SDK 原始 `{ error }`
-3. bridge RPC 超时视为失败
-4. 只有真正成功回执才视为成功
-5. broker 本地状态更新永远晚于真实宿主动作成功
+3. 这条 RPC 在 transport 层继续复用现有 envelope `id` 做一次请求/一次响应的对应；`mutationId` 是业务级幂等/防串包标识，必须同时落在 request/result payload 中。
+4. 也就是说：
+   - envelope `id` 负责“这次 socket 往返对应的是哪一个请求”
+   - `mutationId` 负责“这次业务回复结果是否真的属于当前 slash 命令，不是过期/串包结果”
+5. bridge RPC 超时视为失败
+6. 只有真正成功回执才视为成功
+7. broker 本地状态更新永远晚于真实宿主动作成功
 
 ## 测试策略
 
