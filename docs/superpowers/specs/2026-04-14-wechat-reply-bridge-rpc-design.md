@@ -71,14 +71,28 @@
 
 ### 1. 协议边界
 
-新增最小消息类型：
+这次不是重做整套协议名，而是**增量扩展现有 `src/wechat/protocol.ts`**。如果当前文件里已经有 `replyQuestion` / `replyPermission` 之类占位类型，则应直接把它们落成真实可用消息，不再另起一套平行命名。
 
-- `questionReplyRequest`
-- `questionReplyResult`
-- `permissionReplyRequest`
-- `permissionReplyResult`
+无论最终沿用现名还是做一次统一重命名，协议都必须明确包含两类消息：
 
-这些消息只在 broker 和目标 bridge 实例之间流动。
+- 请求消息：broker -> bridge
+- 结果消息：bridge -> broker
+
+结果契约必须是**规范化结果**，而不是把 SDK 的原始 `{ data, error, request, response }` 结构直接透传回来。最小要求：
+
+```ts
+type ReplyMutationResult = {
+  mutationId: string
+  ok: boolean
+  errorMessage?: string
+}
+```
+
+其中：
+
+1. `mutationId` 用于 broker 将响应和当前 slash 请求一一对应，防止并发 reply/allow 串包。
+2. `ok: true` 代表宿主内真实 `question.reply()` / `permission.reply()` 已成功完成。
+3. `ok: false` 时 broker 只能使用 `errorMessage` 做稳定中文失败提示，绝不能再本地误写终态。
 
 ### 2. `/reply` 数据流
 
@@ -123,18 +137,27 @@
 #### question 文案
 
 1. 发到微信时要带完整题面。
-2. 选项仍按编号展示，但必须保留“自定义回复”路径说明。
-3. 如果题型允许选择编号，消息里应同时给：
+2. 选项仍按编号展示，但只有在题目本身允许自由输入时，才保留“自定义回复”路径说明。
+3. 这次 spec 明确把 question 分成三类：
+   - `text`：只展示自定义回复示例
+   - `single` / `multiple` 且 **不允许自定义**：只展示编号回复示例
+   - `single` / `multiple` 且 **允许自定义**：同时展示编号回复与自定义回复示例
+4. 如果题型允许选择编号，消息里应按实际题型给：
    - `/reply q4 1`
    - `/reply q4 1,3`
    - `/reply q4 你的自定义回答`
-4. question 的简写只用于状态汇总场景，不用于 question 本身的首次通知。
+5. question 的简写只用于状态汇总场景，不用于 question 本身的首次通知。
+6. 这意味着实现时必须明确补一层“题目是否允许自定义回复”的元数据提取与展示，而不能只改文案不改语义判断。
 
 #### permission 文案
 
 1. 文案要明确“你到底在批准什么”。
 2. 不能再只剩 handle。
-3. 仍保留 `once` / `always` / `reject` 的简洁动作格式，但提示语应让人知道批准对象和影响范围。
+3. 这次至少要把现有可用字段中的这些内容明确纳入展示：
+   - 标题/权限类型
+   - 目标对象或模式（如 patterns / tool / metadata.type 中已有的稳定信息）
+   - `once` / `always` / `reject` 的动作语义
+4. 仍保留 `once` / `always` / `reject` 的简洁动作格式，但提示语必须能让人知道批准对象和影响范围。
 
 #### `/status` 文案
 
@@ -149,6 +172,12 @@
    - 完整 todo 内容
    - 必要的问题简写
    - 真正有助于人工处理的信息
+5. 这次 spec 明确要求：实现范围必须锁在现有 `bridge snapshot -> session digest -> status formatter` 这一条链里，不允许顺手去改 live read 行为、polling 频率或 broker 运行时机制。
+6. 也就是说，这轮 `/status` 改造只允许：
+   - 调整 digest 的字段选择
+   - 调整 formatter 的分段和标签呈现
+   - 必要时补最小的 digest 字段
+   但不允许把它扩成新一轮状态采集架构改造。
 
 ### 6. 成功/失败语义
 
