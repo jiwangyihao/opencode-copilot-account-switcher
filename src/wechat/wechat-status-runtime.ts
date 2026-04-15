@@ -6,6 +6,7 @@ import {
 } from "./compat/openclaw-public-helpers.js"
 import { STAGE_A_SLASH_ONLY_MESSAGE } from "./compat/slash-guard.js"
 import { parseWechatSlashCommand, type WechatSlashCommand } from "./command-parser.js"
+import { redactDebugBundleText } from "./debug-bundle-redaction.js"
 import { upsertInboundToken, type TokenSource } from "./token-store.js"
 
 const DEFAULT_RETRY_DELAY_MS = 1_000
@@ -36,6 +37,16 @@ type RuntimeDrainOutboundMessagesInput = {
 }
 
 export type WechatStatusRuntimeDiagnosticEvent =
+  | {
+      type: "runtimeError"
+      stage:
+        | "loadPublicHelpers"
+        | "getUpdates"
+        | "persistGetUpdatesBuf"
+        | "drainOutboundMessages"
+        | "sendReplyMessage"
+      error: string
+    }
   | {
       type: "messageSkipped"
       reason: "missingFromUserId" | "missingText"
@@ -184,6 +195,14 @@ function toErrorMessage(error: unknown): string {
   return String(error)
 }
 
+function sanitizeRuntimeDiagnosticError(error: string): string {
+  return redactDebugBundleText(error, "diagnostics/wechat-status-runtime.runtime-error.txt")
+}
+
+function toRuntimeDiagnosticError(error: unknown): string {
+  return sanitizeRuntimeDiagnosticError(toErrorMessage(error))
+}
+
 function toInboundTokenSource(command: WechatSlashCommand | null): TokenSource {
   if (command?.type === "reply") {
     return "question"
@@ -221,6 +240,22 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
       })
   }
 
+  const emitRuntimeErrorDiagnostic = (
+    stage:
+      | "loadPublicHelpers"
+      | "getUpdates"
+      | "persistGetUpdatesBuf"
+      | "drainOutboundMessages"
+      | "sendReplyMessage",
+    error: unknown,
+  ) => {
+    emitDiagnosticEvent({
+      type: "runtimeError",
+      stage,
+      error: toRuntimeDiagnosticError(error),
+    })
+  }
+
   const poll = async (signal: AbortSignal) => {
     let initialized: {
       helpers: PublicHelpersForRuntime
@@ -234,19 +269,27 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
       try {
         let justInitialized = false
         if (!initialized) {
-          const helpers = await withAbort(loadPublicHelpers(input.publicHelpersOptions), signal)
-          const latestAccountState = helpers.latestAccountState
-          if (!latestAccountState) {
-            throw new Error("missing wechat account state")
+          try {
+            const helpers = await withAbort(loadPublicHelpers(input.publicHelpersOptions), signal)
+            const latestAccountState = helpers.latestAccountState
+            if (!latestAccountState) {
+              throw new Error("missing wechat account state")
+            }
+            initialized = {
+              helpers,
+              accountId: latestAccountState.accountId,
+              baseUrl: latestAccountState.baseUrl,
+              token: latestAccountState.token,
+              getUpdatesBuf: typeof latestAccountState.getUpdatesBuf === "string" ? latestAccountState.getUpdatesBuf : "",
+            }
+            justInitialized = true
+          } catch (error) {
+            if (isAbortError(error)) {
+              return
+            }
+            emitRuntimeErrorDiagnostic("loadPublicHelpers", error)
+            throw error
           }
-          initialized = {
-            helpers,
-            accountId: latestAccountState.accountId,
-            baseUrl: latestAccountState.baseUrl,
-            token: latestAccountState.token,
-            getUpdatesBuf: typeof latestAccountState.getUpdatesBuf === "string" ? latestAccountState.getUpdatesBuf : "",
-          }
-          justInitialized = true
         }
 
         if (!justInitialized && initialized && shouldReloadState({
@@ -259,15 +302,24 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
           continue
         }
 
-        const response = await withAbort(
-          initialized.helpers.getUpdates({
-            baseUrl: initialized.baseUrl,
-            token: initialized.token,
-            get_updates_buf: initialized.getUpdatesBuf,
-            timeoutMs: longPollTimeoutMs,
-          }),
-          signal,
-        )
+        let response: Awaited<ReturnType<PublicHelpersForRuntime["getUpdates"]>>
+        try {
+          response = await withAbort(
+            initialized.helpers.getUpdates({
+              baseUrl: initialized.baseUrl,
+              token: initialized.token,
+              get_updates_buf: initialized.getUpdatesBuf,
+              timeoutMs: longPollTimeoutMs,
+            }),
+            signal,
+          )
+        } catch (error) {
+          if (isAbortError(error)) {
+            return
+          }
+          emitRuntimeErrorDiagnostic("getUpdates", error)
+          throw error
+        }
 
         // 语义锁定：一旦服务端返回新的 get_updates_buf，立即推进游标；
         // 后续轮询即便失败，也不会回滚到旧 buf。
@@ -286,6 +338,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
               if (isAbortError(error)) {
                 return
               }
+              emitRuntimeErrorDiagnostic("persistGetUpdatesBuf", error)
               onRuntimeError(error)
             }
           }
@@ -318,6 +371,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
             if (isAbortError(error)) {
               return
             }
+            emitRuntimeErrorDiagnostic("drainOutboundMessages", error)
             onRuntimeError(error)
           }
         }
@@ -409,6 +463,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
               error: toErrorMessage(error),
               commandType: parsedCommand?.type ?? null,
             })
+            emitRuntimeErrorDiagnostic("sendReplyMessage", error)
             onRuntimeError(error)
           }
         }
