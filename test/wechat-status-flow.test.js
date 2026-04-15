@@ -2677,6 +2677,734 @@ test("wechat status runtime diagnostics: 记录 skipped/slash/send-failed 三类
   assert.ok(sendFailed)
 })
 
+test("wechat status runtime diagnostics: loadPublicHelpers 失败时写 runtimeError", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-load-public-helpers`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("helpers unavailable")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.deepEqual(runtimeError, {
+    type: "runtimeError",
+    stage: "loadPublicHelpers",
+    error: "helpers unavailable",
+  })
+})
+
+test("wechat status runtime diagnostics: runtimeError.error 在落盘前已做源头脱敏", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-source-redaction`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("Authorization: Bearer token-secret for user-secret")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(typeof runtimeError?.error, "string")
+  assert.doesNotMatch(runtimeError?.error ?? "", /token-secret|user-secret/)
+  assert.match(runtimeError?.error ?? "", /REDACTED/i)
+})
+
+test("wechat status runtime diagnostics: runtimeError.error 源头脱敏后仍保留非敏感上下文", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-source-context`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("Authorization: Bearer token-secret userId=user-secret requestId=req-123 upstream=502")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(typeof runtimeError?.error, "string")
+  assert.doesNotMatch(runtimeError?.error ?? "", /token-secret|user-secret/)
+  assert.match(runtimeError?.error ?? "", /requestId=req-123/)
+  assert.match(runtimeError?.error ?? "", /upstream=502/)
+})
+
+test("wechat status runtime diagnostics: runtimeError.error 源头脱敏不会因 free-form messageBody 尾部 key-like 文本泄漏", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-free-form-tail`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("messageBody=top secret reason: token-raw")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "messageBody=[REDACTED_MESSAGE_TEXT]")
+  assert.doesNotMatch(runtimeError?.error ?? "", /top secret|token-raw|reason:/)
+})
+
+test("wechat status runtime diagnostics: messageBody=https query-style 尾巴也必须整体脱敏", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-message-body-url-tail`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("messageBody=https://x/?conversation=private-chat&id=42")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "messageBody=[REDACTED_MESSAGE_TEXT]")
+  assert.doesNotMatch(runtimeError?.error ?? "", /private-chat|id=42|conversation=/)
+})
+
+test("wechat status runtime diagnostics: messageBody=hello requestId=req-123 upstream=502 保留安全上下文", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-message-body-safe-context`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("messageBody=hello requestId=req-123 upstream=502")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "messageBody=[REDACTED_MESSAGE_TEXT] requestId=req-123 upstream=502")
+  assert.doesNotMatch(runtimeError?.error ?? "", /messageBody=hello/)
+})
+
+test("wechat status runtime diagnostics: messageBody=https://x/?requestId=req-123&upstream=502 不保留 query-style 尾巴", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-message-body-query-tail`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("messageBody=https://x/?requestId=req-123&upstream=502")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "messageBody=[REDACTED_MESSAGE_TEXT]")
+  assert.doesNotMatch(runtimeError?.error ?? "", /requestId=req-123|upstream=502/)
+})
+
+test("wechat status runtime diagnostics: messageBody=hello code=E42 more text 不保留松散 code 尾巴", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-message-body-loose-code-tail`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("messageBody=hello code=E42 more text")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "messageBody=[REDACTED_MESSAGE_TEXT]")
+  assert.doesNotMatch(runtimeError?.error ?? "", /code=E42|more text/)
+})
+
+test("wechat status runtime diagnostics: contextToken=https://x/?requestId=req-123&upstream=502 不保留 query-style 尾巴", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-context-token-query-tail`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("contextToken=https://x/?requestId=req-123&upstream=502")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "contextToken=[REDACTED_CONTEXT_TOKEN]")
+  assert.doesNotMatch(runtimeError?.error ?? "", /requestId=req-123|upstream=502/)
+})
+
+test("wechat status runtime diagnostics: runtimeError.error 在 & 分隔 diagnostics 中保留后续非敏感上下文", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-query-style-context`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("Authorization=Bearer secret-token&requestId=req-123&upstream=502")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "Authorization=[REDACTED_TOKEN]&requestId=req-123&upstream=502")
+  assert.doesNotMatch(runtimeError?.error ?? "", /secret-token/)
+})
+
+test("wechat status runtime diagnostics: Authorization: Bearer 后仍保留 key: value 形式的后续上下文", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-bearer-colon-context`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("Authorization: Bearer token-secret requestId: req-123 upstream=502")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "Authorization: [REDACTED_TOKEN] requestId: req-123 upstream=502")
+  assert.doesNotMatch(runtimeError?.error ?? "", /token-secret/)
+})
+
+test("wechat status runtime diagnostics: Authorization: Bearer token-secret code=oauth-live requestId=req-123 不保留 code", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-bearer-code-space`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("Authorization: Bearer token-secret code=oauth-live requestId=req-123")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "Authorization: [REDACTED_TOKEN] requestId=req-123")
+  assert.doesNotMatch(runtimeError?.error ?? "", /token-secret|code=oauth-live/)
+})
+
+test("wechat status runtime diagnostics: Authorization: Bearer token-secret,requestId=req-123,upstream=502 保留逗号后的安全上下文", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-bearer-comma-context`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("Authorization: Bearer token-secret,requestId=req-123,upstream=502")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "Authorization: [REDACTED_TOKEN],requestId=req-123,upstream=502")
+  assert.doesNotMatch(runtimeError?.error ?? "", /token-secret/)
+})
+
+test("wechat status runtime diagnostics: Authorization=Bearer secret-token&code=oauth-live&requestId=req-123 不保留 code", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-bearer-code-ampersand`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("Authorization=Bearer secret-token&code=oauth-live&requestId=req-123")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "Authorization=[REDACTED_TOKEN]&requestId=req-123")
+  assert.doesNotMatch(runtimeError?.error ?? "", /secret-token|code=oauth-live/)
+})
+
+test("wechat status runtime diagnostics: Authorization=https://x/?requestId=req-123&code=oauth-live 不保留 query-style token 尾巴", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-authorization-query-tail`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("Authorization=https://x/?requestId=req-123&code=oauth-live")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.error, "Authorization=[REDACTED_TOKEN]")
+  assert.doesNotMatch(runtimeError?.error ?? "", /requestId=req-123|code=oauth-live/)
+})
+
+test("wechat status runtime diagnostics: getUpdates 失败时写 runtimeError", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-get-updates`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => ({
+      latestAccountState: {
+        accountId: "acc-get-updates",
+        token: "token-get-updates",
+        baseUrl: "https://wx.example.com",
+        getUpdatesBuf: "buf-get-updates",
+      },
+      getUpdates: async () => {
+        throw new Error("getUpdates failed")
+      },
+      sendMessageWeixin: async () => ({ messageId: "m-1" }),
+    }),
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() => diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "getUpdates"))
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "getUpdates",
+  )
+
+  assert.deepEqual(runtimeError, {
+    type: "runtimeError",
+    stage: "getUpdates",
+    error: "getUpdates failed",
+  })
+})
+
+test("wechat status runtime diagnostics: persistGetUpdatesBuf 失败时写 runtimeError", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-persist-get-updates-buf`
+  )
+
+  const diagnostics = []
+  let pollCount = 0
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => ({
+      latestAccountState: {
+        accountId: "acc-persist-error",
+        token: "token-persist-error",
+        baseUrl: "https://wx.example.com",
+        getUpdatesBuf: "buf-initial",
+      },
+      getUpdates: async () => {
+        pollCount += 1
+        if (pollCount === 1) {
+          return {
+            get_updates_buf: "buf-next",
+            msgs: [],
+          }
+        }
+        return new Promise(() => {})
+      },
+      persistGetUpdatesBuf: async () => {
+        throw new Error("persist failed")
+      },
+      sendMessageWeixin: async () => ({ messageId: "m-1" }),
+    }),
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "persistGetUpdatesBuf"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "persistGetUpdatesBuf",
+  )
+
+  assert.deepEqual(runtimeError, {
+    type: "runtimeError",
+    stage: "persistGetUpdatesBuf",
+    error: "persist failed",
+  })
+})
+
+test("wechat status runtime diagnostics: drainOutboundMessages 失败时写 runtimeError", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-drain-outbound-messages`
+  )
+
+  const diagnostics = []
+  let pollCount = 0
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    drainOutboundMessages: async () => {
+      throw new Error("drain failed")
+    },
+    loadPublicHelpers: async () => ({
+      latestAccountState: {
+        accountId: "acc-drain-error",
+        token: "token-drain-error",
+        baseUrl: "https://wx.example.com",
+        getUpdatesBuf: "buf-drain",
+      },
+      getUpdates: async () => {
+        pollCount += 1
+        if (pollCount === 1) {
+          return {
+            get_updates_buf: "buf-drain-next",
+            msgs: [],
+          }
+        }
+        return new Promise(() => {})
+      },
+      sendMessageWeixin: async () => ({ messageId: "m-1" }),
+    }),
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "drainOutboundMessages"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "drainOutboundMessages",
+  )
+
+  assert.deepEqual(runtimeError, {
+    type: "runtimeError",
+    stage: "drainOutboundMessages",
+    error: "drain failed",
+  })
+})
+
+test("wechat status runtime diagnostics: sendReplyMessage 失败时同时保留 replySendFailed 与 runtimeError", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-error-send-reply-message`
+  )
+
+  const diagnostics = []
+  let pollCount = 0
+  const rawSendFailureMessage = "Authorization: Bearer token-send-error userId=user-send-error"
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => ({
+      latestAccountState: {
+        accountId: "acc-send-error",
+        token: "token-send-error",
+        baseUrl: "https://wx.example.com",
+        getUpdatesBuf: "buf-send-error",
+      },
+      getUpdates: async () => {
+        pollCount += 1
+        if (pollCount === 1) {
+          return {
+            get_updates_buf: "buf-send-error-next",
+            msgs: [
+              {
+                from_user_id: "user-status",
+                context_token: "ctx-status",
+                item_list: [{ type: 1, text_item: { text: "/status" } }],
+              },
+            ],
+          }
+        }
+        return new Promise(() => {})
+      },
+      sendMessageWeixin: async () => {
+        throw new Error(rawSendFailureMessage)
+      },
+    }),
+    onSlashCommand: async () => "status reply",
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() =>
+      diagnostics.some((event) => event?.type === "runtimeError" && event?.stage === "sendReplyMessage"),
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const replySendFailed = diagnostics.find((event) => event?.type === "replySendFailed" && event?.to === "user-status")
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "sendReplyMessage",
+  )
+
+  assert.ok(replySendFailed)
+  assert.deepEqual(replySendFailed, {
+    type: "replySendFailed",
+    to: "user-status",
+    error: rawSendFailureMessage,
+    commandType: "status",
+  })
+  assert.ok(runtimeError)
+  assert.equal(runtimeError.type, "runtimeError")
+  assert.equal(runtimeError.stage, "sendReplyMessage")
+  assert.match(runtimeError.error, /\[REDACTED_TOKEN\]/)
+  assert.doesNotMatch(runtimeError.error, /token-send-error|user-send-error/)
+  assert.notEqual(runtimeError.error, replySendFailed.error)
+})
+
 test("wechat status runtime diagnostics: 诊断写入挂起不阻塞 slash 回复发送", async () => {
   const runtimeModule = await import(`../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}`)
 

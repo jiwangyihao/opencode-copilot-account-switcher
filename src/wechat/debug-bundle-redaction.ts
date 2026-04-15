@@ -13,6 +13,8 @@ export const REDACTED_CREDENTIAL = "[REDACTED_CREDENTIAL]"
 export const REDACTED_MESSAGE_TEXT = "[REDACTED_MESSAGE_TEXT]"
 export const REDACTED_CORRUPT_STRUCTURED_CONTENT = "[REDACTED_CORRUPT_STRUCTURED_CONTENT]"
 
+const SAFE_DIAGNOSTIC_SUFFIX_KEYS = ["requestId", "upstream", "status"]
+
 export function redactDebugBundleContent(
   content: Buffer,
   options: RedactDebugBundleContentOptions,
@@ -73,21 +75,35 @@ function redactPlainText(text: string): string {
   let redacted = redactQuotedEscapedJsonFragments(text)
   redacted = redactUnquotedEscapedJsonFragments(redacted)
   redacted = redactEmbeddedJsonFragments(redacted)
-  redacted = redacted.replace(/Bearer\s+[^\s\r\n]+/gi, `Bearer ${REDACTED_TOKEN}`)
+  redacted = redacted.replace(/Bearer\s+[^\s\r\n&?,;|]+/gi, `Bearer ${REDACTED_TOKEN}`)
 
+  redacted = replaceField(
+    redacted,
+    ["authorization"],
+    REDACTED_TOKEN,
+    {
+      allowColonFollowers: true,
+      followerKeys: SAFE_DIAGNOSTIC_SUFFIX_KEYS,
+      preserveWholeSuffixOnly: true,
+      allowAmpersandFollowers: true,
+      forbidQuestionMarkBeforeSuffix: true,
+    },
+  )
   redacted = replaceField(redacted, ["contextToken"], REDACTED_CONTEXT_TOKEN)
   redacted = replaceField(redacted, ["wechatAccountId", "accountId"], REDACTED_ACCOUNT_ID)
   redacted = replaceField(redacted, ["userId", "fromUserId", "toUserId"], REDACTED_USER_ID)
   redacted = replaceField(redacted, ["cookie", "credential", "credentials"], REDACTED_CREDENTIAL)
-  redacted = replaceField(
-    redacted,
-    ["accessToken", "refreshToken", "bearerToken", "token", "authorization", "secret", "password"],
-    REDACTED_TOKEN,
-  )
+  redacted = replaceField(redacted, ["accessToken", "refreshToken", "bearerToken", "token", "secret", "password"], REDACTED_TOKEN)
   redacted = replaceField(
     redacted,
     ["messageBody", "messageText", "message", "rawText", "rawMessage", "body", "text", "content"],
     REDACTED_MESSAGE_TEXT,
+    {
+      allowColonFollowers: true,
+      followerKeys: SAFE_DIAGNOSTIC_SUFFIX_KEYS,
+      preserveWholeSuffixOnly: true,
+      requireMinimumFollowerCount: 2,
+    },
   )
 
   return redacted
@@ -116,10 +132,86 @@ function redactUnquotedEscapedJsonFragments(text: string): string {
   })
 }
 
-function replaceField(text: string, keys: string[], replacement: string): string {
+function replaceField(
+  text: string,
+  keys: string[],
+  replacement: string,
+  options: {
+    allowColonFollowers?: boolean
+    followerKeys?: string[]
+    preserveWholeSuffixOnly?: boolean
+    requireMinimumFollowerCount?: number
+    allowAmpersandFollowers?: boolean
+    forbidQuestionMarkBeforeSuffix?: boolean
+    terminal?: boolean
+  } = {},
+): string {
   const escapedKeys = keys.map((key) => escapeRegExp(key)).join("|")
-  const matcher = new RegExp(`(\\b(?:${escapedKeys})\\b\\s*[:=]\\s*)([^\\r\\n]+)`, "gi")
-  return text.replace(matcher, `$1${replacement}`)
+  const followerValueSeparator = options.allowColonFollowers ? "(?:=|:)" : "="
+  const followerKeyPattern = (options.followerKeys ?? [])
+    .map((key) => escapeRegExp(key))
+    .join("|")
+  const structuredFollowerBoundary =
+    followerKeyPattern.length > 0
+      ? `(?:\\s+(?:${followerKeyPattern})\\s*${followerValueSeparator}|[&?](?:${followerKeyPattern})\\s*=|[,;|]+\\s*(?:${followerKeyPattern})\\s*${followerValueSeparator})`
+      : null
+  const matcher = new RegExp(
+    options.terminal
+      ? `(\\b(?:${escapedKeys})\\b\\s*[:=]\\s*)([^\\r\\n]*)`
+      : options.preserveWholeSuffixOnly
+        ? `(\\b(?:${escapedKeys})\\b\\s*[:=]\\s*)([^\\r\\n]*)`
+      : structuredFollowerBoundary
+        ? `(\\b(?:${escapedKeys})\\b\\s*[:=]\\s*)([^\\r\\n]*?)(?=(?:${structuredFollowerBoundary})|$)`
+        : `(\\b(?:${escapedKeys})\\b\\s*[:=]\\s*)([^\\r\\n]*)`,
+    "gi",
+  )
+  return text.replace(matcher, (_, prefix: string, value: string) => {
+    if (options.preserveWholeSuffixOnly) {
+      const suffix = extractSafeSuffixChain(value, {
+        allowColonFollowers: options.allowColonFollowers === true,
+        followerKeys: options.followerKeys ?? [],
+        allowAmpersandFollowers: options.allowAmpersandFollowers === true,
+        forbidQuestionMarkBeforeSuffix: options.forbidQuestionMarkBeforeSuffix === true,
+        minimumCount: options.requireMinimumFollowerCount ?? 1,
+      })
+      return `${prefix}${replacement}${suffix}`
+    }
+    return `${prefix}${replacement}`
+  })
+}
+
+function extractSafeSuffixChain(
+  value: string,
+  options: {
+    allowColonFollowers: boolean
+    followerKeys: string[]
+    allowAmpersandFollowers: boolean
+    forbidQuestionMarkBeforeSuffix: boolean
+    minimumCount: number
+  },
+): string {
+  if (options.followerKeys.length === 0) {
+    return ""
+  }
+
+  const followerKeyPattern = options.followerKeys.map((key) => escapeRegExp(key)).join("|")
+  const valueSeparator = options.allowColonFollowers ? "(?:=|:)" : "="
+  const segmentSeparator = options.allowAmpersandFollowers ? `[\\s,;|&]+` : `[\\s,;|]+`
+  const segment = `${segmentSeparator}(?:${followerKeyPattern})\\s*${valueSeparator}\\s*[^\\s,;|&?]+`
+  const suffixMatcher = new RegExp(`((?:${segment})+)$`, "i")
+  const suffixMatch = value.match(suffixMatcher)
+  if (!suffixMatch) {
+    return ""
+  }
+
+  const prefixValue = value.slice(0, value.length - suffixMatch[1].length)
+  if (options.forbidQuestionMarkBeforeSuffix && prefixValue.includes("?")) {
+    return ""
+  }
+
+  const segmentMatcher = new RegExp(segment, "gi")
+  const segmentCount = Array.from(suffixMatch[1].matchAll(segmentMatcher)).length
+  return segmentCount >= options.minimumCount ? suffixMatch[1] : ""
 }
 
 function tryParseJson(text: string): unknown | undefined {

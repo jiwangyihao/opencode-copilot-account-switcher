@@ -1,5 +1,6 @@
 import path from "node:path"
 import { execFile } from "node:child_process"
+import type { Dirent } from "node:fs"
 import { readdir, readFile, stat } from "node:fs/promises"
 import {
   REDACTED_ACCOUNT_ID,
@@ -35,7 +36,7 @@ type MissingPathEntry = {
 type SkippedBundleEntry = {
   bundlePath: string
   category: "state" | "diagnostics"
-  reason: "file-too-large" | "temporary-token-file" | "file-disappeared"
+  reason: "file-too-large" | "token-temp-file" | "empty-token-file" | "file-disappeared" | "file-read-failed"
   sourcePath: string | null
   redactedSourcePath?: string | null
 }
@@ -80,9 +81,12 @@ export type CollectWechatDebugBundleOptions = {
   platform?: string
 }
 
-const STATE_FILE_TARGETS = [{ relativePath: "broker.json" }] as const
+const STATE_FILE_TARGETS = [
+  { relativePath: "broker.json" },
+  { relativePath: "operator.json" },
+  { relativePath: "latest-account.json" },
+] as const
 const STATE_DIRECTORY_TARGETS = [
-  { relativePath: "tokens" },
   { relativePath: "notifications" },
   { relativePath: "requests" },
   { relativePath: "dead-letter" },
@@ -143,6 +147,18 @@ export async function collectWechatDebugBundle(
       sourcePath: path.join(stateRoot, target.relativePath),
     })
   }
+
+  await collectTokenDirectoryTarget({
+    category: "state",
+    entries,
+    manifestEntries,
+    missingPaths,
+    mode,
+    relativePath: "tokens",
+    skippedEntries,
+    visiblePathBuilder,
+    sourcePath: path.join(stateRoot, "tokens"),
+  })
 
   for (const target of STATE_DIRECTORY_TARGETS) {
     await collectDirectoryTarget({
@@ -228,7 +244,22 @@ async function collectFileTarget(input: {
   visiblePathBuilder: ReturnType<typeof createVisiblePathBuilder>
   sourcePath: string
 }) {
-  const fileStat = await safeStat(input.sourcePath)
+  let fileStat: Awaited<ReturnType<typeof safeStat>>
+  try {
+    fileStat = await safeStat(input.sourcePath)
+  } catch {
+    input.skippedEntries.push(
+      createSkippedBundleEntry({
+        bundlePath: bundlePathFor(input.category, input.visiblePathBuilder.peekVisibleRelativePath(input.relativePath)),
+        category: input.category,
+        reason: "file-read-failed",
+        sourcePath: input.sourcePath,
+        redactedSourcePath: input.visiblePathBuilder.peekVisibleSourcePath(input.relativePath),
+      }),
+    )
+    return
+  }
+
   if (!fileStat?.isFile()) {
     input.missingPaths.push({ category: input.category, relativePath: input.relativePath })
     return
@@ -242,6 +273,7 @@ async function collectFileTarget(input: {
     sourcePath: input.sourcePath,
     statsSize: fileStat.size,
     redactedSourcePath: input.visiblePathBuilder.toVisibleSourcePath(input.relativePath),
+    readFailureReason: "file-read-failed",
   })
   if (!bundleEntry) {
     return
@@ -269,32 +301,19 @@ async function collectDirectoryTarget(input: {
   }
 
   for (const filePath of await walkFiles(input.sourcePath)) {
-    const fileStat = await safeStat(filePath)
-    if (!fileStat?.isFile()) {
-      const relativeSubPath = toPosixPath(path.relative(input.sourcePath, filePath))
-      const relativePath = path.posix.join(input.relativePath, relativeSubPath)
-      input.skippedEntries.push({
-        bundlePath: bundlePathFor(input.category, input.visiblePathBuilder.peekVisibleRelativePath(relativePath)),
-        category: input.category,
-        reason: "file-disappeared",
-        sourcePath: input.mode === "sanitized" ? null : filePath,
-        ...(input.mode === "sanitized"
-          ? { redactedSourcePath: input.visiblePathBuilder.peekVisibleSourcePath(relativePath) }
-          : {}),
-      })
-      continue
-    }
-
     const relativeSubPath = toPosixPath(path.relative(input.sourcePath, filePath))
     const relativePath = path.posix.join(input.relativePath, relativeSubPath)
-    if (shouldSkipTemporaryTokenFile(input.mode, relativePath, filePath)) {
-      input.skippedEntries.push({
-        bundlePath: bundlePathFor(input.category, input.visiblePathBuilder.peekVisibleRelativePath(relativePath)),
-        category: input.category,
-        reason: "temporary-token-file",
-        sourcePath: null,
-        redactedSourcePath: input.visiblePathBuilder.peekVisibleSourcePath(relativePath),
-      })
+    const fileStat = await safeStat(filePath)
+    if (!fileStat?.isFile()) {
+      input.skippedEntries.push(
+        createSkippedBundleEntry({
+          bundlePath: bundlePathFor(input.category, input.visiblePathBuilder.peekVisibleRelativePath(relativePath)),
+          category: input.category,
+          reason: "file-disappeared",
+          sourcePath: filePath,
+          redactedSourcePath: input.visiblePathBuilder.peekVisibleSourcePath(relativePath),
+        }),
+      )
       continue
     }
 
@@ -316,6 +335,146 @@ async function collectDirectoryTarget(input: {
   }
 }
 
+async function collectTokenDirectoryTarget(input: {
+  category: "state"
+  entries: BundleEntry[]
+  manifestEntries: BundleManifestEntry[]
+  missingPaths: MissingPathEntry[]
+  mode: WechatDebugBundleMode
+  relativePath: string
+  skippedEntries: SkippedBundleEntry[]
+  visiblePathBuilder: ReturnType<typeof createVisiblePathBuilder>
+  sourcePath: string
+}) {
+  let directoryStat: Awaited<ReturnType<typeof safeStat>>
+  try {
+    directoryStat = await safeStat(input.sourcePath)
+  } catch {
+    input.skippedEntries.push(
+      createSkippedBundleEntry({
+        bundlePath: bundlePathFor(input.category, input.visiblePathBuilder.peekVisibleRelativePath(input.relativePath)),
+        category: input.category,
+        reason: "file-read-failed",
+        sourcePath: input.sourcePath,
+        redactedSourcePath: input.visiblePathBuilder.peekVisibleSourcePath(input.relativePath),
+      }),
+    )
+    input.missingPaths.push({ category: input.category, relativePath: input.relativePath })
+    return
+  }
+
+  if (!directoryStat?.isDirectory()) {
+    input.missingPaths.push({ category: input.category, relativePath: input.relativePath })
+    return
+  }
+
+  let hasEligibleToken = false
+
+  for (const filePath of await walkFiles(input.sourcePath, {
+    onDirectoryError: (directoryPath, error) => {
+      const relativeSubPath = toPosixPath(path.relative(input.sourcePath, directoryPath))
+      const relativePath = relativeSubPath.length > 0 ? path.posix.join(input.relativePath, relativeSubPath) : input.relativePath
+      input.skippedEntries.push(
+        createSkippedBundleEntry({
+          bundlePath: bundlePathFor(input.category, input.visiblePathBuilder.toVisibleRelativePath(relativePath)),
+          category: input.category,
+          reason: isMissingError(error) ? "file-disappeared" : "file-read-failed",
+          sourcePath: directoryPath,
+          redactedSourcePath: input.visiblePathBuilder.toVisibleSourcePath(relativePath),
+        }),
+      )
+    },
+  })) {
+    const relativeSubPath = toPosixPath(path.relative(input.sourcePath, filePath))
+    const relativePath = path.posix.join(input.relativePath, relativeSubPath)
+    const isTempFile = isTemporaryTokenFile(filePath)
+    const isJsonFile = path.extname(filePath).toLowerCase() === ".json"
+    if (!isTempFile && !isJsonFile) {
+      continue
+    }
+
+    const bundlePath = bundlePathFor(input.category, input.visiblePathBuilder.toVisibleRelativePath(relativePath))
+    const redactedSourcePath = input.visiblePathBuilder.toVisibleSourcePath(relativePath)
+
+    let fileStat: Awaited<ReturnType<typeof safeStat>>
+    try {
+      fileStat = await safeStat(filePath)
+    } catch {
+      input.skippedEntries.push(
+        createSkippedBundleEntry({
+          bundlePath,
+          category: input.category,
+          reason: "file-read-failed",
+          sourcePath: filePath,
+          redactedSourcePath,
+        }),
+      )
+      continue
+    }
+
+    if (!fileStat?.isFile()) {
+      input.skippedEntries.push(
+        createSkippedBundleEntry({
+          bundlePath,
+          category: input.category,
+          reason: "file-disappeared",
+          sourcePath: filePath,
+          redactedSourcePath,
+        }),
+      )
+      continue
+    }
+
+    if (isTempFile) {
+      input.skippedEntries.push(
+        createSkippedBundleEntry({
+          bundlePath,
+          category: input.category,
+          reason: "token-temp-file",
+          sourcePath: filePath,
+          redactedSourcePath,
+        }),
+      )
+      continue
+    }
+
+    if (fileStat.size === 0) {
+      input.skippedEntries.push(
+        createSkippedBundleEntry({
+          bundlePath,
+          category: input.category,
+          reason: "empty-token-file",
+          sourcePath: filePath,
+          redactedSourcePath,
+        }),
+      )
+      continue
+    }
+
+    const bundleEntry = await loadBundleEntry({
+      bundlePath,
+      category: input.category,
+      mode: input.mode,
+      skippedEntries: input.skippedEntries,
+      sourcePath: filePath,
+      statsSize: fileStat.size,
+      redactedSourcePath,
+      readFailureReason: "file-read-failed",
+    })
+    if (!bundleEntry) {
+      continue
+    }
+
+    hasEligibleToken = true
+    input.entries.push(bundleEntry)
+    input.manifestEntries.push(toManifestEntry(bundleEntry))
+  }
+
+  if (!hasEligibleToken) {
+    input.missingPaths.push({ category: input.category, relativePath: input.relativePath })
+  }
+}
+
 async function loadBundleEntry(input: {
   bundlePath: string
   category: "state" | "diagnostics"
@@ -324,18 +483,21 @@ async function loadBundleEntry(input: {
   sourcePath: string
   statsSize: number
   redactedSourcePath: string
+  readFailureReason?: "file-read-failed"
 }): Promise<BundleEntry | null> {
   const normalizedRedactedSourcePath =
     input.redactedSourcePath !== input.sourcePath ? input.redactedSourcePath : null
 
   if (shouldSkipLargeIrrelevantFile(input.sourcePath, input.statsSize)) {
-    input.skippedEntries.push({
-      bundlePath: input.bundlePath,
-      category: input.category,
-      reason: "file-too-large",
-      sourcePath: normalizedRedactedSourcePath ? null : input.sourcePath,
-      ...(normalizedRedactedSourcePath ? { redactedSourcePath: normalizedRedactedSourcePath } : {}),
-    })
+    input.skippedEntries.push(
+      createSkippedBundleEntry({
+        bundlePath: input.bundlePath,
+        category: input.category,
+        reason: "file-too-large",
+        sourcePath: input.sourcePath,
+        redactedSourcePath: input.redactedSourcePath,
+      }),
+    )
     return null
   }
 
@@ -344,13 +506,27 @@ async function loadBundleEntry(input: {
     content = await readFile(input.sourcePath)
   } catch (error) {
     if (isMissingError(error)) {
-      input.skippedEntries.push({
-        bundlePath: input.bundlePath,
-        category: input.category,
-        reason: "file-disappeared",
-        sourcePath: normalizedRedactedSourcePath ? null : input.sourcePath,
-        ...(normalizedRedactedSourcePath ? { redactedSourcePath: normalizedRedactedSourcePath } : {}),
-      })
+      input.skippedEntries.push(
+        createSkippedBundleEntry({
+          bundlePath: input.bundlePath,
+          category: input.category,
+          reason: "file-disappeared",
+          sourcePath: input.sourcePath,
+          redactedSourcePath: input.redactedSourcePath,
+        }),
+      )
+      return null
+    }
+    if (input.readFailureReason) {
+      input.skippedEntries.push(
+        createSkippedBundleEntry({
+          bundlePath: input.bundlePath,
+          category: input.category,
+          reason: input.readFailureReason,
+          sourcePath: input.sourcePath,
+          redactedSourcePath: input.redactedSourcePath,
+        }),
+      )
       return null
     }
     throw error
@@ -377,18 +553,25 @@ async function buildEnvironmentSummary(input: {
   stateRoot: string
 }): Promise<EnvironmentSummary> {
   const checks: Record<string, boolean> = {
-    "broker.json": await pathExists(path.join(input.stateRoot, "broker.json")),
-    tokens: await pathExists(path.join(input.stateRoot, "tokens")),
+    "broker.json": await pathExists(path.join(input.stateRoot, "broker.json"), { failSoft: true }),
+    tokens: await pathExists(path.join(input.stateRoot, "tokens"), { failSoft: true }),
     notifications: await pathExists(path.join(input.stateRoot, "notifications")),
     requests: await pathExists(path.join(input.stateRoot, "requests")),
     "dead-letter": await pathExists(path.join(input.stateRoot, "dead-letter")),
     instances: await pathExists(path.join(input.stateRoot, "instances")),
     "wechat-status-runtime.diagnostics.jsonl": await pathExists(
       path.join(input.stateRoot, "wechat-status-runtime.diagnostics.jsonl"),
+      { failSoft: true },
     ),
-    "wechat-broker.diagnostics.jsonl": await pathExists(path.join(input.stateRoot, "wechat-broker.diagnostics.jsonl")),
-    "wechat-bridge.diagnostics.jsonl": await pathExists(path.join(input.stateRoot, "wechat-bridge.diagnostics.jsonl")),
-    "broker-startup.diagnostics.log": await pathExists(path.join(input.stateRoot, "broker-startup.diagnostics.log")),
+    "wechat-broker.diagnostics.jsonl": await pathExists(path.join(input.stateRoot, "wechat-broker.diagnostics.jsonl"), {
+      failSoft: true,
+    }),
+    "wechat-bridge.diagnostics.jsonl": await pathExists(path.join(input.stateRoot, "wechat-bridge.diagnostics.jsonl"), {
+      failSoft: true,
+    }),
+    "broker-startup.diagnostics.log": await pathExists(path.join(input.stateRoot, "broker-startup.diagnostics.log"), {
+      failSoft: true,
+    }),
   }
 
   return {
@@ -404,15 +587,30 @@ async function buildEnvironmentSummary(input: {
   }
 }
 
-async function walkFiles(rootPath: string): Promise<string[]> {
-  const entries = await readdir(rootPath, { withFileTypes: true })
+async function walkFiles(
+  rootPath: string,
+  options: {
+    onDirectoryError?: (directoryPath: string, error: unknown) => void
+  } = {},
+): Promise<string[]> {
+  let entries: Dirent<string>[]
+  try {
+    entries = await readdir(rootPath, { withFileTypes: true })
+  } catch (error) {
+    if (options.onDirectoryError) {
+      options.onDirectoryError(rootPath, error)
+      return []
+    }
+    throw error
+  }
+
   const sortedEntries = [...entries].sort((left, right) => left.name.localeCompare(right.name))
   const files: string[] = []
 
   for (const entry of sortedEntries) {
     const entryPath = path.join(rootPath, entry.name)
     if (entry.isDirectory()) {
-      files.push(...(await walkFiles(entryPath)))
+      files.push(...(await walkFiles(entryPath, options)))
       continue
     }
     if (entry.isFile()) {
@@ -430,8 +628,8 @@ function shouldSkipLargeIrrelevantFile(filePath: string, size: number): boolean 
   return !LARGE_FILE_SAFE_EXTENSIONS.has(path.extname(filePath).toLowerCase())
 }
 
-function shouldSkipTemporaryTokenFile(mode: WechatDebugBundleMode, relativePath: string, sourcePath: string): boolean {
-  return mode === "sanitized" && toPosixPath(relativePath).startsWith("tokens/") && path.basename(sourcePath).endsWith(".tmp")
+function isTemporaryTokenFile(filePath: string): boolean {
+  return path.basename(filePath).endsWith(".tmp")
 }
 
 function createVisiblePathBuilder(mode: WechatDebugBundleMode, stateRoot: string) {
@@ -501,6 +699,24 @@ function createBundleEntry(entry: BundleEntry): BundleEntry {
   }
 }
 
+function createSkippedBundleEntry(entry: {
+  bundlePath: string
+  category: "state" | "diagnostics"
+  reason: SkippedBundleEntry["reason"]
+  sourcePath: string
+  redactedSourcePath: string
+}): SkippedBundleEntry {
+  const normalizedRedactedSourcePath = entry.redactedSourcePath !== entry.sourcePath ? entry.redactedSourcePath : null
+
+  return {
+    bundlePath: entry.bundlePath,
+    category: entry.category,
+    reason: entry.reason,
+    sourcePath: normalizedRedactedSourcePath ? null : entry.sourcePath,
+    ...(normalizedRedactedSourcePath ? { redactedSourcePath: normalizedRedactedSourcePath } : {}),
+  }
+}
+
 function toManifestEntry(entry: BundleEntry): BundleManifestEntry {
   return {
     bundlePath: entry.bundlePath,
@@ -555,8 +771,15 @@ async function safeStat(filePath: string) {
   }
 }
 
-async function pathExists(filePath: string): Promise<boolean> {
-  return (await safeStat(filePath)) !== null
+async function pathExists(filePath: string, options: { failSoft?: boolean } = {}): Promise<boolean> {
+  try {
+    return (await safeStat(filePath)) !== null
+  } catch (error) {
+    if (options.failSoft) {
+      return false
+    }
+    throw error
+  }
 }
 
 function isMissingError(error: unknown): error is NodeJS.ErrnoException {
