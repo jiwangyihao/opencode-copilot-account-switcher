@@ -101,11 +101,16 @@ type WechatStatusRuntimeDiagnosticEvent =
 
 1. 仍沿用当前 `onDiagnosticEvent` -> diagnostics file writer 这条链，不新增第二个 writer。
 2. `error` 只保留稳定可读的错误摘要，不写完整堆栈。
-3. 现有事件：
+3. `runtimeError.error` 既然会进入 diagnostics 并可能被导出到 sanitized bundle，就必须继续服从现有 diagnostics 脱敏边界：实现上不能直接把未经处理的原始错误字符串原样落盘并指望导出器兜底。
+4. 现有事件：
    - `messageSkipped`
    - `slashCommandRecognized`
    - `replySendFailed`
    都保留，不与 `runtimeError` 合并。
+5. 对 `sendReplyMessage` 失败这一类场景，兼容语义也必须写死：
+   - 现有 `replySendFailed` 事件继续保留
+   - 同一次失败可以额外补一条 `runtimeError { stage: "sendReplyMessage", ... }`
+   - 但不能因为引入 `runtimeError` 而移除或重命名现有 `replySendFailed`
 
 ### 2. runtime 错误阶段落点
 
@@ -127,7 +132,7 @@ type WechatStatusRuntimeDiagnosticEvent =
 
 ### 3. 调试包新增导出项
 
-在当前 bundle collector 里新增这些状态文件：
+在当前 bundle collector 里新增这些状态文件/状态类目：
 
 - `state/operator.json`
 - `state/latest-account.json`
@@ -136,8 +141,22 @@ type WechatStatusRuntimeDiagnosticEvent =
 约束：
 
 1. 若不存在，进入 `missingPaths`，不让整包失败。
-2. `tokens/` 只导出实际存在且非空的文件，不因空目录而写伪条目。
-3. `operator.json` 与 `latest-account.json` 在 manifest 中应作为 `state` 类别条目出现。
+2. 这里说的 `tokens/**` 不是“把整个目录无条件全打包”，而是只导出**最终 token state 文件**：
+   - 常规 `.json` token 文件
+   - 非空
+   - 非 `.*.tmp` 这类临时文件
+3. `tokens/` 目录存在但没有任何符合条件的 token 文件时，仍要把 `tokens/` 作为一条类别级缺失信号写进 `missingPaths`，从而明确表达“当前没有可用 token 证据”。
+   - 这里沿用当前 manifest 的目录类目语义，实际 `relativePath` 应继续使用 `tokens`（不带尾斜杠），不新引入目录路径写法特例。
+4. 对新增导出项，缺失与失败要继续沿现有 collector 的两层语义表达，而不是混成一类：
+   - 真正不存在：`missingPaths`
+   - 枚举后瞬时消失、空文件、临时文件、读取失败等单文件问题：`skippedEntries` + 稳定原因
+   - 不因为单个新增文件有问题就让整包失败
+5. 这轮新增/依赖的 `skippedEntries.reason` 取值也要固定下来，至少包括：
+   - `token-temp-file`
+   - `empty-token-file`
+   - `file-disappeared`
+   - `file-read-failed`
+6. `operator.json` 与 `latest-account.json` 在 manifest 中应作为 `state` 类别条目出现。
 
 ### 4. 脱敏规则补充
 
@@ -149,6 +168,8 @@ type WechatStatusRuntimeDiagnosticEvent =
    - sanitized 模式下，`accountId`、`token` 脱敏。
 3. `tokens/**`
    - sanitized 模式下，`contextToken`、账号/用户标识继续按现有规则脱敏。
+4. `runtimeError.error`
+   - sanitized 模式下也必须保证不泄漏账号标识、token、cookie、bearer、message body 等敏感内容。
 
 ### 5. manifest / environment-summary 变化
 
@@ -167,13 +188,17 @@ manifest 需要反映新增导出项：
 
 至少覆盖：
 
-1. `loadPublicHelpers` / `getUpdates` / `sendReplyMessage` 失败时会写 `runtimeError`，且 `stage` 正确。
-2. 导出 full bundle 时会包含：
+1. `loadPublicHelpers` 失败时会写 `runtimeError`，且 `stage = loadPublicHelpers`。
+2. `getUpdates` 失败时会写 `runtimeError`，且 `stage = getUpdates`。
+3. `persistGetUpdatesBuf` 失败时会写 `runtimeError`，且 `stage = persistGetUpdatesBuf`。
+4. `drainOutboundMessages` 失败时会写 `runtimeError`，且 `stage = drainOutboundMessages`。
+5. `sendReplyMessage` 失败时会写 `runtimeError`，且 `stage = sendReplyMessage`。
+6. 导出 full bundle 时会包含：
    - `operator.json`
    - `latest-account.json`
    - 非空 token 文件
-3. sanitized bundle 会对这些新增文件继续执行脱敏，不泄漏 `token` / `contextToken` / 账号标识。
-4. 这些文件缺失时只进入 `missingPaths`，导出仍继续成功。
+7. sanitized bundle 会对这些新增文件继续执行脱敏，不泄漏 `token` / `contextToken` / 账号标识；`runtimeError.error` 也服从同样的导出脱敏边界。
+8. 这些文件真正缺失时进入 `missingPaths`；空 token 文件、临时 token 文件、枚举后消失或读取失败的单文件进入 `skippedEntries`，并使用上文固定的 reason 字面量；导出仍继续成功。
 
 ## 成功判定
 
