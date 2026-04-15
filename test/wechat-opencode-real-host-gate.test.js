@@ -348,6 +348,8 @@ test("real host install: uses a host-loadable dist entry file path instead of a 
     assert.equal(calls[0].options.timeoutMs, 120_000)
     assert.equal(calls[0].options.env.HOME, "C:/tmp/opencode-host")
     assert.equal(calls[0].options.env.USERPROFILE, "C:/tmp/opencode-host")
+    assert.equal(calls[0].options.env.OPENCODE_TEST_HOME, "C:/tmp/opencode-host")
+    assert.equal(calls[0].options.env.OPENCODE_DISABLE_PROJECT_CONFIG, "1")
     assert.equal(calls[0].options.env.XDG_CONFIG_HOME, "C:/tmp/opencode-host/config")
     assert.equal(calls[0].options.env.XDG_CACHE_HOME, "C:/tmp/opencode-host/cache")
     assert.equal(calls[0].options.env.XDG_DATA_HOME, "C:/tmp/opencode-host/data")
@@ -1230,6 +1232,69 @@ test("real host PTY helper: providers login sends Enter after Add credential bef
   }
 })
 
+test("real host PTY helper: providers login treats common-settings/provider-settings screen as plugin menu even before 微信通知 is visible", async () => {
+  const dataEmitter = new EventEmitter()
+  const exitEmitter = new EventEmitter()
+  const sentInputs = []
+  const fakePty = {
+    pid: 1234,
+    cols: 120,
+    rows: 30,
+    process: "opencode",
+    handleFlowControl: false,
+    onData(listener) {
+      dataEmitter.on("data", listener)
+      return { dispose: () => dataEmitter.off("data", listener) }
+    },
+    onExit(listener) {
+      exitEmitter.on("exit", listener)
+      return { dispose: () => exitEmitter.off("exit", listener) }
+    },
+    write(input) {
+      sentInputs.push(input)
+    },
+    kill() {
+      exitEmitter.emit("exit", { exitCode: 0 })
+    },
+  }
+  const buffers = [
+    "T  Add credential",
+    "GitHub Copilot 账号\nGuided Loop Safety\n通用设置\nProvider 专属设置",
+  ]
+  let readCount = 0
+
+  const result = await openGitHubCopilotPluginMenuThroughRealOpencode({
+    host: {
+      hostRoot: "C:/tmp/opencode-host",
+      cacheRoot: "C:/tmp/opencode-host/cache",
+      configRoot: "C:/tmp/opencode-host/config",
+      dataRoot: "C:/tmp/opencode-host/data",
+      logRoot: "C:/tmp/opencode-host/logs",
+      tmpRoot: "C:/tmp/opencode-host/tmp",
+      runtimeCommand: "opencode",
+      runtimeArgs: [],
+      runtimeKind: "binary",
+    },
+    artifact: {
+      entryFilePath: "C:/repo/opencode-copilot-account-switcher/dist/index.js",
+    },
+    inlineConfigContent: JSON.stringify({ plugin: ["C:/repo/opencode-copilot-account-switcher/dist/index.js"] }),
+    spawnPtyImpl: () => fakePty,
+    readScreenImpl: async () => buffers[Math.min(readCount++, buffers.length - 1)],
+  })
+
+  try {
+    assert.equal(result.ok, true)
+    assert.equal(result.stage, "plugin-menu-visible")
+    assert.match(result.pluginMenuScreen, /Guided Loop Safety/i)
+    assert.match(result.pluginMenuScreen, /通用设置/)
+    assert.match(result.pluginMenuScreen, /Provider 专属设置/)
+    assert.deepEqual(sentInputs.slice(0, 1), ["\r"])
+  } finally {
+    await stopRealOpencodePty(result.session)
+  }
+})
+
 test("real host PTY helper: retries Enter when Add credential screen does not advance on first submit", async () => {
   const dataEmitter = new EventEmitter()
   const exitEmitter = new EventEmitter()
@@ -1389,6 +1454,79 @@ test("real host PTY helper: retries the full Add credential -> plugin menu open 
     assert.equal(spawnCount, 2)
     assert.deepEqual(sentInputsByAttempt[0], ["\r", "\u0003"])
     assert.deepEqual(sentInputsByAttempt[1], ["\r"])
+  } finally {
+    await stopRealOpencodePty(result.session)
+  }
+})
+
+test("real host PTY helper: providers login uses isolated hostRoot cwd to avoid project-local plugin leakage", async () => {
+  const sentInputsByAttempt = []
+  const calls = []
+
+  const createFakePty = (attempt) => {
+    const dataEmitter = new EventEmitter()
+    const exitEmitter = new EventEmitter()
+    const fakePty = {
+      pid: 1234 + attempt,
+      cols: 120,
+      rows: 30,
+      process: "opencode",
+      handleFlowControl: false,
+      onData(listener) {
+        dataEmitter.on("data", listener)
+        return { dispose: () => dataEmitter.off("data", listener) }
+      },
+      onExit(listener) {
+        exitEmitter.on("exit", listener)
+        return { dispose: () => exitEmitter.off("exit", listener) }
+      },
+      write(input) {
+        sentInputsByAttempt[attempt].push(input)
+      },
+      kill() {
+        exitEmitter.emit("exit", { exitCode: 0 })
+      },
+    }
+
+    return fakePty
+  }
+
+  let attempt = 0
+  const result = await openGitHubCopilotPluginMenuThroughRealOpencode({
+    host: {
+      hostRoot: "C:/tmp/opencode-host",
+      projectRoot: REPO_ROOT,
+      cacheRoot: "C:/tmp/opencode-host/cache",
+      configRoot: "C:/tmp/opencode-host/config",
+      dataRoot: "C:/tmp/opencode-host/data",
+      logRoot: "C:/tmp/opencode-host/logs",
+      tmpRoot: "C:/tmp/opencode-host/tmp",
+      runtimeCommand: "opencode",
+      runtimeArgs: [],
+      runtimeKind: "binary",
+    },
+    artifact: {
+      entryFilePath: "C:/repo/opencode-copilot-account-switcher/dist/index.js",
+    },
+    inlineConfigContent: JSON.stringify({ plugin: ["C:/repo/opencode-copilot-account-switcher/dist/index.js"] }),
+    spawnPtyImpl: (command, args, options) => {
+      sentInputsByAttempt[attempt] = []
+      calls.push({ command, args, options })
+      return createFakePty(attempt++)
+    },
+    readScreenImpl: async () => {
+      const currentAttempt = Math.max(0, attempt - 1)
+      const enterCount = sentInputsByAttempt[currentAttempt].filter((input) => input === "\r").length
+      if (enterCount === 0) {
+        return "T  Add credential"
+      }
+      return "Guided Loop Safety\n通用设置\nProvider 专属设置"
+    },
+  })
+
+  try {
+    assert.equal(result.ok, true)
+    assert.equal(calls[0].options.cwd, "C:/tmp/opencode-host")
   } finally {
     await stopRealOpencodePty(result.session)
   }

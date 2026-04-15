@@ -244,6 +244,8 @@ export function buildRealHostEnv(host, baseEnv = process.env, {
 
   const nextEnv = {
     ...env,
+    OPENCODE_TEST_HOME: host.hostRoot,
+    OPENCODE_DISABLE_PROJECT_CONFIG: "1",
     HOME: host.hostRoot,
     USERPROFILE: host.hostRoot,
     XDG_CONFIG_HOME: host.configRoot,
@@ -402,6 +404,7 @@ export async function spawnRealOpencodePty({
   host,
   spawnPtyImpl = loadNodePtySpawn(),
   commandArgsOverride,
+  workingDirectoryOverride,
   platform = process.platform,
   disableInheritedMcp = false,
   inlineConfigContent,
@@ -421,7 +424,7 @@ export async function spawnRealOpencodePty({
     name,
     cols,
     rows,
-    cwd: host.projectRoot ?? host.hostRoot,
+    cwd: workingDirectoryOverride ?? host.projectRoot ?? host.hostRoot,
     env: buildRealHostEnv(host, process.env, {
       inlineConfigContent: resolvedInlineConfigContent,
     }),
@@ -570,6 +573,7 @@ export async function openGitHubCopilotPluginMenuThroughRealOpencode({
       session = await spawnRealOpencodePty({
         host,
         inlineConfigContent: resolvedInlineConfigContent,
+        workingDirectoryOverride: host.hostRoot,
         commandArgsOverride: [
           "providers",
           "login",
@@ -640,7 +644,7 @@ async function advanceFromAddCredentialToPluginMenu(session, addCredentialScreen
   let currentScreen = addCredentialScreen
 
   while (Date.now() - startedAt <= screenWaitTimeoutMs) {
-    if (/WeChat notifications|微信通知/.test(currentScreen)) {
+    if (screenLooksLikePluginMenu(currentScreen)) {
       return currentScreen
     }
 
@@ -652,7 +656,7 @@ async function advanceFromAddCredentialToPluginMenu(session, addCredentialScreen
       while (Date.now() - submitStartedAt <= inputChangeTimeoutMs) {
         currentScreen = await readSessionScreen(session, readScreenImpl)
 
-        if (/WeChat notifications|微信通知/.test(currentScreen)) {
+        if (screenLooksLikePluginMenu(currentScreen)) {
           return currentScreen
         }
 
@@ -673,7 +677,25 @@ async function advanceFromAddCredentialToPluginMenu(session, addCredentialScreen
     currentScreen = await readSessionScreen(session, readScreenImpl)
   }
 
-  throw new Error(`menu buffer did not match /WeChat notifications|微信通知/ within ${screenWaitTimeoutMs}ms`)
+  throw new Error(`menu buffer did not match plugin menu markers within ${screenWaitTimeoutMs}ms`)
+}
+
+function screenLooksLikePluginMenu(screenText) {
+  const markers = [
+    /Guided Loop Safety/i,
+    /Common settings|通用设置/i,
+    /Provider settings|Provider 专属设置/i,
+    /WeChat notifications|微信通知/i,
+  ]
+
+  let matches = 0
+  for (const marker of markers) {
+    if (marker.test(String(screenText ?? ""))) {
+      matches += 1
+    }
+  }
+
+  return matches >= 2
 }
 
 export async function openWechatNotificationsSubmenuThroughRealOpencode({
