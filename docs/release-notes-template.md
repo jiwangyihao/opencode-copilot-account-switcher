@@ -17,12 +17,13 @@
 - …
 
 ## 升级方式
-- `opencode plugin opencode-copilot-account-switcher@x.y.z --force`
+- `opencode plugin opencode-copilot-account-switcher@x.y.z --force -g`
 
 说明：
 - `## 适合谁升级` 必写，控制在 1-2 条。
 - `## 你会看到的变化` 必写，控制在 2-5 条。
 - `## 升级方式` 必写，且必须给出带明确版本号的命令，不能只写 `latest` 或裸包名。
+- 默认升级命令应写成带 `-g/--global` 的全局安装/升级路径；如果某次正文故意只针对当前项目 `.opencode`，必须额外把“不带 `-g` 只影响项目局部配置”的语义写清楚。
 - 只有确有实验性能力时才保留 `## 实验性功能`。
 - 只有确实影响升级判断时才保留 `## 注意事项`。
 - 正文整体控制在 5-10 行可扫读内容内，优先写用户会感受到什么变化。
