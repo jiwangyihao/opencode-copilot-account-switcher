@@ -12,7 +12,7 @@ import {
   type ProviderActionOutput,
 } from "./menu-runtime.js"
 import { persistAccountSwitch } from "./plugin-actions.js"
-import { buildPluginHooks } from "./plugin-hooks.js"
+import { buildPluginHooks, isBridgeCapableBrokerOwnerInput } from "./plugin-hooks.js"
 import {
   readCommonSettingsStore,
   readCommonSettingsStoreSync,
@@ -32,6 +32,22 @@ import { readAuth, readStore, writeStore, type AccountEntry, type StoreFile, typ
 
 function now() {
   return Date.now()
+}
+
+type WechatBrokerConnection = {
+  endpoint: string
+}
+
+let brokerEnsurePromiseInProcess: Promise<WechatBrokerConnection> | undefined
+let brokerEnsureSucceededInProcess = false
+
+function toWechatBrokerConnection(value: unknown): WechatBrokerConnection {
+  if (typeof value === "object" && value !== null && typeof (value as { endpoint?: unknown }).endpoint === "string") {
+    return {
+      endpoint: (value as { endpoint: string }).endpoint,
+    }
+  }
+  throw new Error("Wechat broker 启动结果缺少 endpoint")
 }
 
 function formatBrokerStartupError(error: unknown) {
@@ -377,6 +393,9 @@ async function createAccountSwitcherPlugin(
   const ensureWechatBrokerStarted = (input as {
     ensureWechatBrokerStarted?: () => Promise<unknown>
   }).ensureWechatBrokerStarted ?? (async () => connectOrSpawnBroker())
+  const createWechatBridgeLifecycleImpl = (input as {
+    createWechatBridgeLifecycleImpl?: Parameters<typeof buildPluginHooks>[0]["createWechatBridgeLifecycleImpl"]
+  }).createWechatBridgeLifecycleImpl
   const diagnosticsPath = brokerStartupDiagnosticsPath()
   const showToast = (input as {
     client?: {
@@ -385,14 +404,35 @@ async function createAccountSwitcherPlugin(
       }
     }
   }).client?.tui?.showToast
-  void Promise.resolve()
-    .then(() => ensureWechatBrokerStarted())
-    .catch((error) => recordBrokerStartupFailure({
-      provider,
-      diagnosticsPath,
-      error,
-      showToast,
-    }))
+  const isBridgeCapable = isBridgeCapableBrokerOwnerInput({ client, serverUrl })
+  let initialWechatBrokerPromise: Promise<WechatBrokerConnection> | undefined
+  if (isBridgeCapable && !brokerEnsureSucceededInProcess) {
+    if (!brokerEnsurePromiseInProcess) {
+      const brokerEnsurePromise = Promise.resolve()
+        .then(() => ensureWechatBrokerStarted())
+        .then((result) => toWechatBrokerConnection(result))
+        .then((result) => {
+          brokerEnsureSucceededInProcess = true
+          return result
+        })
+      brokerEnsurePromiseInProcess = brokerEnsurePromise
+
+      void brokerEnsurePromise
+        .catch((error) => recordBrokerStartupFailure({
+          provider,
+          diagnosticsPath,
+          error,
+          showToast,
+        }))
+        .finally(() => {
+          if (brokerEnsurePromiseInProcess === brokerEnsurePromise) {
+            brokerEnsurePromiseInProcess = undefined
+          }
+        })
+    }
+
+    initialWechatBrokerPromise = brokerEnsurePromiseInProcess
+  }
   const persistStore = (store: StoreFile, meta?: StoreWriteDebugMeta) => writeStore(store, { debug: meta })
   const codexClient = {
     auth: {
@@ -593,6 +633,8 @@ async function createAccountSwitcherPlugin(
     directory,
     serverUrl,
     ensureWechatBrokerStarted: async () => {},
+    initialWechatBrokerPromise,
+    ...(createWechatBridgeLifecycleImpl ? { createWechatBridgeLifecycleImpl } : {}),
     loadCommonSettings: readCommonSettingsStore,
     loadCommonSettingsSync: readCommonSettingsStoreSync,
   })

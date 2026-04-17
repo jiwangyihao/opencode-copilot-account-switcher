@@ -31,11 +31,14 @@ type LaunchOptions = {
   spawnImpl?: (endpoint: string, stateRoot: string) => { pid?: number | undefined; unref?: (() => void) | undefined }
   retireBrokerImpl?: (metadata: BrokerMetadata) => Promise<void> | void
   pingImpl?: (endpoint: string) => Promise<boolean>
+  isProcessAliveImpl?: (pid: number) => boolean
   onLockAcquired?: (lock: LaunchLockContent) => void
 }
 
 const DEFAULT_BACKOFF_MS = 250
 const DEFAULT_MAX_ATTEMPTS = 20
+const DEFAULT_BOOTING_BROKER_WAIT_STEP_MS = 100
+const DEFAULT_BOOTING_BROKER_WAIT_STEPS = 20
 
 type ResolveBrokerSpawnCommandOptions = {
   execPath?: string
@@ -58,6 +61,34 @@ type WechatBrokerLauncherDiagnosticEvent = {
   previousVersion?: string
   nextVersion?: string
 }
+
+type CompatibleBrokerState =
+  | {
+      status: "ready"
+      metadata: BrokerMetadata
+    }
+  | {
+      status: "booting"
+      metadata: BrokerMetadata
+    }
+  | {
+      status: "unavailable"
+    }
+
+type WaitForBootingBrokerResult =
+  | {
+      status: "ready"
+      metadata: BrokerMetadata
+    }
+  | {
+      status: "replaced"
+      metadata: BrokerMetadata
+    }
+  | {
+      status: "failed"
+      metadata: BrokerMetadata
+    }
+  | null
 
 async function appendBrokerLauncherDiagnostic(stateRoot: string, event: WechatBrokerLauncherDiagnosticEvent) {
   try {
@@ -236,7 +267,7 @@ async function readLaunchLock(filePath: string): Promise<LaunchLockContent | nul
   }
 }
 
-async function acquireLaunchLock(filePath: string): Promise<AcquireLaunchLockResult> {
+async function acquireLaunchLock(filePath: string, isProcessAliveImpl: (pid: number) => boolean): Promise<AcquireLaunchLockResult> {
   const lock: LaunchLockContent = {
     pid: process.pid,
     acquiredAt: Date.now(),
@@ -254,7 +285,7 @@ async function acquireLaunchLock(filePath: string): Promise<AcquireLaunchLockRes
     }
 
     const existing = await readLaunchLock(filePath)
-    if (existing && isProcessAlive(existing.pid)) {
+    if (existing && isProcessAliveImpl(existing.pid)) {
       return { lock: null }
     }
 
@@ -266,25 +297,69 @@ async function acquireLaunchLock(filePath: string): Promise<AcquireLaunchLockRes
   }
 }
 
-async function isBrokerAlive(
+function getBrokerIdentity(metadata: BrokerMetadata): string {
+  return `${metadata.pid}:${metadata.startedAt}:${metadata.version}:${metadata.endpoint}`
+}
+
+async function readCompatibleBrokerState(
   brokerFilePath: string,
   pingImpl: (endpoint: string) => Promise<boolean>,
+  isProcessAliveImpl: (pid: number) => boolean,
   expectedVersion?: string,
-): Promise<BrokerMetadata | null> {
+): Promise<CompatibleBrokerState> {
   const metadata = await readBrokerMetadata(brokerFilePath)
   if (!metadata) {
-    return null
+    return { status: "unavailable" }
   }
 
   if (isNonEmptyString(expectedVersion) && !isBrokerVersionCompatible(metadata.version, expectedVersion)) {
-    return null
+    return { status: "unavailable" }
+  }
+
+  if (!isProcessAliveImpl(metadata.pid)) {
+    return { status: "unavailable" }
   }
 
   const ok = await pingImpl(metadata.endpoint)
-  if (!ok) {
+  if (ok) {
+    return {
+      status: "ready",
+      metadata,
+    }
+  }
+
+  return {
+    status: "booting",
+    metadata,
+  }
+}
+
+async function isBrokerAlive(
+  brokerFilePath: string,
+  pingImpl: (endpoint: string) => Promise<boolean>,
+  isProcessAliveImpl: (pid: number) => boolean,
+  expectedVersion?: string,
+): Promise<BrokerMetadata | null> {
+  const state = await readCompatibleBrokerState(brokerFilePath, pingImpl, isProcessAliveImpl, expectedVersion)
+  if (state.status !== "ready") {
     return null
   }
-  return metadata
+
+  return state.metadata
+}
+
+async function readBootingCompatibleBroker(
+  brokerFilePath: string,
+  pingImpl: (endpoint: string) => Promise<boolean>,
+  isProcessAliveImpl: (pid: number) => boolean,
+  expectedVersion?: string,
+): Promise<BrokerMetadata | null> {
+  const state = await readCompatibleBrokerState(brokerFilePath, pingImpl, isProcessAliveImpl, expectedVersion)
+  if (state.status !== "booting") {
+    return null
+  }
+
+  return state.metadata
 }
 
 async function readVersionMismatchedBroker(
@@ -353,6 +428,61 @@ function defaultSpawnImpl(endpoint: string, stateRoot: string) {
   return child
 }
 
+async function waitForBootingBrokerToBecomeReady(input: {
+  brokerFilePath: string
+  bootingBrokerIdentity: string
+  pingImpl: (endpoint: string) => Promise<boolean>
+  isProcessAliveImpl: (pid: number) => boolean
+  expectedVersion?: string
+  waitStepMs: number
+  maxWaitSteps: number
+}): Promise<WaitForBootingBrokerResult> {
+  let lastBootingBroker: BrokerMetadata | null = null
+
+  for (let step = 0; step < input.maxWaitSteps; step += 1) {
+    const state = await readCompatibleBrokerState(
+      input.brokerFilePath,
+      input.pingImpl,
+      input.isProcessAliveImpl,
+      input.expectedVersion,
+    )
+    if (state.status === "ready") {
+      return {
+        status: "ready",
+        metadata: state.metadata,
+      }
+    }
+
+    if (state.status !== "booting") {
+      return lastBootingBroker
+        ? {
+            status: "failed",
+            metadata: lastBootingBroker,
+          }
+        : null
+    }
+
+    if (getBrokerIdentity(state.metadata) !== input.bootingBrokerIdentity) {
+      return {
+        status: "replaced",
+        metadata: state.metadata,
+      }
+    }
+
+    lastBootingBroker = state.metadata
+    if (step < input.maxWaitSteps - 1) {
+      await delay(input.waitStepMs)
+    }
+  }
+
+  return lastBootingBroker
+    ? {
+        status: "failed",
+        metadata: lastBootingBroker,
+      }
+    : null
+}
+
 export async function connectOrSpawnBroker(options: LaunchOptions = {}): Promise<BrokerMetadata> {
   const stateRoot = options.stateRoot ?? wechatStateRoot()
   const brokerJsonFile = options.brokerJsonPath ?? path.join(stateRoot, "broker.json")
@@ -361,19 +491,60 @@ export async function connectOrSpawnBroker(options: LaunchOptions = {}): Promise
   const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
   const expectedVersion = options.expectedVersion ?? await readCurrentPackageVersion()
   const pingImpl = options.pingImpl ?? defaultPingImpl
+  const isProcessAliveImpl = options.isProcessAliveImpl ?? isProcessAlive
   const spawnImpl = options.spawnImpl ?? defaultSpawnImpl
   const retireBrokerImpl = options.retireBrokerImpl ?? ((metadata: BrokerMetadata) => defaultRetireBrokerImpl(metadata, pingImpl))
   const endpointFactory = options.endpointFactory ?? (() => createDefaultBrokerEndpoint({ stateRoot }))
+  const bootingBrokerWaitStepMs = Math.min(Math.max(backoffMs, 10), DEFAULT_BOOTING_BROKER_WAIT_STEP_MS)
+  const bootingBrokerWaitSteps = DEFAULT_BOOTING_BROKER_WAIT_STEPS
 
   await mkdir(stateRoot, { recursive: true, mode: 0o700 })
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const running = await isBrokerAlive(brokerJsonFile, pingImpl, expectedVersion)
+    const running = await isBrokerAlive(brokerJsonFile, pingImpl, isProcessAliveImpl, expectedVersion)
     if (running) {
       return running
     }
 
-    const lockAttempt = await acquireLaunchLock(launchLockFile)
+    let failedBootingBrokerIdentity: string | null = null
+    const bootingCompatibleBroker = await readBootingCompatibleBroker(
+      brokerJsonFile,
+      pingImpl,
+      isProcessAliveImpl,
+      expectedVersion,
+    )
+    if (bootingCompatibleBroker) {
+      let bootingBrokerToWaitFor: BrokerMetadata | null = bootingCompatibleBroker
+
+      for (let transition = 0; transition < maxAttempts && bootingBrokerToWaitFor; transition += 1) {
+        const waitResult = await waitForBootingBrokerToBecomeReady({
+          brokerFilePath: brokerJsonFile,
+          bootingBrokerIdentity: getBrokerIdentity(bootingBrokerToWaitFor),
+          pingImpl,
+          isProcessAliveImpl,
+          expectedVersion,
+          waitStepMs: bootingBrokerWaitStepMs,
+          maxWaitSteps: bootingBrokerWaitSteps,
+        })
+        if (waitResult?.status === "ready") {
+          return waitResult.metadata
+        }
+
+        if (waitResult?.status === "replaced") {
+          bootingBrokerToWaitFor = waitResult.metadata
+          continue
+        }
+
+        failedBootingBrokerIdentity = waitResult ? getBrokerIdentity(waitResult.metadata) : null
+        bootingBrokerToWaitFor = null
+      }
+
+      if (bootingBrokerToWaitFor) {
+        continue
+      }
+    }
+
+    const lockAttempt = await acquireLaunchLock(launchLockFile, isProcessAliveImpl)
     if (lockAttempt.recoveredStaleLock) {
       await appendBrokerLauncherDiagnostic(stateRoot, {
         type: "brokerTakeover",
@@ -391,9 +562,22 @@ export async function connectOrSpawnBroker(options: LaunchOptions = {}): Promise
     options.onLockAcquired?.(lock)
 
     try {
-      const secondCheck = await isBrokerAlive(brokerJsonFile, pingImpl, expectedVersion)
+      const secondCheck = await isBrokerAlive(brokerJsonFile, pingImpl, isProcessAliveImpl, expectedVersion)
       if (secondCheck) {
         return secondCheck
+      }
+
+      const lockWindowBootingBroker = await readBootingCompatibleBroker(
+        brokerJsonFile,
+        pingImpl,
+        isProcessAliveImpl,
+        expectedVersion,
+      )
+      if (
+        lockWindowBootingBroker &&
+        getBrokerIdentity(lockWindowBootingBroker) !== failedBootingBrokerIdentity
+      ) {
+        continue
       }
 
       const versionMismatchedBroker = await readVersionMismatchedBroker(brokerJsonFile, expectedVersion)
@@ -415,7 +599,7 @@ export async function connectOrSpawnBroker(options: LaunchOptions = {}): Promise
 
       for (let n = 0; n < 20; n += 1) {
         await delay(100)
-        const spawned = await isBrokerAlive(brokerJsonFile, pingImpl, expectedVersion)
+        const spawned = await isBrokerAlive(brokerJsonFile, pingImpl, isProcessAliveImpl, expectedVersion)
         if (spawned) {
           return spawned
         }

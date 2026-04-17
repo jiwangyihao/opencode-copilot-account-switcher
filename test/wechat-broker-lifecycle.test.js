@@ -635,6 +635,141 @@ test("broker 退出只清理自己写出的 broker.json，不删除后继 broker
   }
 })
 
+test("broker-entry 失去 broker.json 所有权后会自退", { concurrency: false }, async () => {
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-owner-loss-"))
+  const endpoint = createBrokerEndpoint(`${sandboxConfigHome}-owner`)
+  const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
+  const ownershipScanIntervalMs = 80
+  const child = spawnBrokerEntry({
+    endpoint,
+    xdgConfigHome: sandboxConfigHome,
+    extraEnv: {
+      WECHAT_BROKER_OWNERSHIP_SCAN_INTERVAL_MS: String(ownershipScanIntervalMs),
+    },
+  })
+
+  try {
+    const brokerMetadata = await waitForBrokerMetadata(brokerJsonPath)
+    await delay(ownershipScanIntervalMs * 3)
+
+    const replacedMetadata = {
+      ...brokerMetadata,
+      version: `${brokerMetadata.version}-shadow-owner`,
+    }
+
+    await writeFile(brokerJsonPath, JSON.stringify(replacedMetadata, null, 2), "utf8")
+
+    const exited = await waitForExit(child, 5_000)
+    assert.equal(exited.code, 0)
+
+    const remaining = JSON.parse(await readFile(brokerJsonPath, "utf8"))
+    assert.deepEqual(remaining, replacedMetadata)
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      await terminateChild(child)
+    }
+    childProcesses.delete(child)
+  }
+})
+
+test("broker-entry 在尚未完成 owner 建立前不会误自退", { concurrency: false }, async () => {
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-owner-startup-"))
+  const stateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+  const rightEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-right`)
+  const wrongEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-wrong`)
+  const otherEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-other`)
+  const brokerJsonPath = path.join(stateRoot, "broker.json")
+  const ownershipScanIntervalMs = 120
+  const preexistingMetadata = {
+    pid: 99999,
+    startedAt: Date.now() - 1000,
+    version: "shadow-owner",
+    endpoint: wrongEndpoint,
+  }
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  await writeFile(brokerJsonPath, JSON.stringify(preexistingMetadata, null, 2), "utf8")
+
+  const child = spawnBrokerEntry({
+    endpoint: rightEndpoint,
+    xdgConfigHome: sandboxConfigHome,
+    extraEnv: {
+      WECHAT_BROKER_OWNERSHIP_SCAN_INTERVAL_MS: String(ownershipScanIntervalMs),
+    },
+  })
+
+  try {
+    await assertProcessStaysAlive(child.pid, ownershipScanIntervalMs * 3)
+
+    const brokerMetadata = await waitForJsonFile(
+      brokerJsonPath,
+      (candidate) => candidate.pid === child.pid && candidate.endpoint === rightEndpoint,
+      5_000,
+    )
+    await delay(ownershipScanIntervalMs * 3)
+
+    const replacedMetadata = {
+      ...brokerMetadata,
+      endpoint: otherEndpoint,
+    }
+    await writeFile(brokerJsonPath, JSON.stringify(replacedMetadata, null, 2), "utf8")
+
+    const exited = await waitForExit(child, 5_000)
+    assert.equal(exited.code, 0)
+
+    const remaining = JSON.parse(await readFile(brokerJsonPath, "utf8"))
+    assert.deepEqual(remaining, replacedMetadata)
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      await terminateChild(child)
+    }
+    childProcesses.delete(child)
+  }
+})
+
+test("broker-entry 首个 ownership scan 前失去 owner 也会退出", { concurrency: false }, async () => {
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-owner-loss-before-first-scan-"))
+  const endpoint = createBrokerEndpoint(`${sandboxConfigHome}-owner`)
+  const otherEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-other`)
+  const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
+  const ownershipScanIntervalMs = 2_000
+  const child = spawnBrokerEntry({
+    endpoint,
+    xdgConfigHome: sandboxConfigHome,
+    extraEnv: {
+      WECHAT_BROKER_OWNERSHIP_SCAN_INTERVAL_MS: String(ownershipScanIntervalMs),
+    },
+  })
+
+  try {
+    const brokerMetadata = await waitForBrokerMetadata(brokerJsonPath)
+    const replacedMetadata = {
+      ...brokerMetadata,
+      pid: brokerMetadata.pid + 10000,
+      startedAt: brokerMetadata.startedAt + 10000,
+      endpoint: otherEndpoint,
+    }
+
+    const ownerLostAt = Date.now()
+    await writeFile(brokerJsonPath, JSON.stringify(replacedMetadata, null, 2), "utf8")
+
+    const exited = await waitForExit(child, 5_000)
+    const exitLatencyMs = Date.now() - ownerLostAt
+    assert.equal(exited.code, 0)
+    assert.ok(
+      exitLatencyMs < ownershipScanIntervalMs,
+      `expected owner-loss exit before first ownership scan, got ${exitLatencyMs}ms`,
+    )
+
+    const remaining = JSON.parse(await readFile(brokerJsonPath, "utf8"))
+    assert.deepEqual(remaining, replacedMetadata)
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      await terminateChild(child)
+    }
+    childProcesses.delete(child)
+  }
+})
+
 test("detached + stdio ignore 启动后 broker 持续存活并可 ping", async () => {
   const protocol = await import(DIST_PROTOCOL_MODULE)
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-detached-"))
@@ -1105,6 +1240,7 @@ test("两个 launcher 并发时只会有一个 broker 被真正拉起，且 laun
     endpointFactory: () => endpoint,
     spawnImpl,
     pingImpl,
+    isProcessAliveImpl: (pid) => pid === process.pid || pid === metadata?.pid,
     onLockAcquired: () => {},
   }
 
@@ -1168,6 +1304,7 @@ test("锁持有者消失后，后续 launcher 可重新竞争并完成 spawn", a
     endpointFactory: () => endpoint,
     spawnImpl,
     pingImpl: async () => metadata !== null,
+    isProcessAliveImpl: (pid) => pid === process.pid || pid === metadata?.pid,
   })
 
   assert.equal(spawned, 1)
@@ -1214,6 +1351,7 @@ test("launcher 仅传入自定义 stateRoot 时，默认 broker/lock 路径与�
       return { pid: metadata.pid, unref() {} }
     },
     pingImpl: async (candidateEndpoint) => metadata !== null && candidateEndpoint === metadata.endpoint,
+    isProcessAliveImpl: (pid) => pid === process.pid || pid === metadata?.pid,
     onLockAcquired: () => {
       customLockSeen = JSON.parse(readFileSync(customLaunchLockPath, "utf8"))
     },
@@ -1258,6 +1396,7 @@ test("launcher 遇到版本落后的 broker 会先退役旧进程再拉起当前
     maxAttempts: 10,
     endpointFactory: () => newEndpoint,
     pingImpl: async (candidateEndpoint) => candidateEndpoint === metadata.endpoint,
+    isProcessAliveImpl: (pid) => pid === process.pid || pid === metadata.pid,
     spawnImpl: () => {
       spawned += 1
       metadata = {
@@ -1318,6 +1457,7 @@ test("launcher 遇到同 minor 下更高补丁版本 broker 时直接复用，�
     maxAttempts: 3,
     endpointFactory: () => createBrokerEndpoint(`${sandboxConfigHome}-unused`),
     pingImpl: async (candidateEndpoint) => candidateEndpoint === endpoint,
+    isProcessAliveImpl: (pid) => pid === 48001,
     spawnImpl: () => {
       spawned += 1
       return { pid: 49001, unref() {} }
@@ -1334,6 +1474,323 @@ test("launcher 遇到同 minor 下更高补丁版本 broker 时直接复用，�
 
   const diagnosticsExists = await access(diagnosticsPath).then(() => true).catch(() => false)
   assert.equal(diagnosticsExists, false)
+})
+
+test("launcher 遇到同版本 healthy broker 时直接复用，不再 spawn 第二个 broker", async () => {
+  const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-launcher-same-version-reuse-"))
+  const stateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+  const brokerJsonPath = path.join(stateRoot, "broker.json")
+  const endpoint = createBrokerEndpoint(sandboxConfigHome)
+
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  await writeFile(
+    brokerJsonPath,
+    JSON.stringify({ pid: 49010, endpoint, startedAt: Date.now() - 1000, version: "0.14.43" }, null, 2),
+    "utf8",
+  )
+
+  let spawned = 0
+
+  const result = await launcher.connectOrSpawnBroker({
+    stateRoot,
+    brokerJsonPath,
+    expectedVersion: "0.14.43",
+    backoffMs: 10,
+    maxAttempts: 3,
+    endpointFactory: () => createBrokerEndpoint(`${sandboxConfigHome}-unused`),
+    pingImpl: async (candidateEndpoint) => candidateEndpoint === endpoint,
+    isProcessAliveImpl: (pid) => pid === 49010,
+    spawnImpl: () => {
+      spawned += 1
+      return { pid: 49011, unref() {} }
+    },
+  })
+
+  assert.equal(result.endpoint, endpoint)
+  assert.equal(result.version, "0.14.43")
+  assert.equal(spawned, 0)
+})
+
+test("owner 死亡后若 replacement broker 已写入 broker.json 且 pid 仍存活，后续 launcher 在短暂未 ready 窗口内不会再拉第二个 broker", async () => {
+  const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-launcher-existing-replacement-"))
+  const stateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+  const brokerJsonPath = path.join(stateRoot, "broker.json")
+  const launchLockPath = path.join(stateRoot, "launch.lock")
+  const replacementEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-replacement`)
+  const replacementPid = 50010
+
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  await writeFile(
+    brokerJsonPath,
+    JSON.stringify({ pid: replacementPid, endpoint: replacementEndpoint, startedAt: Date.now(), version: "0.14.43" }, null, 2),
+    "utf8",
+  )
+
+  let replacementPingCalls = 0
+  let spawned = 0
+
+  const options = {
+    stateRoot,
+    brokerJsonPath,
+    launchLockPath,
+    expectedVersion: "0.14.43",
+    backoffMs: 20,
+    maxAttempts: 20,
+    endpointFactory: () => createBrokerEndpoint(`${sandboxConfigHome}-unused`),
+    pingImpl: async (candidateEndpoint) => {
+      if (candidateEndpoint !== replacementEndpoint) {
+        return false
+      }
+      replacementPingCalls += 1
+      return replacementPingCalls >= 6
+    },
+    isProcessAliveImpl: (pid) => pid === replacementPid || pid === process.pid,
+    spawnImpl: () => {
+      spawned += 1
+      throw new Error("should wait for existing replacement")
+    },
+  }
+
+  const [first, second] = await Promise.all([
+    launcher.connectOrSpawnBroker(options),
+    launcher.connectOrSpawnBroker(options),
+  ])
+
+  assert.equal(first.endpoint, replacementEndpoint)
+  assert.equal(second.endpoint, replacementEndpoint)
+  assert.equal(spawned, 0)
+})
+
+test("replacement 在等待窗口内崩溃时，launcher 会重新接管，而不是无限等待", async () => {
+  const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-launcher-replacement-crash-"))
+  const stateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+  const brokerJsonPath = path.join(stateRoot, "broker.json")
+  const launchLockPath = path.join(stateRoot, "launch.lock")
+  const replacementEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-replacement`)
+  const replacementPid = 50020
+  const nextEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-next`)
+
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  await writeFile(
+    brokerJsonPath,
+    JSON.stringify({ pid: replacementPid, endpoint: replacementEndpoint, startedAt: Date.now(), version: "0.14.43" }, null, 2),
+    "utf8",
+  )
+
+  let currentEndpoint = replacementEndpoint
+  let replacementAliveChecks = 0
+  let spawned = 0
+
+  const result = await launcher.connectOrSpawnBroker({
+    stateRoot,
+    brokerJsonPath,
+    launchLockPath,
+    expectedVersion: "0.14.43",
+    backoffMs: 20,
+    maxAttempts: 20,
+    endpointFactory: () => nextEndpoint,
+    pingImpl: async (candidateEndpoint) => candidateEndpoint === currentEndpoint && candidateEndpoint === nextEndpoint,
+    isProcessAliveImpl: (pid) => {
+      if (pid === replacementPid) {
+        replacementAliveChecks += 1
+        return replacementAliveChecks < 4
+      }
+      return true
+    },
+    spawnImpl: () => {
+      assert.equal(replacementAliveChecks >= 4, true)
+      spawned += 1
+      currentEndpoint = nextEndpoint
+      void writeFile(
+        brokerJsonPath,
+        JSON.stringify({ pid: 50021, endpoint: nextEndpoint, startedAt: Date.now(), version: "0.14.43" }, null, 2),
+        "utf8",
+      )
+      return { pid: 50021, unref() {} }
+    },
+  })
+
+  assert.equal(result.endpoint, nextEndpoint)
+  assert.equal(spawned, 1)
+})
+
+test("replacement 长时间 not-ready 时，launcher 会判 failed replacement 并重新接管", async () => {
+  const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-launcher-replacement-timeout-"))
+  const stateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+  const brokerJsonPath = path.join(stateRoot, "broker.json")
+  const launchLockPath = path.join(stateRoot, "launch.lock")
+  const replacementEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-replacement`)
+  const nextEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-next`)
+
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  await writeFile(
+    brokerJsonPath,
+    JSON.stringify({ pid: 50030, endpoint: replacementEndpoint, startedAt: Date.now(), version: "0.14.43" }, null, 2),
+    "utf8",
+  )
+
+  let currentEndpoint = replacementEndpoint
+  let replacementPingCalls = 0
+  let spawned = 0
+
+  const result = await launcher.connectOrSpawnBroker({
+    stateRoot,
+    brokerJsonPath,
+    launchLockPath,
+    expectedVersion: "0.14.43",
+    backoffMs: 20,
+    maxAttempts: 20,
+    endpointFactory: () => nextEndpoint,
+    pingImpl: async (candidateEndpoint) => {
+      if (candidateEndpoint === replacementEndpoint) {
+        replacementPingCalls += 1
+        return false
+      }
+      return candidateEndpoint === currentEndpoint && candidateEndpoint === nextEndpoint
+    },
+    isProcessAliveImpl: (pid) => pid !== 0,
+    spawnImpl: () => {
+      assert.equal(replacementPingCalls >= 5, true)
+      spawned += 1
+      currentEndpoint = nextEndpoint
+      void writeFile(
+        brokerJsonPath,
+        JSON.stringify({ pid: 50031, endpoint: nextEndpoint, startedAt: Date.now(), version: "0.14.43" }, null, 2),
+        "utf8",
+      )
+      return { pid: 50031, unref() {} }
+    },
+  })
+
+  assert.equal(result.endpoint, nextEndpoint)
+  assert.equal(spawned, 1)
+})
+
+test("旧 owner 死亡后第一次 replacement 只会被生成一次，后续 launcher 都进入等待", async () => {
+  const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-launcher-single-replacement-"))
+  const stateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+  const brokerJsonPath = path.join(stateRoot, "broker.json")
+  const launchLockPath = path.join(stateRoot, "launch.lock")
+  const oldOwnerEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-old-owner`)
+  const oldOwnerPid = 50040
+  const replacementEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-replacement`)
+  const replacementPid = 50041
+
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  await writeFile(
+    brokerJsonPath,
+    JSON.stringify({ pid: oldOwnerPid, endpoint: oldOwnerEndpoint, startedAt: Date.now() - 1000, version: "0.14.42" }, null, 2),
+    "utf8",
+  )
+
+  let replacementPingCalls = 0
+  let spawned = 0
+
+  const options = {
+    stateRoot,
+    brokerJsonPath,
+    launchLockPath,
+    expectedVersion: "0.14.43",
+    backoffMs: 20,
+    maxAttempts: 30,
+    endpointFactory: () => replacementEndpoint,
+    pingImpl: async (candidateEndpoint) => {
+      if (candidateEndpoint !== replacementEndpoint) {
+        return false
+      }
+      replacementPingCalls += 1
+      return replacementPingCalls >= 8
+    },
+    isProcessAliveImpl: (pid) => pid !== oldOwnerPid,
+    retireBrokerImpl: async () => {},
+    spawnImpl: () => {
+      spawned += 1
+      void writeFile(
+        brokerJsonPath,
+        JSON.stringify({ pid: replacementPid, endpoint: replacementEndpoint, startedAt: Date.now(), version: "0.14.43" }, null, 2),
+        "utf8",
+      )
+      if (spawned === 1) {
+        void rm(launchLockPath, { force: true })
+      }
+      return { pid: replacementPid, unref() {} }
+    },
+  }
+
+  const results = await Promise.all(
+    Array.from({ length: 6 }, () => launcher.connectOrSpawnBroker(options)),
+  )
+
+  assert.equal(new Set(results.map((item) => item.endpoint)).size, 1)
+  assert.equal(spawned, 1)
+})
+
+test("booting broker identity 变化后等待窗口会重置", async () => {
+  const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-launcher-booting-identity-reset-"))
+  const stateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+  const brokerJsonPath = path.join(stateRoot, "broker.json")
+  const launchLockPath = path.join(stateRoot, "launch.lock")
+  const replacementA = {
+    pid: 50050,
+    endpoint: createBrokerEndpoint(`${sandboxConfigHome}-replacement-a`),
+    startedAt: Date.now(),
+    version: "0.14.43",
+  }
+  const replacementB = {
+    pid: 50051,
+    endpoint: createBrokerEndpoint(`${sandboxConfigHome}-replacement-b`),
+    startedAt: Date.now() + 1,
+    version: "0.14.43",
+  }
+
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  await writeFile(brokerJsonPath, JSON.stringify(replacementA, null, 2), "utf8")
+
+  let totalPingCalls = 0
+  let replacementBPingCalls = 0
+  let spawned = 0
+
+  const result = await launcher.connectOrSpawnBroker({
+    stateRoot,
+    brokerJsonPath,
+    launchLockPath,
+    expectedVersion: "0.14.43",
+    backoffMs: 10,
+    maxAttempts: 20,
+    endpointFactory: () => createBrokerEndpoint(`${sandboxConfigHome}-unused`),
+    pingImpl: async (candidateEndpoint) => {
+      totalPingCalls += 1
+      if (candidateEndpoint === replacementA.endpoint) {
+        if (totalPingCalls === 19) {
+          await writeFile(brokerJsonPath, JSON.stringify(replacementB, null, 2), "utf8")
+        }
+        return false
+      }
+
+      if (candidateEndpoint === replacementB.endpoint) {
+        replacementBPingCalls += 1
+        return replacementBPingCalls >= 6
+      }
+
+      return false
+    },
+    isProcessAliveImpl: (pid) => pid === process.pid || pid === replacementA.pid || pid === replacementB.pid,
+    spawnImpl: () => {
+      spawned += 1
+      throw new Error("should reset wait budget for fresh booting broker")
+    },
+  })
+
+  assert.equal(result.pid, replacementB.pid)
+  assert.equal(result.endpoint, replacementB.endpoint)
+  assert.equal(spawned, 0)
+  assert.equal(replacementBPingCalls >= 6, true)
 })
 
 test("Windows Bun runtime 下默认 broker endpoint 应切到 tcp 回环地址", async () => {

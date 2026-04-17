@@ -64,7 +64,6 @@ import {
   type WechatBridgeLifecycle,
   type WechatBridgeLifecycleInput,
 } from "./wechat/bridge.js"
-import { connectOrSpawnBroker } from "./wechat/broker-launcher.js"
 
 type AuthLoader = NonNullable<CopilotPluginHooks["auth"]>["loader"]
 type AuthProvider = Parameters<NonNullable<AuthLoader>>[1]
@@ -624,6 +623,32 @@ function toWechatBridgeClient(value: unknown): WechatBridgeClientShape | undefin
   return hasWechatBridgeClientShape(wrapped) ? wrapped : undefined
 }
 
+export function resolveBridgeCapableBrokerOwnerInput(input: {
+  client?: unknown
+  serverUrl?: URL
+}) {
+  if (!input.serverUrl) {
+    return undefined
+  }
+
+  const client = toWechatBridgeClient(input.client)
+  if (!client) {
+    return undefined
+  }
+
+  return {
+    client,
+    serverUrl: input.serverUrl,
+  }
+}
+
+export function isBridgeCapableBrokerOwnerInput(input: {
+  client?: unknown
+  serverUrl?: URL
+}) {
+  return resolveBridgeCapableBrokerOwnerInput(input) !== undefined
+}
+
 function sanitizeLoggedRequestHeadersRecord(headers: Record<string, string>) {
   const sanitized = { ...headers }
   if (typeof sanitized.authorization === "string" && sanitized.authorization.length > 0) {
@@ -892,6 +917,7 @@ export function buildPluginHooks(input: {
   directory?: CopilotRetryContext["directory"]
   serverUrl?: CopilotRetryContext["serverUrl"]
   ensureWechatBrokerStarted?: () => Promise<unknown>
+  initialWechatBrokerPromise?: WechatBridgeLifecycleInput["initialBrokerPromise"]
   createWechatBridgeLifecycleImpl?: (input: WechatBridgeLifecycleInput) => Promise<{ close: () => Promise<void> }>
   clearAccountSwitchContext?: (lastAccountSwitchAt?: number) => Promise<void>
   now?: () => number
@@ -992,14 +1018,17 @@ export function buildPluginHooks(input: {
   const appendRouteDecisionEventImpl = input.appendRouteDecisionEventImpl ?? appendRouteDecisionEvent
   const readRoutingStateImpl = input.readRoutingStateImpl ?? readRoutingState
   const triggerBillingCompensation = input.triggerBillingCompensation ?? (async () => {})
-  const ensureWechatBrokerStarted = input.ensureWechatBrokerStarted ?? (async () => connectOrSpawnBroker())
   const createWechatBridgeLifecycleImpl = input.createWechatBridgeLifecycleImpl ?? createWechatBridgeLifecycle
 
-  const wechatBridgeClient = toWechatBridgeClient(input.client)
-  const wechatBridgeLifecycleKey = input.serverUrl && wechatBridgeClient
+  const bridgeCapableBrokerOwnerInput = resolveBridgeCapableBrokerOwnerInput({
+    client: input.client,
+    serverUrl: input.serverUrl,
+  })
+  const wechatBridgeClient = bridgeCapableBrokerOwnerInput?.client
+  const wechatBridgeLifecycleKey = bridgeCapableBrokerOwnerInput
     ? buildWechatBridgeLifecycleKey({
         directory: input.directory,
-        serverUrl: input.serverUrl,
+        serverUrl: bridgeCapableBrokerOwnerInput.serverUrl,
         project: input.project,
       })
     : undefined
@@ -1016,21 +1045,21 @@ export function buildPluginHooks(input: {
         console.warn(`[${scope}] failed to show toast`, error)
       },
     })
-    void Promise.resolve()
-      .then(() => ensureWechatBrokerStarted())
-      .catch(() => {})
   }
 
-  if (input.serverUrl && wechatBridgeClient && wechatBridgeLifecycleKey) {
+  if (bridgeCapableBrokerOwnerInput && wechatBridgeLifecycleKey) {
+    const bridgeCapableClient = bridgeCapableBrokerOwnerInput.client
+
     attachWechatBridgeAutoClose()
     void ensureWechatBridgeLifecycle({
       key: wechatBridgeLifecycleKey,
       create: async () => {
         return createWechatBridgeLifecycleImpl({
-          client: wechatBridgeClient,
+          client: bridgeCapableClient,
           project: input.project,
           directory: input.directory,
-          serverUrl: input.serverUrl,
+          serverUrl: bridgeCapableBrokerOwnerInput.serverUrl,
+          initialBrokerPromise: input.initialWechatBrokerPromise,
           statusCollectionEnabled: true,
           getActiveSessionID: () => getWechatBridgeActiveSessionID(wechatBridgeSessionContext),
           onFallbackToast: async (payload) => {
