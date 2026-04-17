@@ -2710,6 +2710,235 @@ test("wechat status runtime diagnostics: loadPublicHelpers 失败时写 runtimeE
     type: "runtimeError",
     stage: "loadPublicHelpers",
     error: "helpers unavailable",
+    consecutiveFailures: 1,
+    backoffMs: 10,
+    retryState: "backing-off",
+    reachedGetUpdates: false,
+  })
+})
+
+test("wechat status runtime: loadPublicHelpers 持续失败时进入受控退避而不是固定 1s 热重试", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-helper-failure-backoff`
+  )
+
+  let now = 0
+  let helperCalls = 0
+  const sleeps = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    now: () => now,
+    sleepImpl: async (ms) => {
+      sleeps.push(ms)
+      now += ms
+      await new Promise((resolve) => setImmediate(resolve))
+    },
+    loadPublicHelpers: async () => {
+      helperCalls += 1
+      throw new Error("missing delayed-stream")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(() => helperCalls >= 6, 1000)
+  } finally {
+    await runtime.close()
+  }
+
+  assert.equal(sleeps.length >= 5, true)
+  assert.equal(new Set(sleeps).size > 1, true)
+  assert.equal(sleeps.some((ms) => ms > 10), true)
+})
+
+test("wechat status runtime: 持续 helper 失败时写出结构化退避状态", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-helper-failure-structured-state`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    sleepImpl: async () => {
+      await new Promise((resolve) => setImmediate(resolve))
+    },
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("missing delayed-stream")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(
+      () => diagnostics.some(
+        (event) =>
+          event?.type === "runtimeError"
+          && event?.stage === "loadPublicHelpers"
+          && event?.consecutiveFailures >= 3,
+      ),
+      1000,
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.filter(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  ).at(-1)
+
+  assert.equal(runtimeError?.consecutiveFailures >= 3, true)
+  assert.equal(typeof runtimeError?.backoffMs, "number")
+  assert.equal(runtimeError?.backoffMs > 10, true)
+  assert.equal(runtimeError?.retryState, "backing-off")
+})
+
+test("wechat status runtime: helper 持续失败时明确记录 getUpdates 未触达", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-helper-failure-get-updates-not-reached`
+  )
+
+  const diagnostics = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    sleepImpl: async () => {
+      await new Promise((resolve) => setImmediate(resolve))
+    },
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("missing delayed-stream")
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(
+      () => diagnostics.some(
+        (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+      ),
+      1000,
+    )
+  } finally {
+    await runtime.close()
+  }
+
+  const runtimeError = diagnostics.find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+
+  assert.equal(runtimeError?.reachedGetUpdates, false)
+})
+
+test("wechat status runtime: helper 持续失败时进入 plateau / bounded steady state", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-helper-failure-plateau`
+  )
+
+  let now = 0
+  let helperCalls = 0
+  const sleeps = []
+  const failureStates = []
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    now: () => now,
+    sleepImpl: async (ms) => {
+      sleeps.push(ms)
+      now += ms
+      await new Promise((resolve) => setImmediate(resolve))
+    },
+    onFailureStateChange: (state) => {
+      if (state) {
+        failureStates.push(state)
+      }
+    },
+    loadPublicHelpers: async () => {
+      helperCalls += 1
+      throw new Error("missing delayed-stream")
+    },
+  })
+
+  await runtime.start()
+  let debugState
+  try {
+    await waitFor(() => helperCalls >= 15, 1000)
+    debugState = runtime.getDebugFailureStateForTest()
+  } finally {
+    await runtime.close()
+  }
+
+  assert.equal(failureStates.length >= 10, true)
+  assert.equal(sleeps.length >= 14, true)
+  assert.equal(new Set(sleeps.slice(-3)).size, 1)
+  assert.equal(sleeps.at(-1) > sleeps[0], true)
+  assert.equal(debugState?.helperFailureState?.retryState, "backing-off")
+  assert.equal(debugState?.helperFailureState?.currentBackoffMs, sleeps.at(-1))
+  assert.equal(debugState?.retainedFailureObjectCount, 1)
+})
+
+test("wechat status runtime: close 后重新 start 不继承旧 failure state", async () => {
+  const runtimeModule = await import(
+    `../dist/wechat/wechat-status-runtime.js?reload=${Date.now()}-runtime-helper-failure-reset-after-close`
+  )
+
+  const diagnostics = []
+  let now = 0
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    now: () => now,
+    sleepImpl: async (ms) => {
+      now += ms
+      await new Promise((resolve) => setImmediate(resolve))
+    },
+    onDiagnosticEvent: (event) => {
+      diagnostics.push(event)
+    },
+    loadPublicHelpers: async () => {
+      throw new Error("missing delayed-stream")
+    },
+  })
+
+  await runtime.start()
+  await waitFor(
+    () => diagnostics.filter((event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers").length >= 3,
+    1000,
+  )
+  await runtime.close()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.deepEqual(runtime.getDebugFailureStateForTest(), {
+    helperFailureState: null,
+    retainedFailureObjectCount: 0,
+  })
+
+  const diagnosticsCountBeforeRestart = diagnostics.length
+
+  await runtime.start()
+  await waitFor(
+    () => diagnostics.length > diagnosticsCountBeforeRestart,
+    1000,
+  )
+  const firstFailureAfterRestart = diagnostics.slice(diagnosticsCountBeforeRestart).find(
+    (event) => event?.type === "runtimeError" && event?.stage === "loadPublicHelpers",
+  )
+  await runtime.close()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.deepEqual(firstFailureAfterRestart, {
+    type: "runtimeError",
+    stage: "loadPublicHelpers",
+    error: "missing delayed-stream",
+    consecutiveFailures: 1,
+    backoffMs: 10,
+    retryState: "backing-off",
+    reachedGetUpdates: false,
+  })
+  assert.deepEqual(runtime.getDebugFailureStateForTest(), {
+    helperFailureState: null,
+    retainedFailureObjectCount: 0,
   })
 })
 
@@ -3218,6 +3447,7 @@ test("wechat status runtime diagnostics: getUpdates 失败时写 runtimeError", 
     type: "runtimeError",
     stage: "getUpdates",
     error: "getUpdates failed",
+    reachedGetUpdates: true,
   })
 })
 
@@ -3274,6 +3504,7 @@ test("wechat status runtime diagnostics: persistGetUpdatesBuf 失败时写 runti
     type: "runtimeError",
     stage: "persistGetUpdatesBuf",
     error: "persist failed",
+    reachedGetUpdates: true,
   })
 })
 
@@ -3330,6 +3561,7 @@ test("wechat status runtime diagnostics: drainOutboundMessages 失败时写 runt
     type: "runtimeError",
     stage: "drainOutboundMessages",
     error: "drain failed",
+    reachedGetUpdates: true,
   })
 })
 

@@ -105,6 +105,7 @@ export type WechatBridgeLifecycleInput = {
   }
   directory?: string
   serverUrl?: URL
+  initialBrokerPromise?: Promise<{ endpoint: string }>
   statusCollectionEnabled?: boolean
   heartbeatIntervalMs?: number
   getActiveSessionID?: () => string | undefined
@@ -743,8 +744,7 @@ export async function createWechatBridgeLifecycle(
     onFallbackToast: input.onFallbackToast,
   })
 
-  const broker = await connectOrSpawnBrokerImpl()
-  let brokerClient = await connectImpl(broker.endpoint, { bridge })
+  let brokerClient!: Awaited<ReturnType<typeof connect>>
 
   async function registerCurrentBrokerClient() {
     try {
@@ -758,7 +758,21 @@ export async function createWechatBridgeLifecycle(
     }
   }
 
-  await registerCurrentBrokerClient()
+  if (input.initialBrokerPromise) {
+    try {
+      const initialBroker = await input.initialBrokerPromise
+      brokerClient = await connectImpl(initialBroker.endpoint, { bridge })
+      await registerCurrentBrokerClient()
+    } catch {
+      const fallbackBroker = await connectOrSpawnBrokerImpl()
+      brokerClient = await connectImpl(fallbackBroker.endpoint, { bridge })
+      await registerCurrentBrokerClient()
+    }
+  } else {
+    const broker = await connectOrSpawnBrokerImpl()
+    brokerClient = await connectImpl(broker.endpoint, { bridge })
+    await registerCurrentBrokerClient()
+  }
 
   const heartbeatIntervalMs =
     typeof input.heartbeatIntervalMs === "number" && Number.isFinite(input.heartbeatIntervalMs)

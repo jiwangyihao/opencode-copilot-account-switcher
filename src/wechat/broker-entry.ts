@@ -65,6 +65,7 @@ type BrokerState = {
 const BROKER_WECHAT_RUNTIME_AUTOSTART_DELAY_MS = 1_000
 const DEFAULT_BROKER_IDLE_TIMEOUT_MS = 5 * 60 * 1000
 const DEFAULT_BROKER_IDLE_SCAN_INTERVAL_MS = 1_000
+const DEFAULT_BROKER_OWNERSHIP_SCAN_INTERVAL_MS = 1_000
 
 async function readPackageVersion(): Promise<string> {
   const packageJsonPath = new URL("../../package.json", import.meta.url)
@@ -129,7 +130,31 @@ async function writeBrokerState(state: BrokerState, stateRoot: string) {
   await writeFile(filePath, JSON.stringify(state, null, 2), { mode: WECHAT_FILE_MODE })
 }
 
-type BrokerOwnership = Pick<BrokerState, "pid" | "startedAt">
+type BrokerOwnership = Pick<BrokerState, "pid" | "startedAt" | "version" | "endpoint">
+
+function isBrokerStateOwnedBy(candidate: Partial<BrokerState>, ownership: BrokerOwnership) {
+  return candidate.pid === ownership.pid
+    && candidate.startedAt === ownership.startedAt
+    && candidate.version === ownership.version
+    && candidate.endpoint === ownership.endpoint
+}
+
+async function brokerStateStillOwnedBy(input: { stateRoot: string } & BrokerOwnership): Promise<boolean | undefined> {
+  try {
+    const raw = await readFile(brokerStatePathForRoot(input.stateRoot), "utf8")
+    const parsed = JSON.parse(raw) as Partial<BrokerState>
+    return isBrokerStateOwnedBy(parsed, input)
+  } catch {
+    return undefined
+  }
+}
+
+function shouldExitForLostBrokerOwnership(input: {
+  ownerEstablished: boolean
+  stillOwned: boolean | undefined
+}): boolean {
+  return input.ownerEstablished && input.stillOwned === false
+}
 
 type BrokerWechatStatusRuntimeLifecycle = {
   start: () => Promise<void>
@@ -936,7 +961,7 @@ function removeOwnedBrokerStateFileSync(ownership: BrokerOwnership, stateRoot: s
     const filePath = brokerStatePathForRoot(stateRoot)
     const raw = readFileSync(filePath, "utf8")
     const parsed = JSON.parse(raw) as Partial<BrokerState>
-    if (parsed.pid !== ownership.pid || parsed.startedAt !== ownership.startedAt) {
+    if (!isBrokerStateOwnedBy(parsed, ownership)) {
       return
     }
 
@@ -972,31 +997,83 @@ async function run() {
     sendReplyPermissionRpc: server.dispatchReplyPermissionToInstance,
     handleNotificationDeliveryFailure: server.handleNotificationDeliveryFailure,
   })
-  if (shouldEnableBrokerWechatStatusRuntime()) {
-    setTimeout(() => {
-      void wechatRuntimeLifecycle.start()
-    }, BROKER_WECHAT_RUNTIME_AUTOSTART_DELAY_MS)
-  }
   const ownership: BrokerOwnership = {
     pid: state.pid,
     startedAt: state.startedAt,
+    version: state.version,
+    endpoint: state.endpoint,
   }
   const idleTimeoutMs = toPositiveNumber(process.env.WECHAT_BROKER_IDLE_TIMEOUT_MS, DEFAULT_BROKER_IDLE_TIMEOUT_MS)
   const idleScanIntervalMs = toPositiveNumber(process.env.WECHAT_BROKER_IDLE_SCAN_INTERVAL_MS, DEFAULT_BROKER_IDLE_SCAN_INTERVAL_MS)
+  const ownershipScanIntervalMs = toPositiveNumber(
+    process.env.WECHAT_BROKER_OWNERSHIP_SCAN_INTERVAL_MS,
+    DEFAULT_BROKER_OWNERSHIP_SCAN_INTERVAL_MS,
+  )
 
   let shuttingDown = false
+  const ownerEstablished = true
+  let ownershipScanInFlight = false
+  let runtimeStartTimer: NodeJS.Timeout | undefined
   const shutdown = async (exitCode = 0) => {
     if (shuttingDown) {
       return
     }
     shuttingDown = true
 
+    clearTimeout(runtimeStartTimer)
     clearInterval(idleTimer)
+    clearInterval(ownershipTimer)
     removeOwnedBrokerStateFileSync(ownership, stateRoot)
     await wechatRuntimeLifecycle.close()
     await server.close()
     process.exit(exitCode)
   }
+
+  const shutdownIfBrokerOwnershipLost = async (): Promise<boolean> => {
+    const stillOwned = await brokerStateStillOwnedBy({
+      stateRoot,
+      ...ownership,
+    })
+    if (shuttingDown) {
+      return true
+    }
+
+    if (!shouldExitForLostBrokerOwnership({
+      ownerEstablished,
+      stillOwned,
+    })) {
+      return false
+    }
+
+    await shutdown(0)
+    return true
+  }
+
+  if (shouldEnableBrokerWechatStatusRuntime()) {
+    runtimeStartTimer = setTimeout(() => {
+      if (shuttingDown) {
+        return
+      }
+
+      void shutdownIfBrokerOwnershipLost().then((ownershipLost) => {
+        if (ownershipLost || shuttingDown) {
+          return
+        }
+        void wechatRuntimeLifecycle.start()
+      })
+    }, BROKER_WECHAT_RUNTIME_AUTOSTART_DELAY_MS)
+  }
+
+  const ownershipTimer = setInterval(() => {
+    if (!ownerEstablished || ownershipScanInFlight) {
+      return
+    }
+
+    ownershipScanInFlight = true
+    void shutdownIfBrokerOwnershipLost().finally(() => {
+      ownershipScanInFlight = false
+    })
+  }, ownershipScanIntervalMs)
 
   let idleSince: number | undefined
   const idleTimer = setInterval(() => {

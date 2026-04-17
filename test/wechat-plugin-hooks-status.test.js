@@ -9,6 +9,40 @@ async function importBridgeModule() {
   return import(`../dist/wechat/bridge.js?reload=${Date.now()}-${Math.random()}`)
 }
 
+function createBridgeCapableClient(extra = {}) {
+  const base = {
+    session: {
+      list: async () => [],
+      status: async () => ({}),
+      todo: async () => [],
+      messages: async () => [],
+    },
+    question: {
+      list: async () => [],
+    },
+    permission: {
+      list: async () => [],
+    },
+  }
+
+  return {
+    ...base,
+    ...extra,
+    session: {
+      ...base.session,
+      ...(extra.session ?? {}),
+    },
+    question: {
+      ...base.question,
+      ...(extra.question ?? {}),
+    },
+    permission: {
+      ...base.permission,
+      ...(extra.permission ?? {}),
+    },
+  }
+}
+
 test("plugin-hooks 仅接入 /status bridge 生命周期", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const calls = []
@@ -163,23 +197,12 @@ test("plugin-hooks 用事件与请求作用域共同维护当前前台 session",
   assert.equal(lifecycleInput?.getActiveSessionID?.(), "sess-ui")
 })
 
-test("plugin-hooks 在实例初始化入口显式触发 broker 启动确保", async () => {
+test("plugin-hooks 不再把实例初始化当作第二条 eager broker 启动入口", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
-  const client = {
-    session: {
-      list: async () => [],
-      status: async () => ({}),
-      todo: async () => [],
-      messages: async () => [],
-    },
-    question: {
-      list: async () => [],
-    },
-    permission: {
-      list: async () => [],
-    },
-  }
-  let ensureBrokerCalls = 0
+  const { createWechatBridgeLifecycle } = await importBridgeModule()
+  const client = createBridgeCapableClient()
+  let launcherCalls = 0
+  const connectedEndpoints = []
 
   buildPluginHooksRaw({
     auth: {
@@ -190,43 +213,45 @@ test("plugin-hooks 在实例初始化入口显式触发 broker 启动确保", as
     project: { id: "project-id", name: "wechat-stage-a" },
     directory: "/workspace/wechat-stage-a",
     serverUrl: new URL("http://127.0.0.1:4096"),
-    ensureWechatBrokerStarted: async () => {
-      ensureBrokerCalls += 1
-      return { endpoint: "fake-endpoint" }
-    },
-    createWechatBridgeLifecycleImpl: async () => ({
-      close: async () => {},
+    initialWechatBrokerPromise: Promise.resolve({ endpoint: "fake-endpoint-from-plugin" }),
+    createWechatBridgeLifecycleImpl: (input) => createWechatBridgeLifecycle(input, {
+      connectOrSpawnBrokerImpl: async () => {
+        launcherCalls += 1
+        return {
+          endpoint: "fake-endpoint-from-launcher",
+        }
+      },
+      connectImpl: async (endpoint) => {
+        connectedEndpoints.push(endpoint)
+        return {
+          registerInstance: async () => ({ sessionToken: "token", registeredAt: Date.now(), brokerPid: process.pid }),
+          heartbeat: async () => ({}),
+          close: async () => {},
+        }
+      },
+      setIntervalImpl: () => ({ id: Symbol("timer") }),
+      clearIntervalImpl: () => {},
     }),
   })
 
   await Promise.resolve()
   await Promise.resolve()
+  await Promise.resolve()
 
-  assert.equal(ensureBrokerCalls, 1)
+  assert.equal(launcherCalls, 0)
+  assert.deepEqual(connectedEndpoints, ["fake-endpoint-from-plugin"])
 })
 
-test("plugin-hooks 在无 serverUrl 时仍尝试拉起 broker 并给出可见提示", async () => {
+test("plugin-hooks 在非 bridge-capable 输入下不会额外 eager ensure broker 或显示启动提示", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const toastCalls = []
-  const client = {
-    session: {
-      list: async () => [],
-      status: async () => ({}),
-      todo: async () => [],
-      messages: async () => [],
-    },
-    question: {
-      list: async () => [],
-    },
-    permission: {
-      list: async () => [],
-    },
+  const client = createBridgeCapableClient({
     tui: {
       showToast: async (options) => {
         toastCalls.push(options)
       },
     },
-  }
+  })
   let ensureBrokerCalls = 0
   let lifecycleCalls = 0
 
@@ -253,11 +278,9 @@ test("plugin-hooks 在无 serverUrl 时仍尝试拉起 broker 并给出可见提
   await Promise.resolve()
   await Promise.resolve()
 
-  assert.equal(ensureBrokerCalls, 1)
+  assert.equal(ensureBrokerCalls, 0)
   assert.equal(lifecycleCalls, 0)
-  assert.equal(toastCalls.length, 1)
-  assert.equal(toastCalls[0]?.body?.variant, "info")
-  assert.match(String(toastCalls[0]?.body?.message ?? ""), /broker/i)
+  assert.equal(toastCalls.length, 0)
 })
 
 test("plugin-hooks 将 wechat fallback toast 透传到现有 UI toast", async () => {
@@ -315,23 +338,11 @@ test("plugin-hooks 将 wechat fallback toast 透传到现有 UI toast", async ()
   assert.equal(warningToast?.body?.message, "微信会话可能已失效，请在微信发送 /status 重新激活")
 })
 
-test("plugin-hooks broker 启动确保失败时仍保持 lifecycle fail-open（reject/throw）", async () => {
+test("plugin-hooks lifecycle 初始化不依赖 eager broker ensure", async () => {
   const runCase = async (ensureWechatBrokerStarted) => {
     const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
-    const client = {
-      session: {
-        list: async () => [],
-        status: async () => ({}),
-        todo: async () => [],
-        messages: async () => [],
-      },
-      question: {
-        list: async () => [],
-      },
-      permission: {
-        list: async () => [],
-      },
-    }
+    const client = createBridgeCapableClient()
+    let ensureCalls = 0
     let lifecycleCalls = 0
 
     buildPluginHooksRaw({
@@ -343,7 +354,10 @@ test("plugin-hooks broker 启动确保失败时仍保持 lifecycle fail-open（r
       project: { id: "project-id", name: "wechat-stage-a" },
       directory: `/workspace/wechat-stage-fail-open-${Math.random()}`,
       serverUrl: new URL("http://127.0.0.1:4096"),
-      ensureWechatBrokerStarted,
+      ensureWechatBrokerStarted: async () => {
+        ensureCalls += 1
+        return ensureWechatBrokerStarted()
+      },
       createWechatBridgeLifecycleImpl: async () => {
         lifecycleCalls += 1
         return {
@@ -355,6 +369,7 @@ test("plugin-hooks broker 启动确保失败时仍保持 lifecycle fail-open（r
     await Promise.resolve()
     await Promise.resolve()
 
+    assert.equal(ensureCalls, 0)
     assert.equal(lifecycleCalls, 1)
   }
 
@@ -706,10 +721,12 @@ test("bridge lifecycle heartbeat 与 close 边界：仅定时心跳，close 清�
 
 test("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次 full sync", async () => {
   const { createWechatBridgeLifecycle } = await importBridgeModule()
+  let connectOrSpawnCalls = 0
   let connectCalls = 0
   let registerCalls = 0
   let closeCalls = 0
   let timerCallback = null
+  const brokerEndpoint = "fake-endpoint-reused"
 
   const liveReadCalls = []
   const client = {
@@ -746,8 +763,12 @@ test("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次 full 
   }
 
   const deps = {
-    connectOrSpawnBrokerImpl: async () => ({ endpoint: `fake-endpoint-${connectCalls + 1}` }),
-    connectImpl: async () => {
+    connectOrSpawnBrokerImpl: async () => {
+      connectOrSpawnCalls += 1
+      return { endpoint: brokerEndpoint }
+    },
+    connectImpl: async (endpoint) => {
+      assert.equal(endpoint, brokerEndpoint)
       connectCalls += 1
       const currentConnect = connectCalls
       return {
@@ -789,6 +810,7 @@ test("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次 full 
     await new Promise((resolve) => setTimeout(resolve, 0))
   }
 
+  assert.equal(connectOrSpawnCalls, 2)
   assert.equal(connectCalls, 2)
   assert.equal(registerCalls, 2)
   assert.equal(closeCalls >= 1, true)

@@ -11,9 +11,46 @@ import { upsertInboundToken, type TokenSource } from "./token-store.js"
 
 const DEFAULT_RETRY_DELAY_MS = 1_000
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 25_000
+const MAX_HELPER_FAILURE_BACKOFF_MS = 30_000
 
 export const DEFAULT_NON_SLASH_REPLY_TEXT = STAGE_A_SLASH_ONLY_MESSAGE
 export const DEFAULT_SLASH_HANDLER_ERROR_REPLY_TEXT = "命令处理失败，请稍后重试。"
+
+type RuntimeErrorStage =
+  | "loadPublicHelpers"
+  | "getUpdates"
+  | "persistGetUpdatesBuf"
+  | "drainOutboundMessages"
+  | "sendReplyMessage"
+
+type HelperFailureRetryState = "backing-off"
+
+type HelperFailureState = {
+  stage: "loadPublicHelpers"
+  consecutiveFailures: number
+  currentBackoffMs: number
+  retryState: HelperFailureRetryState
+  reachedGetUpdates: false
+  lastFailureAtMs: number
+  nextRetryAtMs: number
+}
+
+type LoadPublicHelpersRuntimeErrorDiagnostic = {
+  type: "runtimeError"
+  stage: "loadPublicHelpers"
+  error: string
+  consecutiveFailures: number
+  backoffMs: number
+  retryState: HelperFailureRetryState
+  reachedGetUpdates: false
+}
+
+type ReachedGetUpdatesRuntimeErrorDiagnostic = {
+  type: "runtimeError"
+  stage: Exclude<RuntimeErrorStage, "loadPublicHelpers">
+  error: string
+  reachedGetUpdates: true
+}
 
 type PublicHelpersForRuntime = Pick<
   OpenClawWeixinPublicHelpers,
@@ -37,16 +74,8 @@ type RuntimeDrainOutboundMessagesInput = {
 }
 
 export type WechatStatusRuntimeDiagnosticEvent =
-  | {
-      type: "runtimeError"
-      stage:
-        | "loadPublicHelpers"
-        | "getUpdates"
-        | "persistGetUpdatesBuf"
-        | "drainOutboundMessages"
-        | "sendReplyMessage"
-      error: string
-    }
+  | LoadPublicHelpersRuntimeErrorDiagnostic
+  | ReachedGetUpdatesRuntimeErrorDiagnostic
   | {
       type: "messageSkipped"
       reason: "missingFromUserId" | "missingText"
@@ -75,6 +104,9 @@ type CreateWechatStatusRuntimeInput = {
   drainOutboundMessages?: (input: RuntimeDrainOutboundMessagesInput) => Promise<void>
   retryDelayMs?: number
   longPollTimeoutMs?: number
+  now?: () => number
+  sleepImpl?: (ms: number, signal: AbortSignal) => Promise<void>
+  onFailureStateChange?: (state: HelperFailureState | null) => void | Promise<void>
   shouldReloadState?: (state: {
     accountId: string
     baseUrl: string
@@ -86,6 +118,10 @@ type CreateWechatStatusRuntimeInput = {
 export type WechatStatusRuntime = {
   start: () => Promise<void>
   close: () => Promise<void>
+  getDebugFailureStateForTest: () => {
+    helperFailureState: HelperFailureState | null
+    retainedFailureObjectCount: number
+  }
 }
 
 function createAbortError(): Error {
@@ -165,6 +201,17 @@ function normalizePositiveInteger(value: number | undefined, fallback: number): 
   return Math.floor(value)
 }
 
+function computeHelperFailureBackoffMs(retryDelayMs: number, consecutiveFailures: number): number {
+  return Math.min(retryDelayMs * 2 ** Math.max(0, consecutiveFailures - 1), MAX_HELPER_FAILURE_BACKOFF_MS)
+}
+
+function cloneHelperFailureState(state: HelperFailureState | null): HelperFailureState | null {
+  if (!state) {
+    return null
+  }
+  return { ...state }
+}
+
 function extractMessageText(message: PublicWeixinMessage): string {
   for (const item of message.item_list ?? []) {
     if (item?.type !== 1) {
@@ -224,6 +271,9 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
   const onDiagnosticEvent = input.onDiagnosticEvent ?? (() => {})
   const retryDelayMs = normalizePositiveInteger(input.retryDelayMs, DEFAULT_RETRY_DELAY_MS)
   const longPollTimeoutMs = normalizePositiveInteger(input.longPollTimeoutMs, DEFAULT_LONG_POLL_TIMEOUT_MS)
+  const now = input.now ?? Date.now
+  const sleepImpl = input.sleepImpl ?? sleep
+  const onFailureStateChange = input.onFailureStateChange ?? (() => {})
   const shouldReloadState = input.shouldReloadState ?? (() => false)
   const drainOutboundMessages = input.drainOutboundMessages
 
@@ -231,6 +281,9 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
   let closed = false
   let stopController: AbortController | null = null
   let pollingTask: Promise<void> | null = null
+  let helperFailureState: HelperFailureState | null = null
+
+  const retainedHelperFailureObjects = new Set<object>()
 
   const emitDiagnosticEvent = (event: WechatStatusRuntimeDiagnosticEvent) => {
     void Promise.resolve()
@@ -240,19 +293,78 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
       })
   }
 
+  const emitFailureStateChange = (state: HelperFailureState | null) => {
+    const snapshot = cloneHelperFailureState(state)
+    void Promise.resolve()
+      .then(() => onFailureStateChange(snapshot))
+      .catch((error) => {
+        onRuntimeError(error)
+      })
+  }
+
+  const replaceHelperFailureState = (nextState: HelperFailureState | null) => {
+    if (helperFailureState) {
+      retainedHelperFailureObjects.delete(helperFailureState)
+    }
+    helperFailureState = nextState
+    if (helperFailureState) {
+      retainedHelperFailureObjects.add(helperFailureState)
+    }
+    emitFailureStateChange(helperFailureState)
+  }
+
+  const clearHelperFailureState = () => {
+    if (!helperFailureState && retainedHelperFailureObjects.size === 0) {
+      return
+    }
+    replaceHelperFailureState(null)
+  }
+
+  const noteLoadPublicHelpersFailure = (): HelperFailureState => {
+    const consecutiveFailures = (helperFailureState?.consecutiveFailures ?? 0) + 1
+    const currentBackoffMs = computeHelperFailureBackoffMs(retryDelayMs, consecutiveFailures)
+    const lastFailureAtMs = now()
+    const nextState: HelperFailureState = {
+      stage: "loadPublicHelpers",
+      consecutiveFailures,
+      currentBackoffMs,
+      retryState: "backing-off",
+      reachedGetUpdates: false,
+      lastFailureAtMs,
+      nextRetryAtMs: lastFailureAtMs + currentBackoffMs,
+    }
+    replaceHelperFailureState(nextState)
+    return nextState
+  }
+
   const emitRuntimeErrorDiagnostic = (
-    stage:
-      | "loadPublicHelpers"
-      | "getUpdates"
-      | "persistGetUpdatesBuf"
-      | "drainOutboundMessages"
-      | "sendReplyMessage",
+    stage: RuntimeErrorStage,
     error: unknown,
+    options?: {
+      consecutiveFailures?: number
+      backoffMs?: number
+      retryState?: HelperFailureRetryState
+      reachedGetUpdates?: boolean
+    },
   ) => {
+    const runtimeError = toRuntimeDiagnosticError(error)
+    if (stage === "loadPublicHelpers") {
+      emitDiagnosticEvent({
+        type: "runtimeError",
+        stage,
+        error: runtimeError,
+        consecutiveFailures: options?.consecutiveFailures ?? 1,
+        backoffMs: options?.backoffMs ?? retryDelayMs,
+        retryState: options?.retryState ?? "backing-off",
+        reachedGetUpdates: false,
+      })
+      return
+    }
     emitDiagnosticEvent({
       type: "runtimeError",
       stage,
-      error: toRuntimeDiagnosticError(error),
+      error: runtimeError,
+      reachedGetUpdates: true,
     })
   }
 
@@ -266,6 +378,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
     } | null = null
 
     while (!signal.aborted) {
+      let nextRetryDelayMs = retryDelayMs
       try {
         let justInitialized = false
         if (!initialized) {
@@ -282,12 +395,19 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
               token: latestAccountState.token,
               getUpdatesBuf: typeof latestAccountState.getUpdatesBuf === "string" ? latestAccountState.getUpdatesBuf : "",
             }
+            clearHelperFailureState()
             justInitialized = true
           } catch (error) {
             if (isAbortError(error)) {
               return
             }
-            emitRuntimeErrorDiagnostic("loadPublicHelpers", error)
+            const failureState = noteLoadPublicHelpersFailure()
+            nextRetryDelayMs = failureState.currentBackoffMs
+            emitRuntimeErrorDiagnostic("loadPublicHelpers", error, {
+              consecutiveFailures: failureState.consecutiveFailures,
+              backoffMs: failureState.currentBackoffMs,
+              retryState: failureState.retryState,
+            })
             throw error
           }
         }
@@ -338,9 +458,9 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
               if (isAbortError(error)) {
                 return
               }
-              emitRuntimeErrorDiagnostic("persistGetUpdatesBuf", error)
-              onRuntimeError(error)
-            }
+            emitRuntimeErrorDiagnostic("persistGetUpdatesBuf", error)
+            onRuntimeError(error)
+          }
           }
         }
 
@@ -476,7 +596,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
           return
         }
         try {
-          await sleep(retryDelayMs, signal)
+          await sleepImpl(nextRetryDelayMs, signal)
         } catch (sleepError) {
           if (isAbortError(sleepError)) {
             return
@@ -492,6 +612,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
       if (started) {
         return
       }
+      clearHelperFailureState()
       started = true
       closed = false
       const controller = new AbortController()
@@ -500,6 +621,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
     },
     close: async () => {
       if (!started) {
+        clearHelperFailureState()
         return
       }
       closed = true
@@ -513,6 +635,13 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
       pollingTask = null
       if (task) {
         await task.catch(() => {})
+      }
+      clearHelperFailureState()
+    },
+    getDebugFailureStateForTest: () => {
+      return {
+        helperFailureState: cloneHelperFailureState(helperFailureState),
+        retainedFailureObjectCount: retainedHelperFailureObjects.size,
       }
     },
   }

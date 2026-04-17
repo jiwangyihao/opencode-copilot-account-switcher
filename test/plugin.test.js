@@ -80,11 +80,22 @@ async function toggleAllModelsPolicy(plugin) {
 async function waitForCondition(predicate, timeoutMs = 800) {
   const startedAt = Date.now()
   while (Date.now() - startedAt < timeoutMs) {
-    if (predicate()) return
+    if (await predicate()) return
     await delay(10)
   }
-  assert.equal(predicate(), true)
+  assert.equal(await predicate(), true)
 }
+
+test("waitForCondition 会等待异步谓词真正满足", async () => {
+  let ready = false
+  setTimeout(() => {
+    ready = true
+  }, 30)
+
+  await waitForCondition(async () => ready, 1000)
+
+  assert.equal(ready, true)
+})
 
 async function captureRejectedError(run) {
   try {
@@ -107,6 +118,73 @@ function captureConsoleLog() {
       console.log = original
     },
   }
+}
+
+function createBridgeCapablePluginClient(extra = {}) {
+  const base = {
+    auth: {
+      set: async () => {},
+    },
+    session: {
+      list: async () => [],
+      status: async () => ({ data: {} }),
+      todo: async () => [],
+      messages: async () => [],
+    },
+    question: {
+      list: async () => [],
+    },
+    permission: {
+      list: async () => [],
+    },
+  }
+
+  return {
+    ...base,
+    ...extra,
+    auth: {
+      ...base.auth,
+      ...(extra.auth ?? {}),
+    },
+    session: {
+      ...base.session,
+      ...(extra.session ?? {}),
+    },
+    question: {
+      ...base.question,
+      ...(extra.question ?? {}),
+    },
+    permission: {
+      ...base.permission,
+      ...(extra.permission ?? {}),
+    },
+  }
+}
+
+async function createNoopWechatBridgeLifecycle() {
+  return {
+    close: async () => {},
+  }
+}
+
+async function replaceActiveWechatBridgeLifecycleForTest() {
+  buildPluginHooksRaw({
+    auth: {
+      provider: "github-copilot",
+      methods: [],
+    },
+    client: createBridgeCapablePluginClient(),
+    directory: `${process.cwd()}-${Date.now()}-${Math.random()}`,
+    serverUrl: new URL("http://127.0.0.1:4096"),
+    ensureWechatBrokerStarted: async () => ({ endpoint: "fake-endpoint" }),
+    createWechatBridgeLifecycleImpl: async () => ({
+      close: async () => {},
+    }),
+  })
+
+  await Promise.resolve()
+  await Promise.resolve()
+  await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
 test("plugin exposes auth and experimental chat system transform hooks", () => {
@@ -8264,8 +8342,8 @@ test("github-copilot auth methods no longer include Codex entry", async () => {
   ])
 })
 
-test("CopilotAccountSwitcher 插件入口加载时会显式触发 broker 启动确保", async () => {
-  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-${Date.now()}`)
+test("CopilotAccountSwitcher 在非 bridge-capable（没有 serverUrl/bridge 语义）时不应急切拉起 broker", async () => {
+  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-no-bridge-${Date.now()}`)
   const calls = []
 
   await CopilotAccountSwitcher({
@@ -8284,7 +8362,7 @@ test("CopilotAccountSwitcher 插件入口加载时会显式触发 broker 启动�
   await Promise.resolve()
   await Promise.resolve()
 
-  assert.equal(calls.length, 1)
+  assert.equal(calls.length, 0)
 })
 
 test("openai auth provider is wired to Codex menu entry and codex auth loader", async () => {
@@ -8307,27 +8385,174 @@ test("openai auth provider is wired to Codex menu entry and codex auth loader", 
   ])
 })
 
-test("OpenAICodexAccountSwitcher 插件入口加载时会显式触发 broker 启动确保", async () => {
-  const { OpenAICodexAccountSwitcher } = await import(`../dist/plugin.js?codex-broker-${Date.now()}`)
+test("CopilotAccountSwitcher 只有在 bridge-capable 时才会 eager ensure broker", async () => {
+  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-bridge-capable-${Date.now()}`)
   const calls = []
 
-  await OpenAICodexAccountSwitcher({
-    client: {
-      auth: {
-        set: async () => {},
+  try {
+    await CopilotAccountSwitcher({
+      client: createBridgeCapablePluginClient(),
+      directory: process.cwd(),
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      createWechatBridgeLifecycleImpl: createNoopWechatBridgeLifecycle,
+      ensureWechatBrokerStarted: async () => {
+        calls.push("copilot")
+        return { endpoint: "fake-endpoint" }
       },
-    },
-    directory: process.cwd(),
-    ensureWechatBrokerStarted: async () => {
-      calls.push("codex")
-      return { endpoint: "fake-endpoint" }
-    },
-  })
+    })
 
-  await Promise.resolve()
-  await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
 
-  assert.equal(calls.length, 1)
+    assert.equal(calls.length, 1)
+  } finally {
+    await replaceActiveWechatBridgeLifecycleForTest()
+  }
+})
+
+test("CopilotAccountSwitcher 在顺序两次 bridge-capable 加载时，cold-start broker promise 只应 eager ensure 一次", async () => {
+  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-promise-${Date.now()}`)
+  const ensureCalls = []
+  const initialBrokerEndpoints = []
+  const createWechatBridgeLifecycleImpl = async (input) => {
+    initialBrokerEndpoints.push((await input.initialBrokerPromise)?.endpoint)
+    return {
+      close: async () => {},
+    }
+  }
+
+  try {
+    await CopilotAccountSwitcher({
+      client: createBridgeCapablePluginClient(),
+      directory: `${process.cwd()}-cold-start-a-${Date.now()}`,
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      createWechatBridgeLifecycleImpl,
+      ensureWechatBrokerStarted: async () => {
+        ensureCalls.push("first")
+        return { endpoint: "fake-endpoint-first" }
+      },
+    })
+
+    await Promise.resolve()
+    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    await CopilotAccountSwitcher({
+      client: createBridgeCapablePluginClient(),
+      directory: `${process.cwd()}-cold-start-b-${Date.now()}`,
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      createWechatBridgeLifecycleImpl,
+      ensureWechatBrokerStarted: async () => {
+        ensureCalls.push("second")
+        return { endpoint: "fake-endpoint-second" }
+      },
+    })
+
+    await Promise.resolve()
+    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    assert.deepEqual(ensureCalls, ["first"])
+    assert.deepEqual(initialBrokerEndpoints, ["fake-endpoint-first", undefined])
+  } finally {
+    await replaceActiveWechatBridgeLifecycleForTest()
+  }
+})
+
+test("CopilotAccountSwitcher 在 eager ensure 首次失败时仍会回退到 bridge lifecycle 的正常 launcher 路径", async () => {
+  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-eager-fallback-${Date.now()}`)
+  const { createWechatBridgeLifecycle } = await import(`../dist/wechat/bridge.js?copilot-broker-eager-fallback-${Date.now()}`)
+  let launcherCalls = 0
+  const connectedEndpoints = []
+
+  try {
+    await CopilotAccountSwitcher({
+      client: createBridgeCapablePluginClient(),
+      directory: `${process.cwd()}-eager-fallback-${Date.now()}`,
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      ensureWechatBrokerStarted: async () => {
+        throw new Error("eager ensure failed once")
+      },
+      createWechatBridgeLifecycleImpl: (input) => createWechatBridgeLifecycle(input, {
+        connectOrSpawnBrokerImpl: async () => {
+          launcherCalls += 1
+          return { endpoint: "fake-endpoint-from-launcher" }
+        },
+        connectImpl: async (endpoint) => {
+          connectedEndpoints.push(endpoint)
+          return {
+            registerInstance: async () => ({ sessionToken: "token", registeredAt: Date.now(), brokerPid: process.pid }),
+            heartbeat: async () => ({}),
+            close: async () => {},
+          }
+        },
+        setIntervalImpl: () => ({ id: Symbol("timer") }),
+        clearIntervalImpl: () => {},
+      }),
+    })
+
+    await Promise.resolve()
+    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    assert.equal(launcherCalls, 1)
+    assert.deepEqual(connectedEndpoints, ["fake-endpoint-from-launcher"])
+  } finally {
+    await replaceActiveWechatBridgeLifecycleForTest()
+  }
+})
+
+test("CopilotAccountSwitcher 在 eager handoff broker 已失效时仍会回退到 bridge lifecycle 的正常 launcher 路径", async () => {
+  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-stale-handoff-${Date.now()}`)
+  const { createWechatBridgeLifecycle } = await import(`../dist/wechat/bridge.js?copilot-broker-stale-handoff-${Date.now()}`)
+  let launcherCalls = 0
+  const connectedEndpoints = []
+  const registeredEndpoints = []
+  const closedEndpoints = []
+
+  try {
+    await CopilotAccountSwitcher({
+      client: createBridgeCapablePluginClient(),
+      directory: `${process.cwd()}-stale-handoff-${Date.now()}`,
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      ensureWechatBrokerStarted: async () => ({ endpoint: "fake-endpoint-stale" }),
+      createWechatBridgeLifecycleImpl: (input) => createWechatBridgeLifecycle(input, {
+        connectOrSpawnBrokerImpl: async () => {
+          launcherCalls += 1
+          return { endpoint: "fake-endpoint-from-launcher" }
+        },
+        connectImpl: async (endpoint) => {
+          connectedEndpoints.push(endpoint)
+          return {
+            registerInstance: async () => {
+              registeredEndpoints.push(endpoint)
+              if (endpoint === "fake-endpoint-stale") {
+                throw new Error("stale broker register failed")
+              }
+              return { sessionToken: "token", registeredAt: Date.now(), brokerPid: process.pid }
+            },
+            heartbeat: async () => ({}),
+            close: async () => {
+              closedEndpoints.push(endpoint)
+            },
+          }
+        },
+        setIntervalImpl: () => ({ id: Symbol("timer") }),
+        clearIntervalImpl: () => {},
+      }),
+    })
+
+    await Promise.resolve()
+    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    assert.equal(launcherCalls, 1)
+    assert.deepEqual(connectedEndpoints, ["fake-endpoint-stale", "fake-endpoint-from-launcher"])
+    assert.deepEqual(registeredEndpoints, ["fake-endpoint-stale", "fake-endpoint-from-launcher"])
+    assert.deepEqual(closedEndpoints, ["fake-endpoint-stale"])
+  } finally {
+    await replaceActiveWechatBridgeLifecycleForTest()
+  }
 })
 
 test("CopilotAccountSwitcher 在 broker 启动失败时会稳定写入诊断文件并保持 fail-open", async () => {
@@ -8336,47 +8561,59 @@ test("CopilotAccountSwitcher 在 broker 启动失败时会稳定写入诊断文�
   const diagnosticsPath = brokerStartupDiagnosticsPath()
   await fs.rm(diagnosticsPath, { force: true })
 
-  await CopilotAccountSwitcher({
-    client: {
-      auth: {
-        set: async () => {},
+  try {
+    await CopilotAccountSwitcher({
+      client: createBridgeCapablePluginClient(),
+      directory: process.cwd(),
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      createWechatBridgeLifecycleImpl: createNoopWechatBridgeLifecycle,
+      ensureWechatBrokerStarted: async () => {
+        throw new Error("broker bootstrap failed for test")
       },
-    },
-    directory: process.cwd(),
-    ensureWechatBrokerStarted: async () => {
-      throw new Error("broker bootstrap failed for test")
-    },
-  })
+    })
 
-  await waitForCondition(() => existsSync(diagnosticsPath))
-  const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
-  assert.match(diagnostics, /broker bootstrap failed for test/)
+    await waitForCondition(async () => {
+      try {
+        const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
+        return diagnostics.includes("broker bootstrap failed for test")
+      } catch {
+        return false
+      }
+    })
+    const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
+    assert.match(diagnostics, /broker bootstrap failed for test/)
+  } finally {
+    await replaceActiveWechatBridgeLifecycleForTest()
+  }
 })
 
 test("CopilotAccountSwitcher 在 broker 启动失败时会给出最小 toast 提示并保持 fail-open", async () => {
   const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-toast-${Date.now()}`)
   const toasts = []
 
-  await CopilotAccountSwitcher({
-    client: {
-      auth: {
-        set: async () => {},
-      },
-      tui: {
-        showToast: async (options) => {
-          toasts.push(options)
+  try {
+    await CopilotAccountSwitcher({
+      client: createBridgeCapablePluginClient({
+        tui: {
+          showToast: async (options) => {
+            toasts.push(options)
+          },
         },
+      }),
+      directory: process.cwd(),
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      createWechatBridgeLifecycleImpl: createNoopWechatBridgeLifecycle,
+      ensureWechatBrokerStarted: async () => {
+        throw new Error("broker bootstrap failed for toast")
       },
-    },
-    directory: process.cwd(),
-    ensureWechatBrokerStarted: async () => {
-      throw new Error("broker bootstrap failed for toast")
-    },
-  })
+    })
 
-  await waitForCondition(() => toasts.length === 1)
-  assert.equal(toasts.length, 1)
-  assert.match(String(toasts[0]?.body?.message ?? ""), /broker|微信|wechat/i)
+    await waitForCondition(() => toasts.length === 1)
+    assert.equal(toasts.length, 1)
+    assert.match(String(toasts[0]?.body?.message ?? ""), /broker|微信|wechat/i)
+  } finally {
+    await replaceActiveWechatBridgeLifecycleForTest()
+  }
 })
 
 test("provider descriptor contract keeps Copilot assembled and Codex enabled", async () => {
