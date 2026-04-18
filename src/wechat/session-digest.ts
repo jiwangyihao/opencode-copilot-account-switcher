@@ -17,6 +17,11 @@ export type SessionDigestHighlight = {
   text: string
 }
 
+export type SessionDigestTodoItem = {
+  status: "pending" | "in_progress" | "completed" | "cancelled"
+  content: string
+}
+
 export type SessionDigest = {
   sessionID: string
   title: string
@@ -32,7 +37,7 @@ export type SessionDigest = {
   }
   unavailable?: Array<"messages" | "todo">
   highlights: SessionDigestHighlight[]
-  todoItems?: string[]
+  todoItems?: SessionDigestTodoItem[]
   questionHighlights?: string[]
 }
 
@@ -118,6 +123,12 @@ function summarizeTodos(todos: Todo[]): { total: number; inProgress: number; com
   }
 }
 
+function normalizeTodoStatus(status: unknown): SessionDigestTodoItem["status"] | null {
+  return status === "pending" || status === "in_progress" || status === "completed" || status === "cancelled"
+    ? status
+    : null
+}
+
 function pushIfDefined(highlights: SessionDigestHighlight[], kind: SessionDigestHighlight["kind"], text?: string) {
   if (!text) {
     return
@@ -180,8 +191,16 @@ export function buildSessionDigest(input: BuildSessionDigestInput): SessionDiges
   const status = asSessionState(input.statusBySession[sessionID])
   const highlights: SessionDigestHighlight[] = []
   const todoItems = todos
-    .map((todo) => (typeof todo.content === "string" ? todo.content.trim() : ""))
-    .filter((item) => item.length > 0)
+    .map((todo) => {
+      const status = normalizeTodoStatus(todo.status)
+      return {
+        status,
+        content: typeof todo.content === "string" ? todo.content.trim() : "",
+      }
+    })
+    .filter(
+      (item): item is SessionDigestTodoItem => item.status !== null && item.content.length > 0,
+    )
   const questionHighlights = questions
     .map((question) => summarizeQuestionHighlight(question))
     .filter((item): item is string => typeof item === "string" && item.length > 0)

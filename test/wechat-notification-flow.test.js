@@ -1360,6 +1360,8 @@ test("通知文案格式化：question 输出题面 题型 选项 与回复格�
   assert.match(questionText, /类型：单选/)
   assert.match(questionText, /1\. staging/)
   assert.match(questionText, /\/reply q8 1/)
+  assert.doesNotMatch(questionText, /\/reply q8 你的自定义回答/)
+  assert.doesNotMatch(questionText, /\/reply q8 1,3; 其他：先灰度再全量/)
 })
 
 test("通知文案格式化：question 在文本题时展示完整题面与自由文本回复示例", async () => {
@@ -1415,9 +1417,11 @@ test("通知文案格式化：question 在多选题时展示编号选项与多�
   assert.match(questionText, /1\. staging/)
   assert.match(questionText, /3\. preview/)
   assert.match(questionText, /\/reply qmulti1 1,2/)
+  assert.doesNotMatch(questionText, /\/reply qmulti1 你的自定义回答/)
+  assert.doesNotMatch(questionText, /\/reply qmulti1 1,3; 其他：先灰度再全量/)
 })
 
-test("通知文案格式化：question 在多选且允许自定义时同时展示多选与自定义回复示例", async () => {
+test("通知文案格式化：multiple + custom=true 同时展示编号、自定义、mixed reply 示例", async () => {
   const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-question-multiple-custom-copy`)
 
   const questionText = notificationFormat.formatWechatNotificationText({
@@ -1444,9 +1448,39 @@ test("通知文案格式化：question 在多选且允许自定义时同时展�
 
   assert.match(questionText, /\/reply qmulti2 1,2/)
   assert.match(questionText, /\/reply qmulti2 你的自定义回答/)
+  assert.match(questionText, /\/reply qmulti2 1,3; 其他：先灰度再全量/)
 })
 
-test("通知文案格式化：permission 输出标题 类型 与 allow 动作说明", async () => {
+test("通知文案格式化：single + custom=true 展示编号与自定义，但不展示 mixed reply 示例", async () => {
+  const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-question-single-custom-copy`)
+
+  const questionText = notificationFormat.formatWechatNotificationText({
+    idempotencyKey: "question-single-custom-1",
+    kind: "question",
+    wechatAccountId: "wx-main",
+    userId: "u-main",
+    routeKey: "route-question-single-custom-1",
+    handle: "qsingle2",
+    createdAt: 1_700_600_100_031,
+    status: "pending",
+    prompt: {
+      title: "请选择发布环境",
+      body: "也可以直接输入其它发布说明。",
+      mode: "single",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+      ],
+    },
+  })
+
+  assert.match(questionText, /\/reply qsingle2 1/)
+  assert.match(questionText, /\/reply qsingle2 你的自定义回答/)
+  assert.doesNotMatch(questionText, /1,3; 其他：先灰度再全量/)
+})
+
+test("通知文案格式化：permission 同时展示批准对象、handle、命令用法与动作语义", async () => {
   const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}`)
 
   const permissionText = notificationFormat.formatWechatNotificationText({
@@ -1466,11 +1500,15 @@ test("通知文案格式化：permission 输出标题 类型 与 allow 动作说
   })
 
   assert.match(permissionText, /允许执行 shell 命令/)
+  assert.match(permissionText, /收到新的权限请求（p3）/)
   assert.match(permissionText, /类型：command/)
   assert.match(permissionText, /目标：npm publish --tag latest/)
   assert.match(permissionText, /\/allow p3 once/)
   assert.match(permissionText, /\/allow p3 always/)
   assert.match(permissionText, /\/allow p3 reject/)
+  assert.match(permissionText, /once：仅处理这一次/)
+  assert.match(permissionText, /always：后续同类请求自动允许/)
+  assert.match(permissionText, /reject：拒绝当前请求/)
 })
 
 test("通知分发：发送成功后若 markNotificationSent 因竞争失败，不应降级写成 failed", async () => {

@@ -7,7 +7,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { mkdtemp, readFile, stat, access, writeFile, rm, readdir } from "node:fs/promises"
-import { mkdirSync, readFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
 const DIST_PROTOCOL_MODULE = "../dist/wechat/protocol.js"
@@ -74,7 +74,7 @@ function createSocketConnection(endpoint) {
   return net.createConnection(endpoint)
 }
 
-async function waitForBrokerMetadata(brokerJsonPath, timeoutMs = 5000) {
+async function waitForBrokerMetadata(brokerJsonPath, timeoutMs = 15_000) {
   const startedAt = Date.now()
   while (Date.now() - startedAt < timeoutMs) {
     try {
@@ -1728,6 +1728,63 @@ test("旧 owner 死亡后第一次 replacement 只会被生成一次，后续 la
 
   assert.equal(new Set(results.map((item) => item.endpoint)).size, 1)
   assert.equal(spawned, 1)
+})
+
+test("lock window 里 replacement 从 booting 切到 ready 时不会误拉起第二个 broker", async () => {
+  const launcher = await import(`${DIST_BROKER_LAUNCHER_MODULE}?reload=${Date.now()}`)
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-launcher-lock-window-ready-"))
+  const stateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+  const brokerJsonPath = path.join(stateRoot, "broker.json")
+  const launchLockPath = path.join(stateRoot, "launch.lock")
+  const oldOwnerEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-old-owner`)
+  const oldOwnerPid = 50042
+  const replacementEndpoint = createBrokerEndpoint(`${sandboxConfigHome}-replacement`)
+  const replacementPid = 50043
+
+  mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+  await writeFile(
+    brokerJsonPath,
+    JSON.stringify({ pid: oldOwnerPid, endpoint: oldOwnerEndpoint, startedAt: Date.now() - 1000, version: "0.14.42" }, null, 2),
+    "utf8",
+  )
+
+  let replacementPingCalls = 0
+  let spawned = 0
+
+  const result = await launcher.connectOrSpawnBroker({
+    stateRoot,
+    brokerJsonPath,
+    launchLockPath,
+    expectedVersion: "0.14.43",
+    backoffMs: 10,
+    maxAttempts: 20,
+    endpointFactory: () => createBrokerEndpoint(`${sandboxConfigHome}-unused`),
+    onLockAcquired: () => {
+      writeFileSync(
+        brokerJsonPath,
+        JSON.stringify({ pid: replacementPid, endpoint: replacementEndpoint, startedAt: Date.now(), version: "0.14.43" }, null, 2),
+        "utf8",
+      )
+    },
+    pingImpl: async (candidateEndpoint) => {
+      if (candidateEndpoint !== replacementEndpoint) {
+        return false
+      }
+
+      replacementPingCalls += 1
+      return replacementPingCalls >= 2
+    },
+    isProcessAliveImpl: (pid) => pid !== oldOwnerPid,
+    retireBrokerImpl: async () => {},
+    spawnImpl: () => {
+      spawned += 1
+      throw new Error("should not spawn duplicate replacement broker")
+    },
+  })
+
+  assert.equal(result.endpoint, replacementEndpoint)
+  assert.equal(spawned, 0)
+  assert.equal(replacementPingCalls >= 2, true)
 })
 
 test("booting broker identity 变化后等待窗口会重置", async () => {

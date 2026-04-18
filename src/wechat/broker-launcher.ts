@@ -562,20 +562,19 @@ export async function connectOrSpawnBroker(options: LaunchOptions = {}): Promise
     options.onLockAcquired?.(lock)
 
     try {
-      const secondCheck = await isBrokerAlive(brokerJsonFile, pingImpl, isProcessAliveImpl, expectedVersion)
-      if (secondCheck) {
-        return secondCheck
-      }
-
-      const lockWindowBootingBroker = await readBootingCompatibleBroker(
+      const lockWindowBrokerState = await readCompatibleBrokerState(
         brokerJsonFile,
         pingImpl,
         isProcessAliveImpl,
         expectedVersion,
       )
+      if (lockWindowBrokerState.status === "ready") {
+        return lockWindowBrokerState.metadata
+      }
+
       if (
-        lockWindowBootingBroker &&
-        getBrokerIdentity(lockWindowBootingBroker) !== failedBootingBrokerIdentity
+        lockWindowBrokerState.status === "booting" &&
+        getBrokerIdentity(lockWindowBrokerState.metadata) !== failedBootingBrokerIdentity
       ) {
         continue
       }

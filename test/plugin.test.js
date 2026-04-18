@@ -8556,6 +8556,7 @@ test("CopilotAccountSwitcher 在 eager handoff broker 已失效时仍会回退�
 })
 
 test("CopilotAccountSwitcher 在 broker 启动失败时会稳定写入诊断文件并保持 fail-open", async () => {
+  const sandbox = await setupIsolatedWechatStateRoot("wechat-plugin-broker-diagnostics-")
   const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-diagnostics-${Date.now()}`)
   const { brokerStartupDiagnosticsPath } = await import(`../dist/wechat/state-paths.js?copilot-broker-diagnostics-${Date.now()}`)
   const diagnosticsPath = brokerStartupDiagnosticsPath()
@@ -8584,11 +8585,15 @@ test("CopilotAccountSwitcher 在 broker 启动失败时会稳定写入诊断文�
     assert.match(diagnostics, /broker bootstrap failed for test/)
   } finally {
     await replaceActiveWechatBridgeLifecycleForTest()
+    await sandbox.restore()
   }
 })
 
 test("CopilotAccountSwitcher 在 broker 启动失败时会给出最小 toast 提示并保持 fail-open", async () => {
+  const sandbox = await setupIsolatedWechatStateRoot("wechat-plugin-broker-toast-")
   const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-toast-${Date.now()}`)
+  const { brokerStartupDiagnosticsPath } = await import(`../dist/wechat/state-paths.js?copilot-broker-toast-${Date.now()}`)
+  const diagnosticsPath = brokerStartupDiagnosticsPath()
   const toasts = []
 
   try {
@@ -8608,11 +8613,21 @@ test("CopilotAccountSwitcher 在 broker 启动失败时会给出最小 toast 提
       },
     })
 
-    await waitForCondition(() => toasts.length === 1)
-    assert.equal(toasts.length, 1)
-    assert.match(String(toasts[0]?.body?.message ?? ""), /broker|微信|wechat/i)
+    await waitForCondition(() => toasts.some((options) => options?.body?.variant === "warning"))
+    await waitForCondition(async () => {
+      try {
+        const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
+        return diagnostics.includes("broker bootstrap failed for toast")
+      } catch {
+        return false
+      }
+    })
+    const warningToasts = toasts.filter((options) => options?.body?.variant === "warning")
+    assert.equal(warningToasts.length, 1)
+    assert.match(String(warningToasts[0]?.body?.message ?? ""), /broker|微信|wechat/i)
   } finally {
     await replaceActiveWechatBridgeLifecycleForTest()
+    await sandbox.restore()
   }
 })
 

@@ -1,5 +1,5 @@
 import type { WechatInstanceStatusSnapshot } from "./bridge.js"
-import type { SessionDigest, SessionDigestHighlight } from "./session-digest.js"
+import type { SessionDigest, SessionDigestHighlight, SessionDigestTodoItem } from "./session-digest.js"
 
 export type AggregatedStatusInstance =
   | {
@@ -73,6 +73,21 @@ function normalizeHighlight(value: unknown): SessionDigestHighlight | null {
   }
 }
 
+function isTodoStatus(value: unknown): value is SessionDigestTodoItem["status"] {
+  return value === "pending" || value === "in_progress" || value === "completed" || value === "cancelled"
+}
+
+function normalizeTodoItem(value: unknown): SessionDigestTodoItem | null {
+  const record = asObject(value)
+  if (!isTodoStatus(record.status) || !isNonEmptyString(record.content)) {
+    return null
+  }
+  return {
+    status: record.status,
+    content: record.content.trim(),
+  }
+}
+
 function normalizeSessionDigest(value: unknown): SessionDigest | null {
   const record = asObject(value)
   if (!isNonEmptyString(record.sessionID)) {
@@ -90,6 +105,12 @@ function normalizeSessionDigest(value: unknown): SessionDigest | null {
     .map((item) => normalizeHighlight(item))
     .filter((item): item is SessionDigestHighlight => item !== null)
 
+  const todoItems = Array.isArray(record.todoItems)
+    ? record.todoItems
+        .map((item) => normalizeTodoItem(item))
+        .filter((item): item is SessionDigestTodoItem => item !== null)
+    : undefined
+
   return {
     sessionID: record.sessionID,
     title: isNonEmptyString(record.title) ? record.title : "",
@@ -105,13 +126,7 @@ function normalizeSessionDigest(value: unknown): SessionDigest | null {
     },
     unavailable: toSessionUnavailable(record.unavailable),
     highlights,
-    ...(Array.isArray(record.todoItems)
-      ? {
-          todoItems: record.todoItems
-            .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-            .map((item) => item.trim()),
-        }
-      : {}),
+    ...(todoItems !== undefined ? { todoItems } : {}),
     ...(Array.isArray(record.questionHighlights)
       ? {
           questionHighlights: record.questionHighlights
@@ -189,7 +204,19 @@ function formatSessionTags(session: SessionDigest): string {
     `#todo:${session.todoSummary.total}`,
     `#question:${session.pendingQuestionCount}`,
     `#permission:${session.pendingPermissionCount}`,
-  ].join(" ")
+  ].map((tag) => `\`${tag}\``).join(" ")
+}
+
+function formatTodoItem(todo: SessionDigestTodoItem): string {
+  const prefix =
+    todo.status === "completed"
+      ? "[x]"
+      : todo.status === "in_progress"
+        ? "[-]"
+        : todo.status === "cancelled"
+          ? "[~]"
+          : "[ ]"
+  return `${prefix} ${todo.content}`
 }
 
 export function formatInstanceStatusSnapshot(snapshotInput: unknown): string {
@@ -255,7 +282,7 @@ export function formatAggregatedStatusReply(input: AggregatedStatusReplyInput): 
       sections.push(session.title || "未命名会话")
       sections.push(formatSessionTags(session))
       for (const todo of session.todoItems ?? []) {
-        sections.push(`todo: ${todo}`)
+        sections.push(formatTodoItem(todo))
       }
       for (const question of session.questionHighlights ?? []) {
         sections.push(question)

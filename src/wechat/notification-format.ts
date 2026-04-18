@@ -40,15 +40,26 @@ function formatQuestionOptions(options: Array<{ index: number; label: string }> 
 function formatQuestionReplyExamples(handle: string, mode: string | undefined, allowCustom: boolean) {
   const examples: string[] = []
   if (mode === "single") {
-    examples.push(`回复示例：/reply ${handle} 1`)
+    examples.push(`编号回复：/reply ${handle} 1`)
   }
   if (mode === "multiple") {
-    examples.push(`回复示例：/reply ${handle} 1,2`)
+    examples.push(`编号回复：/reply ${handle} 1,2`)
   }
   if (mode === "text" || allowCustom) {
-    examples.push(`回复示例：/reply ${handle} 你的自定义回答`)
+    examples.push(`自定义回复：/reply ${handle} 你的自定义回答`)
+  }
+  if (mode === "multiple" && allowCustom) {
+    examples.push(`混合回复：/reply ${handle} 1,3; 其他：先灰度再全量`)
   }
   return examples
+}
+
+function formatPermissionReplySemantics() {
+  return [
+    "once：仅处理这一次",
+    "always：后续同类请求自动允许",
+    "reject：拒绝当前请求",
+  ]
 }
 
 export function formatWechatNotificationText(record: NotificationRecord): string {
@@ -81,6 +92,7 @@ export function formatWechatNotificationText(record: NotificationRecord): string
         `允许一次：/allow ${handle} once`,
         `始终允许：/allow ${handle} always`,
         `拒绝：/allow ${handle} reject`,
+        ...formatPermissionReplySemantics(),
       ].filter(Boolean)
       return lines.join("\n")
     }

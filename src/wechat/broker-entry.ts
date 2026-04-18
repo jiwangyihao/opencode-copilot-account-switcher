@@ -233,6 +233,13 @@ type BrokerWechatSlashHandlerClient = {
   }
 }
 
+type PermissionMutationTestHooks = {
+  beforeFinalizePermission?: (request: {
+    readonly routeKey: string
+    readonly handle: string
+  }) => Promise<void> | void
+}
+
 function withOptionalDirectory<T extends object>(input: T, directory: string | undefined): T & { directory?: string } {
   if (typeof directory === "string" && directory.trim().length > 0) {
     return {
@@ -296,6 +303,7 @@ export function createBrokerWechatSlashCommandHandler(input: {
   directory?: string
   mutationQueue?: BrokerMutationQueue
   markDeadLetterRecoveryFailedImpl?: typeof markDeadLetterRecoveryFailed
+  permissionMutationTestHooks?: PermissionMutationTestHooks
   recoveryTestHooks?: {
     afterReopenRequest?: (mutation: RecoveryMutation) => Promise<void> | void
   }
@@ -823,6 +831,10 @@ export function createBrokerWechatSlashCommandHandler(input: {
     if (result.ok !== true) {
       return `处理权限请求失败：${result.errorMessage ?? "unknown"}`
     }
+    await input.permissionMutationTestHooks?.beforeFinalizePermission?.({
+      routeKey: openPermission.routeKey,
+      handle: openPermission.handle,
+    })
     if (command.reply === "reject") {
       await markRequestRejected({
         kind: "permission",

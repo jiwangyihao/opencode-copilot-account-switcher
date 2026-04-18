@@ -458,14 +458,26 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function cleanupPtyInternals(pty) {
+async function cleanupPtyInternals(pty) {
   const agent = pty?._agent
 
   if (agent?._closeTimeout) {
     clearTimeout(agent._closeTimeout)
+    agent._closeTimeout = undefined
   }
 
-  agent?._conoutSocketWorker?.dispose?.()
+  const conoutSocketWorker = agent?._conoutSocketWorker
+  if (conoutSocketWorker?._drainTimeout) {
+    clearTimeout(conoutSocketWorker._drainTimeout)
+    conoutSocketWorker._drainTimeout = undefined
+  }
+
+  if (typeof conoutSocketWorker?._destroySocket === "function") {
+    await conoutSocketWorker._destroySocket()
+  } else {
+    conoutSocketWorker?.dispose?.()
+  }
+
   agent?._inSocket?.destroy?.()
   agent?._outSocket?.destroy?.()
   pty?._socket?.destroy?.()
@@ -1402,16 +1414,22 @@ export async function stopRealOpencodePty(session, {
   gracefulInputs = ["CTRL_C"],
   gracefulExitWaitMs = 1_000,
   sendInputImpl,
+  platform = process.platform,
 } = {}) {
   if (!session) {
     return
   }
 
   let killError = null
+  const stopInputs = platform === "win32"
+    && gracefulInputs.length > 0
+    && !gracefulInputs.includes("CTRL_C")
+    ? [...gracefulInputs, "CTRL_C"]
+    : gracefulInputs
 
   try {
     if (!session.exited) {
-      for (const input of gracefulInputs) {
+      for (const input of stopInputs) {
         await sendKeys(session, [input], { sendInputImpl })
 
         const didExitGracefully = await Promise.race([
@@ -1453,7 +1471,7 @@ export async function stopRealOpencodePty(session, {
   } finally {
     session.dataSubscription?.dispose?.()
     session.exitSubscription?.dispose?.()
-    cleanupPtyInternals(session.pty)
+    await cleanupPtyInternals(session.pty)
   }
 }
 

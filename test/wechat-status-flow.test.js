@@ -1818,7 +1818,7 @@ test("broker-client connect: 同时传入 bridge 和 onCollectStatus 会显式�
   )
 })
 
-test("/status 文案边界：标题分段、短标签、完整 todo 优先，且不前置内部 ID", async () => {
+test("/status 文案边界：标题分段、inline code tag、checklist todo 优先，且不前置内部 ID", async () => {
   const statusFormat = await import(`../dist/wechat/status-format.js?reload=${Date.now()}`)
 
   const reply = statusFormat.formatAggregatedStatusReply({
@@ -1843,15 +1843,20 @@ test("/status 文案边界：标题分段、短标签、完整 todo 优先，且
               status: "busy",
               pendingQuestionCount: 1,
               pendingPermissionCount: 3,
-              todoSummary: { total: 2, inProgress: 1, completed: 1 },
-              todoItems: ["发布 npm 包并检查 Release workflow"],
+              todoSummary: { total: 4, inProgress: 1, completed: 1 },
+              todoItems: [
+                { status: "pending", content: "发布 release 草稿" },
+                { status: "in_progress", content: "等待 npm 发布" },
+                { status: "completed", content: "更新 README" },
+                { status: "cancelled", content: "已取消的迁移任务" },
+              ],
               questionHighlights: ["问题：是否先发 staging 再发 production"],
               highlights: [
                 { kind: "permission", text: "pending permission: 3" },
                 { kind: "question", text: "pending question: 1" },
                 { kind: "running-tool", text: "running tool: bash" },
                 { kind: "completed-tool", text: "completed tool: edit" },
-                { kind: "todo", text: "todo: 1 in progress, 1 completed, 2 total" },
+                { kind: "todo", text: "todo: 1 in progress, 1 completed, 4 total" },
                 { kind: "status", text: "status: busy" },
               ],
             },
@@ -1903,11 +1908,11 @@ test("/status 文案边界：标题分段、短标签、完整 todo 优先，且
   })
 
   assert.match(reply, /发布主线/)
-  assert.match(reply, /#busy/)
-  assert.match(reply, /#todo:2/)
-  assert.match(reply, /#question:1/)
-  assert.match(reply, /#permission:3/)
-  assert.match(reply, /todo: 发布 npm 包并检查 Release workflow/i)
+  assert.match(reply, /`#busy` `#todo:4` `#question:1` `#permission:3`/)
+  assert.match(reply, /\[ \] 发布 release 草稿/)
+  assert.match(reply, /\[-\] 等待 npm 发布/)
+  assert.match(reply, /\[x\] 更新 README/)
+  assert.match(reply, /\[~\] 已取消的迁移任务/)
   assert.match(reply, /问题：是否先发 staging 再发 production/i)
   assert.match(reply, /running tool: bash/i)
   assert.match(reply, /completed tool: edit/i)
@@ -1922,8 +1927,8 @@ test("/status 文案边界：标题分段、短标签、完整 todo 优先，且
   assert.doesNotMatch(reply, /\/status|slash command|recent command/i)
 
   const titleIndex = reply.indexOf("发布主线")
-  const tagsIndex = reply.indexOf("#busy")
-  const todoIndex = reply.indexOf("todo: 发布 npm 包并检查 Release workflow")
+  const tagsIndex = reply.indexOf("`#busy`")
+  const todoIndex = reply.indexOf("[ ] 发布 release 草稿")
   const questionIndex = reply.indexOf("问题：是否先发 staging 再发 production")
   const runningIndex = reply.indexOf("running tool: bash")
   assert.equal(titleIndex >= 0, true)
@@ -2134,6 +2139,14 @@ test("status formatter: 过滤畸形 snapshot，避免输出 undefined 文案", 
               sessionID: "ok-session",
               title: "ok",
               updatedAt: 1,
+              todoSummary: { total: 1, inProgress: 0, completed: 0 },
+              todoItems: [
+                { status: "pending", content: " 保留的事项 " },
+                { status: "blocked", content: "非法状态" },
+                { status: "completed", content: "   " },
+                { status: "cancelled" },
+                "legacy string todo",
+              ],
               unavailable: ["messages", "messages", "todo"],
               highlights: [
                 { kind: "status", text: "status: idle" },
@@ -2149,9 +2162,10 @@ test("status formatter: 过滤畸形 snapshot，避免输出 undefined 文案", 
   })
 
   assert.match(reply, /^wechat status\nok$/m)
-  assert.match(reply, /#unknown #todo:0 #question:0 #permission:0/)
+  assert.match(reply, /`#unknown` `#todo:1` `#question:0` `#permission:0`/)
+  assert.match(reply, /\[ \] 保留的事项/)
   assert.match(reply, /session unavailable: messages, todo/)
-  assert.doesNotMatch(reply, /undefined|null|malformed-instance|ok-session|status: idle|pending question: 1/) 
+  assert.doesNotMatch(reply, /undefined|null|malformed-instance|ok-session|status: idle|pending question: 1|非法状态|legacy string todo/)
 })
 
 test("status formatter: 同分 session 与 unavailable 列表输出稳定（排序+去重）", async () => {
@@ -2291,8 +2305,7 @@ test("wechat status runtime: 收到响应即推进 get_updates_buf，失败重�
 })
 
 test("wechat status runtime: 仅 accepted slash 会持久化 context_token 并清理 stale，non-slash 不会", async () => {
-  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-status-flow-runtime-token-")
-  const sandboxWechatStateRoot = isolatedStateRoot.stateRoot
+  const sandboxWechatStateRoot = isolatedWechatStateRoot.stateRoot
 
   assert.equal(process.env.WECHAT_STATE_ROOT_OVERRIDE, sandboxWechatStateRoot)
 
@@ -2393,7 +2406,7 @@ test("wechat status runtime: 仅 accepted slash 会持久化 context_token 并�
     assert.equal(sendCalls[0]?.opts?.contextToken, "ctx-status-refresh")
     assert.equal(sendCalls[1]?.opts?.contextToken, "ctx-text-refresh")
   } finally {
-    await isolatedStateRoot.restore()
+    assert.equal(process.env.WECHAT_STATE_ROOT_OVERRIDE, sandboxWechatStateRoot)
   }
 })
 
@@ -4617,6 +4630,282 @@ test("broker-entry slash handler: /reply 多选题且允许自定义时，编号
   assert.deepEqual(replyCalls, [{ requestID: "q-reply-multiple-custom-number-1", answers: [["staging", "preview"]] }])
 })
 
+test("broker-entry slash handler: /reply 多选题且允许自定义时，带空格编号输入仍走结构化多值答案", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-reply-multiple-custom-number-spaced`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-reply-multiple-custom-number-spaced-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-reply-multiple-custom-number-spaced-request-store`)
+
+  const replyCalls = []
+  const routeKey = handle.createRouteKey({ kind: "question", requestID: "q-reply-multiple-custom-number-spaced-1" })
+  await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-reply-multiple-custom-number-spaced-1",
+    routeKey,
+    handle: "qmulticustom2space",
+    wechatAccountId: "wx-reply-multi-custom-space",
+    userId: "u-reply-multi-custom-space",
+    createdAt: 1_700_600_271_000,
+    prompt: {
+      title: "请选择需要通知的环境",
+      mode: "multiple",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    handleStatusCommand: async () => "status reply",
+    client: {
+      question: {
+        reply: async (input) => {
+          replyCalls.push(input)
+          return { data: true }
+        },
+      },
+      permission: {},
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qmulticustom2space", text: "1, 3" })
+  assert.equal(result, "已回复问题：qmulticustom2space")
+  assert.deepEqual(replyCalls, [{ requestID: "q-reply-multiple-custom-number-spaced-1", answers: [["staging", "preview"]] }])
+})
+
+async function createQuestionReplyFixture({
+  reloadTag,
+  requestID,
+  handle: requestHandle,
+  createdAt,
+  prompt,
+}) {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-${reloadTag}`)
+  const handleModule = await import(`../dist/wechat/handle.js?reload=${Date.now()}-${reloadTag}-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-${reloadTag}-request-store`)
+
+  const replyCalls = []
+  const routeKey = handleModule.createRouteKey({ kind: "question", requestID })
+  await requestStore.upsertRequest({
+    kind: "question",
+    requestID,
+    routeKey,
+    handle: requestHandle,
+    wechatAccountId: `wx-${reloadTag}`,
+    userId: `u-${reloadTag}`,
+    createdAt,
+    prompt,
+  })
+
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    handleStatusCommand: async () => "status reply",
+    client: {
+      question: {
+        reply: async (input) => {
+          replyCalls.push(input)
+          return { data: true }
+        },
+      },
+      permission: {},
+    },
+  })
+
+  return { handler, replyCalls }
+}
+
+test("broker-entry slash handler: multiple + custom=true 支持 1,3; 其他：... mixed reply", async () => {
+  const { handler, replyCalls } = await createQuestionReplyFixture({
+    reloadTag: "reply-mixed-mode",
+    requestID: "q-reply-mixed-1",
+    handle: "qmulti3",
+    createdAt: 1_700_600_280_000,
+    prompt: {
+      title: "请选择需要通知的环境",
+      mode: "multiple",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qmulti3", text: "1,3; 其他：先灰度再全量" })
+
+  assert.equal(result, "已回复问题：qmulti3")
+  assert.deepEqual(replyCalls, [{ requestID: "q-reply-mixed-1", answers: [["staging", "preview", "先灰度再全量"]] }])
+})
+
+test("broker-entry slash handler: multiple + custom=true 支持带空格的编号列表 mixed reply", async () => {
+  const { handler, replyCalls } = await createQuestionReplyFixture({
+    reloadTag: "reply-mixed-mode-spaced-list",
+    requestID: "q-reply-mixed-spaced-1",
+    handle: "qmulti7",
+    createdAt: 1_700_600_280_500,
+    prompt: {
+      title: "请选择需要通知的环境",
+      mode: "multiple",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qmulti7", text: "1, 3; 其他：先灰度" })
+
+  assert.equal(result, "已回复问题：qmulti7")
+  assert.deepEqual(replyCalls, [{ requestID: "q-reply-mixed-spaced-1", answers: [["staging", "preview", "先灰度"]] }])
+})
+
+test("broker-entry slash handler: mixed reply 只认第一个分号，其余分号保留在自定义文本里", async () => {
+  const { handler, replyCalls } = await createQuestionReplyFixture({
+    reloadTag: "reply-mixed-first-separator",
+    requestID: "q-reply-mixed-2",
+    handle: "qmulti4",
+    createdAt: 1_700_600_281_000,
+    prompt: {
+      title: "请选择需要通知的环境",
+      mode: "multiple",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qmulti4", text: "1,3; 其他：先灰度; 再全量" })
+
+  assert.equal(result, "已回复问题：qmulti4")
+  assert.deepEqual(replyCalls, [{ requestID: "q-reply-mixed-2", answers: [["staging", "preview", "先灰度; 再全量"]] }])
+})
+
+test("broker-entry slash handler: 非 multiple + custom=true 题型遇到 mixed 形态输入时返回稳定中文提示", async () => {
+  const { handler, replyCalls } = await createQuestionReplyFixture({
+    reloadTag: "reply-single-custom-mixed-invalid",
+    requestID: "q-reply-single-custom-mixed-invalid-1",
+    handle: "qsinglecustom3",
+    createdAt: 1_700_600_282_000,
+    prompt: {
+      title: "请选择发布环境",
+      mode: "single",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+      ],
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qsinglecustom3", text: "1; 其他：补充说明" })
+
+  assert.match(result, /当前题型不支持.*编号 \+ 自定义补充/)
+  assert.deepEqual(replyCalls, [])
+})
+
+test("broker-entry slash handler: 非 multiple + custom=true 题型遇到带空格 mixed 形态输入时返回稳定中文提示", async () => {
+  const { handler, replyCalls } = await createQuestionReplyFixture({
+    reloadTag: "reply-single-custom-mixed-invalid-spaced-list",
+    requestID: "q-reply-single-custom-mixed-invalid-2",
+    handle: "qsinglecustom4",
+    createdAt: 1_700_600_282_500,
+    prompt: {
+      title: "请选择发布环境",
+      mode: "single",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qsinglecustom4", text: "1, 3; 其他：先灰度" })
+
+  assert.match(result, /当前题型不支持.*编号 \+ 自定义补充/)
+  assert.deepEqual(replyCalls, [])
+})
+
+test("broker-entry slash handler: 允许纯自定义的题目收到非 mixed 形态分号文本时仍按纯自定义处理", async () => {
+  const { handler, replyCalls } = await createQuestionReplyFixture({
+    reloadTag: "reply-multiple-custom-semicolon-text",
+    requestID: "q-reply-multiple-custom-text-2",
+    handle: "qmulticustom3",
+    createdAt: 1_700_600_283_000,
+    prompt: {
+      title: "请选择需要通知的环境",
+      mode: "multiple",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qmulticustom3", text: "先灰度; 再全量" })
+
+  assert.equal(result, "已回复问题：qmulticustom3")
+  assert.deepEqual(replyCalls, [{ requestID: "q-reply-multiple-custom-text-2", answers: [["先灰度; 再全量"]] }])
+})
+
+test("broker-entry slash handler: mixed reply 去掉可选前缀后若为空则返回稳定中文提示", async () => {
+  const { handler, replyCalls } = await createQuestionReplyFixture({
+    reloadTag: "reply-mixed-empty-custom",
+    requestID: "q-reply-mixed-empty-custom-1",
+    handle: "qmulti5",
+    createdAt: 1_700_600_284_000,
+    prompt: {
+      title: "请选择需要通知的环境",
+      mode: "multiple",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qmulti5", text: "1,3; 其他：" })
+
+  assert.match(result, /混合回复格式无效/)
+  assert.deepEqual(replyCalls, [])
+})
+
+test("broker-entry slash handler: mixed reply 左半段复用多选编号校验", async () => {
+  const { handler, replyCalls } = await createQuestionReplyFixture({
+    reloadTag: "reply-mixed-duplicate-option",
+    requestID: "q-reply-mixed-duplicate-option-1",
+    handle: "qmulti6",
+    createdAt: 1_700_600_285_000,
+    prompt: {
+      title: "请选择需要通知的环境",
+      mode: "multiple",
+      custom: true,
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "production", value: "production" },
+        { index: 3, label: "preview", value: "preview" },
+      ],
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qmulti6", text: "1,1; 其他：重复编号" })
+
+  assert.match(result, /选项编号不能重复/)
+  assert.deepEqual(replyCalls, [])
+})
+
 test("broker-entry slash handler: /allow p1 always safe 命中 open permission 并回写 answered + resolved", async () => {
   const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-allow-handler`)
   const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-allow-handler-handle`)
@@ -4926,6 +5215,263 @@ test("broker-entry slash handler: /allow 在 bridge RPC timeout 时保持 open +
   const pendingRaw = await readFile(statePaths.notificationStatePath(pending.idempotencyKey), "utf8")
   const pendingAfterTimeout = JSON.parse(pendingRaw)
   assert.equal(pendingAfterTimeout.status, "sent")
+})
+
+async function createSentPermissionFixture({
+  handleModule,
+  requestStore,
+  notificationStore,
+  requestID,
+  handle,
+  scopeKey,
+  wechatAccountId,
+  userId,
+  createdAt,
+  idempotencyKey,
+}) {
+  const routeKey = handleModule.createRouteKey({ kind: "permission", requestID, scopeKey })
+  const request = await requestStore.upsertRequest({
+    kind: "permission",
+    requestID,
+    routeKey,
+    handle,
+    scopeKey,
+    wechatAccountId,
+    userId,
+    createdAt,
+  })
+  const notification = await notificationStore.upsertNotification({
+    idempotencyKey,
+    kind: "permission",
+    routeKey,
+    handle,
+    wechatAccountId,
+    userId,
+    createdAt: createdAt + 10,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: notification.idempotencyKey,
+    sentAt: createdAt + 20,
+  })
+  return { request, notification, routeKey }
+}
+
+async function readStoredNotificationRecord(statePaths, idempotencyKey) {
+  return JSON.parse(await readFile(statePaths.notificationStatePath(idempotencyKey), "utf8"))
+}
+
+test("broker-entry slash handler: 同 session 多个 open permission 时 /allow 只终结目标 handle 的 request 与 notification", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-allow-multi-target-only`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-allow-multi-target-only-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-allow-multi-target-only-request-store`)
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-allow-multi-target-only-notification-store`)
+  const statePaths = await import(`../dist/wechat/state-paths.js?reload=${Date.now()}-allow-multi-target-only-state-paths`)
+
+  const scopeKey = "instance-allow-multi-target-only"
+  const target = await createSentPermissionFixture({
+    handleModule: handle,
+    requestStore,
+    notificationStore,
+    requestID: "p-allow-multi-target-only-1",
+    handle: "pmultitarget1",
+    scopeKey,
+    wechatAccountId: "wx-allow-multi-target-only",
+    userId: "u-allow-multi-target-only",
+    createdAt: 1_700_960_000_100,
+    idempotencyKey: "notif-allow-multi-target-only-1",
+  })
+  const other = await createSentPermissionFixture({
+    handleModule: handle,
+    requestStore,
+    notificationStore,
+    requestID: "p-allow-multi-target-only-2",
+    handle: "pmultitarget2",
+    scopeKey,
+    wechatAccountId: "wx-allow-multi-target-only",
+    userId: "u-allow-multi-target-only",
+    createdAt: 1_700_960_000_200,
+    idempotencyKey: "notif-allow-multi-target-only-2",
+  })
+
+  const rpcCalls = []
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    handleStatusCommand: async () => "status reply",
+    sendReplyPermissionRpc: async (input) => {
+      rpcCalls.push(input)
+      return { mutationId: input.mutationId, ok: true }
+    },
+  })
+
+  const result = await handler({ type: "allow", handle: "pmultitarget1", reply: "once", message: "approved" })
+
+  assert.equal(result, "已处理权限请求：pmultitarget1 (once)")
+  assert.equal(rpcCalls.length, 1)
+  assert.equal(rpcCalls[0].requestID, target.request.requestID)
+  assert.equal(rpcCalls[0].instanceID, scopeKey)
+
+  const targetRequest = await requestStore.findRequestByRouteKey({ kind: "permission", routeKey: target.routeKey })
+  const otherRequest = await requestStore.findRequestByRouteKey({ kind: "permission", routeKey: other.routeKey })
+  assert.equal(targetRequest?.status, "answered")
+  assert.equal(otherRequest?.status, "open")
+
+  const targetNotification = await readStoredNotificationRecord(statePaths, target.notification.idempotencyKey)
+  const otherNotification = await readStoredNotificationRecord(statePaths, other.notification.idempotencyKey)
+  assert.equal(targetNotification.status, "resolved")
+  assert.equal(typeof targetNotification.resolvedAt, "number")
+  assert.equal(otherNotification.status, "sent")
+  assert.equal(otherNotification.resolvedAt, undefined)
+})
+
+test("broker-entry slash handler: /allow 在 bridge RPC ok:false 或抛错时，目标与非目标 request/notification 都保持原样", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-allow-multi-failure-guard`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-allow-multi-failure-guard-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-allow-multi-failure-guard-request-store`)
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-allow-multi-failure-guard-notification-store`)
+  const statePaths = await import(`../dist/wechat/state-paths.js?reload=${Date.now()}-allow-multi-failure-guard-state-paths`)
+
+  const scenarios = [
+    {
+      name: "rpc-ok-false",
+      expectedMessage: /^处理权限请求失败：permission-rpc-failed$/,
+      sendReplyPermissionRpc: async (input) => ({ mutationId: input.mutationId, ok: false, errorMessage: "permission-rpc-failed" }),
+    },
+    {
+      name: "rpc-throws",
+      expectedMessage: /^处理权限请求失败：replyPermission timeout: m-timeout$/,
+      sendReplyPermissionRpc: async () => {
+        throw new Error("replyPermission timeout: m-timeout")
+      },
+    },
+  ]
+
+  for (const [index, scenario] of scenarios.entries()) {
+    const scopeKey = `instance-allow-multi-failure-${scenario.name}`
+    const targetHandle = `pmultifailtarget${index + 1}`
+    const otherHandle = `pmultifailother${index + 1}`
+    const target = await createSentPermissionFixture({
+      handleModule: handle,
+      requestStore,
+      notificationStore,
+      requestID: `p-allow-multi-failure-target-${scenario.name}`,
+      handle: targetHandle,
+      scopeKey,
+      wechatAccountId: "wx-allow-multi-failure",
+      userId: "u-allow-multi-failure",
+      createdAt: 1_700_960_000_300 + index * 100,
+      idempotencyKey: `notif-allow-multi-failure-target-${scenario.name}`,
+    })
+    const other = await createSentPermissionFixture({
+      handleModule: handle,
+      requestStore,
+      notificationStore,
+      requestID: `p-allow-multi-failure-other-${scenario.name}`,
+      handle: otherHandle,
+      scopeKey,
+      wechatAccountId: "wx-allow-multi-failure",
+      userId: "u-allow-multi-failure",
+      createdAt: 1_700_960_000_350 + index * 100,
+      idempotencyKey: `notif-allow-multi-failure-other-${scenario.name}`,
+    })
+
+    const rpcCalls = []
+    const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+      handleStatusCommand: async () => "status reply",
+      sendReplyPermissionRpc: async (input) => {
+        rpcCalls.push(input)
+        return scenario.sendReplyPermissionRpc(input)
+      },
+    })
+
+    const result = await handler({ type: "allow", handle: targetHandle, reply: "reject", message: "deny" })
+
+    assert.match(result, scenario.expectedMessage)
+    assert.equal(rpcCalls.length, 1)
+    assert.equal(rpcCalls[0].requestID, target.request.requestID)
+    assert.equal(rpcCalls[0].instanceID, scopeKey)
+
+    const targetRequest = await requestStore.findRequestByRouteKey({ kind: "permission", routeKey: target.routeKey })
+    const otherRequest = await requestStore.findRequestByRouteKey({ kind: "permission", routeKey: other.routeKey })
+    assert.equal(targetRequest?.status, "open")
+    assert.equal(otherRequest?.status, "open")
+
+    const targetNotification = await readStoredNotificationRecord(statePaths, target.notification.idempotencyKey)
+    const otherNotification = await readStoredNotificationRecord(statePaths, other.notification.idempotencyKey)
+    assert.equal(targetNotification.status, "sent")
+    assert.equal(targetNotification.resolvedAt, undefined)
+    assert.equal(otherNotification.status, "sent")
+    assert.equal(otherNotification.resolvedAt, undefined)
+  }
+})
+
+test("broker-entry slash handler: /allow 在远端 success 后、本地 finalize 前失败时不终结任何 request 或 notification", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-allow-finalize-failure-gate`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-allow-finalize-failure-gate-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-allow-finalize-failure-gate-request-store`)
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-allow-finalize-failure-gate-notification-store`)
+  const statePaths = await import(`../dist/wechat/state-paths.js?reload=${Date.now()}-allow-finalize-failure-gate-state-paths`)
+
+  const scopeKey = "instance-allow-finalize-failure-gate"
+  const target = await createSentPermissionFixture({
+    handleModule: handle,
+    requestStore,
+    notificationStore,
+    requestID: "p-allow-finalize-failure-gate-target",
+    handle: "pfinalizefail1",
+    scopeKey,
+    wechatAccountId: "wx-allow-finalize-failure",
+    userId: "u-allow-finalize-failure",
+    createdAt: 1_700_960_000_500,
+    idempotencyKey: "notif-allow-finalize-failure-gate-target",
+  })
+  const other = await createSentPermissionFixture({
+    handleModule: handle,
+    requestStore,
+    notificationStore,
+    requestID: "p-allow-finalize-failure-gate-other",
+    handle: "pfinalizefail2",
+    scopeKey,
+    wechatAccountId: "wx-allow-finalize-failure",
+    userId: "u-allow-finalize-failure",
+    createdAt: 1_700_960_000_600,
+    idempotencyKey: "notif-allow-finalize-failure-gate-other",
+  })
+
+  const rpcCalls = []
+  const hookCalls = []
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    handleStatusCommand: async () => "status reply",
+    sendReplyPermissionRpc: async (input) => {
+      rpcCalls.push(input)
+      return { mutationId: input.mutationId, ok: true }
+    },
+    permissionMutationTestHooks: {
+      beforeFinalizePermission: async (request) => {
+        hookCalls.push(request)
+        throw new Error("forced permission finalize failure")
+      },
+    },
+  })
+
+  await assert.rejects(
+    () => handler({ type: "allow", handle: "pfinalizefail1", reply: "always", message: "safe" }),
+    /forced permission finalize failure/,
+  )
+
+  assert.equal(rpcCalls.length, 1)
+  assert.equal(rpcCalls[0].requestID, target.request.requestID)
+  assert.deepEqual(hookCalls, [{ handle: "pfinalizefail1", routeKey: target.routeKey }])
+
+  const targetRequest = await requestStore.findRequestByRouteKey({ kind: "permission", routeKey: target.routeKey })
+  const otherRequest = await requestStore.findRequestByRouteKey({ kind: "permission", routeKey: other.routeKey })
+  assert.equal(targetRequest?.status, "open")
+  assert.equal(otherRequest?.status, "open")
+
+  const targetNotification = await readStoredNotificationRecord(statePaths, target.notification.idempotencyKey)
+  const otherNotification = await readStoredNotificationRecord(statePaths, other.notification.idempotencyKey)
+  assert.equal(targetNotification.status, "sent")
+  assert.equal(targetNotification.resolvedAt, undefined)
+  assert.equal(otherNotification.status, "sent")
+  assert.equal(otherNotification.resolvedAt, undefined)
 })
 
 test("broker-entry runtime wiring: 不再通过 localhost:4096 创建 reply client", async () => {

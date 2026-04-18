@@ -137,40 +137,32 @@ function findOptionValue(
   return match.value
 }
 
-export function buildQuestionAnswersFromReply(
-  prompt: QuestionPromptSummary | undefined,
-  rawText: string,
-): Array<Array<string>> {
-  const text = rawText.trim()
-  if (!text) {
-    throw new Error("回复内容不能为空")
-  }
+function splitMultipleChoiceTokens(raw: string): string[] {
+  return raw.split(",").map((token) => token.trim()).filter(Boolean)
+}
 
-  if (!prompt || prompt.mode === "text") {
-    return [[text]]
-  }
-
-  const options = prompt.options ?? []
+function maybeParseMultipleChoiceValues(
+  raw: string,
+  options: NonNullable<QuestionPromptSummary["options"]>,
+): string[] | undefined {
   if (options.length === 0) {
-    return [[text]]
+    return undefined
   }
 
-  if (prompt.custom === true && !/^\d+(,\d+)*$/.test(text)) {
-    return [[text]]
+  const tokens = splitMultipleChoiceTokens(raw)
+  if (tokens.length === 0 || tokens.some((token) => !/^\d+$/.test(token))) {
+    return undefined
   }
 
-  if (prompt.mode === "single") {
-    if (!/^\d+$/.test(text)) {
-      throw new Error(
-        prompt.custom === true
-          ? "单选题请回复单个选项编号，或直接输入自定义回答"
-          : "该问题不支持自定义回复，请按题目提示填写选项编号",
-      )
-    }
-    return [[findOptionValue(options, text)]]
-  }
+  return parseMultipleChoiceValues(raw, options, true)
+}
 
-  const tokens = text.split(",").map((token) => token.trim()).filter(Boolean)
+function parseMultipleChoiceValues(
+  raw: string,
+  options: NonNullable<QuestionPromptSummary["options"]>,
+  allowCustom: boolean,
+): string[] {
+  const tokens = splitMultipleChoiceTokens(raw)
   if (tokens.length === 0) {
     throw new Error("多选题请使用逗号分隔的选项编号")
   }
@@ -180,7 +172,7 @@ export function buildQuestionAnswersFromReply(
   for (const token of tokens) {
     if (!/^\d+$/.test(token)) {
       throw new Error(
-        prompt.custom === true
+        allowCustom === true
           ? "多选题请使用逗号分隔的选项编号，或直接输入自定义回答"
           : "该问题不支持自定义回复，请按题目提示填写选项编号",
       )
@@ -191,5 +183,71 @@ export function buildQuestionAnswersFromReply(
     seen.add(token)
     values.push(findOptionValue(options, token))
   }
-  return [values]
+  return values
+}
+
+export function buildQuestionAnswersFromReply(
+  prompt: QuestionPromptSummary | undefined,
+  rawText: string,
+): Array<Array<string>> {
+  const text = rawText.trim()
+  if (!text) {
+    throw new Error("回复内容不能为空")
+  }
+
+  if (!prompt) {
+    return [[text]]
+  }
+
+  const separatorIndex = text.indexOf(";")
+  const left = separatorIndex >= 0 ? text.slice(0, separatorIndex).trim() : ""
+  const right = separatorIndex >= 0 ? text.slice(separatorIndex + 1).trim() : ""
+  const options = prompt.options ?? []
+  const mixedChoiceValues = separatorIndex >= 0 ? maybeParseMultipleChoiceValues(left, options) : undefined
+
+  if (mixedChoiceValues) {
+    if (prompt.mode !== "multiple" || prompt.custom !== true) {
+      throw new Error("当前题型不支持“编号 + 自定义补充”，请按题目提示回复")
+    }
+
+    const customText = right.replace(/^其他：\s*/u, "").trim()
+    if (!customText) {
+      throw new Error("混合回复格式无效，请使用“编号; 自定义补充”")
+    }
+
+    return [[...mixedChoiceValues, customText]]
+  }
+
+  if (prompt.mode === "text") {
+    return [[text]]
+  }
+
+  if (options.length === 0) {
+    return [[text]]
+  }
+
+  if (prompt.mode === "single") {
+    if (prompt.custom === true && !/^\d+$/.test(text)) {
+      return [[text]]
+    }
+
+    if (!/^\d+$/.test(text)) {
+      throw new Error(
+        prompt.custom === true
+          ? "单选题请回复单个选项编号，或直接输入自定义回答"
+          : "该问题不支持自定义回复，请按题目提示填写选项编号",
+      )
+    }
+    return [[findOptionValue(options, text)]]
+  }
+
+  if (prompt.custom === true) {
+    const choiceValues = maybeParseMultipleChoiceValues(text, options)
+    if (!choiceValues) {
+      return [[text]]
+    }
+    return [choiceValues]
+  }
+
+  return [parseMultipleChoiceValues(text, options, false)]
 }

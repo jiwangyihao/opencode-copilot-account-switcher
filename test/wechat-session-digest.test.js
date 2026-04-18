@@ -61,8 +61,10 @@ test("buildSessionDigest: permission/question/tool/todo/status 可并行展示�
       },
     ]),
     todos: [
-      { id: "todo-1", content: "实现分类器", status: "in_progress" },
-      { id: "todo-2", content: "补充测试", status: "completed" },
+      { id: "todo-1", content: " 发布 release 草稿 ", status: "pending" },
+      { id: "todo-2", content: "等待 npm 发布", status: "in_progress" },
+      { id: "todo-3", content: "更新 README", status: "completed" },
+      { id: "todo-4", content: "已取消的迁移任务", status: "cancelled" },
     ],
     messages: [
       {
@@ -96,10 +98,15 @@ test("buildSessionDigest: permission/question/tool/todo/status 可并行展示�
 
   assert.equal(digest.pendingPermissionCount, 1)
   assert.equal(digest.pendingQuestionCount, 1)
-  assert.equal(digest.todoSummary.total, 2)
+  assert.equal(digest.todoSummary.total, 4)
   assert.equal(digest.todoSummary.inProgress, 1)
   assert.equal(digest.todoSummary.completed, 1)
-  assert.deepEqual(digest.todoItems, ["实现分类器", "补充测试"])
+  assert.deepEqual(digest.todoItems, [
+    { status: "pending", content: "发布 release 草稿" },
+    { status: "in_progress", content: "等待 npm 发布" },
+    { status: "completed", content: "更新 README" },
+    { status: "cancelled", content: "已取消的迁移任务" },
+  ])
   assert.deepEqual(digest.questionHighlights, ["问题：是否继续执行下一步？"])
 
   const kinds = digest.highlights.map((item) => item.kind)

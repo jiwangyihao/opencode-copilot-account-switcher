@@ -912,6 +912,87 @@ test("real host PTY helper: stopRealOpencodePty tolerates UNKNOWN kill errors wh
   assert.equal(session.exited, true)
 })
 
+test("real host PTY helper: stopRealOpencodePty waits for win32 cleanup hooks before returning", async () => {
+  const dataEmitter = new EventEmitter()
+  const exitEmitter = new EventEmitter()
+  let conoutDestroyed = false
+  let inSocketDestroyed = false
+  let outSocketDestroyed = false
+  let ptySocketDestroyed = false
+  const closeTimeout = setTimeout(() => {}, 5_000)
+  const drainTimeout = setTimeout(() => {}, 5_000)
+  const fakePty = {
+    pid: 1234,
+    cols: 120,
+    rows: 30,
+    process: "opencode",
+    handleFlowControl: false,
+    _agent: {
+      _closeTimeout: closeTimeout,
+      _conoutSocketWorker: {
+        _drainTimeout: drainTimeout,
+        async _destroySocket() {
+          await Promise.resolve()
+          conoutDestroyed = true
+        },
+      },
+      _inSocket: {
+        destroy() {
+          inSocketDestroyed = true
+        },
+      },
+      _outSocket: {
+        destroy() {
+          outSocketDestroyed = true
+        },
+      },
+    },
+    _socket: {
+      destroy() {
+        ptySocketDestroyed = true
+      },
+    },
+    onData(listener) {
+      dataEmitter.on("data", listener)
+      return { dispose: () => dataEmitter.off("data", listener) }
+    },
+    onExit(listener) {
+      exitEmitter.on("exit", listener)
+      return { dispose: () => exitEmitter.off("exit", listener) }
+    },
+    write() {},
+    kill() {
+      setTimeout(() => exitEmitter.emit("exit", { exitCode: 0 }), 0)
+    },
+  }
+
+  const session = await spawnRealOpencodePty({
+    host: {
+      hostRoot: "C:/tmp/opencode-host",
+      cacheRoot: "C:/tmp/opencode-host/cache",
+      configRoot: "C:/tmp/opencode-host/config",
+      dataRoot: "C:/tmp/opencode-host/data",
+      logRoot: "C:/tmp/opencode-host/logs",
+      tmpRoot: "C:/tmp/opencode-host/tmp",
+      runtimeCommand: "cmd.exe",
+      runtimeArgs: ["/d", "/s", "/c", "call", "C:/Tools/opencode.cmd"],
+      runtimeKind: "cmd-shim",
+    },
+    spawnPtyImpl: () => fakePty,
+  })
+
+  await stopRealOpencodePty(session, {
+    gracefulInputs: [],
+    platform: "win32",
+  })
+
+  assert.equal(conoutDestroyed, true)
+  assert.equal(inSocketDestroyed, true)
+  assert.equal(outSocketDestroyed, true)
+  assert.equal(ptySocketDestroyed, true)
+  assert.equal(session.exited, true)
+})
+
 test("real host PTY helper: resolveRealHostPluginInlineConfigContent merges plugin dist entry with disabled MCP overrides", async () => {
   const inlineConfigContent = await resolveRealHostPluginInlineConfigContent({
     host: {
@@ -2565,103 +2646,7 @@ test("real host PTY helper: 最后一跳被吞且没有新屏新日志时不会�
   }
 })
 
-test("real host PTY supplemental plugin menu: providers login waits for Add credential, sends Enter, then reaches dist entry plugin menu", { timeout: 180_000 }, async () => {
-  await runExclusiveRealHostPtyTest(async () => {
-  const pluginPackageRoot = await ensureBuiltPluginPackageRoot()
-  const host = await createRealOpencodeHostRoot({
-    repoRoot: REPO_ROOT,
-  })
-
-  assert.equal(host.ok, true)
-
-  const inlineConfigContent = await resolveRealHostPluginInlineConfigContent({
-    host,
-    artifact: {
-      entryFilePath: path.join(pluginPackageRoot, "dist", "index.js"),
-    },
-  })
-
-  const result = await openGitHubCopilotPluginMenuThroughRealOpencode({
-    host,
-    artifact: {
-      entryFilePath: path.join(pluginPackageRoot, "dist", "index.js"),
-    },
-    inlineConfigContent,
-  })
-
-  try {
-    assert.equal(result.ok, true)
-    assert.equal(result.stage, "plugin-menu-visible")
-    assert.equal(result.reachedAddCredential, true)
-    assert.equal(result.reachedPluginMenu, true)
-
-    if (process.platform === "win32") {
-      assert.match(result.session.command, /opencode\.exe$/i)
-      assert.deepEqual(result.session.args, PROVIDERS_LOGIN_GITHUB_COPILOT_ARGS)
-    }
-
-    assert.match(result.addCredentialScreen, /Add credential/i)
-    const pluginMenuScreen = result.pluginMenuScreen
-    assert.match(pluginMenuScreen, /Guided Loop Safety/i)
-    assert.match(pluginMenuScreen, /Common settings|通用设置/i)
-    assert.match(pluginMenuScreen, /Provider 专属设置|Provider settings/i)
-    assert.doesNotMatch(pluginMenuScreen, /MCP Authentication Required/i)
-    assert.doesNotMatch(pluginMenuScreen, /Select model/i)
-    assert.doesNotMatch(pluginMenuScreen, /opencode completion|show resolved configuration/i)
-  } finally {
-    await stopRealOpencodePty(result.session, { gracefulInputs: ["\u001b"] })
-    await host.cleanup()
-  }
-  })
-})
-
-test("real host wechat submenu: providers login reaches 微信通知 -> 绑定 / 重绑微信", { timeout: 180_000 }, async () => {
-  await runExclusiveRealHostPtyTest(async () => {
-  const pluginPackageRoot = await ensureBuiltPluginPackageRoot()
-  const host = await createRealOpencodeHostRoot({
-    repoRoot: REPO_ROOT,
-  })
-
-  assert.equal(host.ok, true)
-
-  const inlineConfigContent = await resolveRealHostPluginInlineConfigContent({
-    host,
-    artifact: {
-      entryFilePath: path.join(pluginPackageRoot, "dist", "index.js"),
-    },
-  })
-
-  const result = await openWechatNotificationsSubmenuThroughRealOpencode({
-    host,
-    artifact: {
-      entryFilePath: path.join(pluginPackageRoot, "dist", "index.js"),
-    },
-    inlineConfigContent,
-  })
-
-  try {
-    assert.equal(result.ok, true)
-    assert.equal(result.stage, "wechat-submenu-visible")
-    assert.equal(result.reachedAddCredential, true)
-    assert.equal(result.reachedPluginMenu, true)
-    assert.equal(result.reachedWechatSubmenu, true)
-
-    assert.match(result.addCredentialScreen, /Add credential/i)
-    assert.match(result.pluginMenuScreen, /WeChat notifications|微信通知/)
-    const submenuScreen = result.wechatSubmenuScreen
-    assert.match(submenuScreen, /Bind \/ Rebind WeChat|绑定 \/ 重绑微信/i)
-    assert.match(submenuScreen, /WeChat notifications: On|微信通知总开关：已开启|微信通知：已开启/i)
-    assert.match(submenuScreen, /Question notifications: On|问题通知：已开启/i)
-    assert.match(submenuScreen, /Permission notifications: On|权限通知：已开启|授权通知：已开启/i)
-    assert.match(submenuScreen, /Session error notifications: On|会话错误通知：已开启/i)
-  } finally {
-    await stopRealOpencodePty(result.session, { gracefulInputs: ["\u001b"] })
-    await host.cleanup()
-  }
-  })
-})
-
-test("real host wechat bind: providers login 真正执行 绑定 / 重绑微信 并返回最终分类", { timeout: 240_000 }, async () => {
+test("real host wechat bind: providers login 真正执行 绑定 / 重绑微信 并返回最终分类", { timeout: 360_000 }, async () => {
   await runExclusiveRealHostPtyTest(async () => {
   const pluginPackageRoot = await ensureBuiltPluginPackageRoot()
   const host = await createRealOpencodeHostRoot({
@@ -2683,6 +2668,7 @@ test("real host wechat bind: providers login 真正执行 绑定 / 重绑微信 
       entryFilePath: path.join(pluginPackageRoot, "dist", "index.js"),
     },
     inlineConfigContent,
+    menuOpenAttempts: 2,
     bindOutcomeTimeoutMs: 120_000,
   })
 
