@@ -82,6 +82,38 @@ test("question / permission / sessionError 支持并遵循 pending -> sent -> re
   assert.equal(suppressed.status, "suppressed")
 })
 
+test("requestTerminal 支持持久化终结字段与常规状态流转", async () => {
+  const terminal = await notificationStore.upsertNotification({
+    idempotencyKey: "notif-request-terminal-1",
+    kind: "requestTerminal",
+    requestKind: "question",
+    terminalReason: "replaced",
+    replacementHandle: "q13",
+    wechatAccountId: "wx-terminal",
+    userId: "u-terminal",
+    routeKey: "question-terminal-route-1",
+    handle: "q12",
+    createdAt: 1_700_200_030_000,
+  })
+
+  assert.equal(terminal.status, "pending")
+  assert.equal(terminal.requestKind, "question")
+  assert.equal(terminal.terminalReason, "replaced")
+  assert.equal(terminal.replacementHandle, "q13")
+
+  const sent = await notificationStore.markNotificationSent({
+    idempotencyKey: terminal.idempotencyKey,
+    sentAt: 1_700_200_031_000,
+  })
+  assert.equal(sent.status, "sent")
+
+  const resolved = await notificationStore.markNotificationResolved({
+    idempotencyKey: terminal.idempotencyKey,
+    resolvedAt: 1_700_200_032_000,
+  })
+  assert.equal(resolved.status, "resolved")
+})
+
 test("相同 idempotencyKey 的 upsert 不重复造记录", async () => {
   const first = await notificationStore.upsertNotification({
     idempotencyKey: "notif-dedupe-1",
@@ -293,6 +325,21 @@ test("question / permission upsert 必须提供 routeKey 与 handle", async () =
         userId: "u-a",
         routeKey: "permission-route-a",
         createdAt: 1_700_250_001_000,
+    }),
+    /invalid notification record format/i,
+  )
+
+  await assert.rejects(
+    () =>
+      notificationStore.upsertNotification({
+        idempotencyKey: "notif-terminal-missing-reason",
+        kind: "requestTerminal",
+        requestKind: "question",
+        wechatAccountId: "wx-a",
+        userId: "u-a",
+        routeKey: "question-route-terminal-a",
+        handle: "q12",
+        createdAt: 1_700_250_001_100,
       }),
     /invalid notification record format/i,
   )

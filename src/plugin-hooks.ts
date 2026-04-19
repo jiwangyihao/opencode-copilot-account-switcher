@@ -131,21 +131,47 @@ type WechatBridgeSessionState = {
   interactedSessionID?: string
 }
 
-let wechatBridgeLifecycleState: WechatBridgeLifecycleState | undefined
-let wechatBridgeSessionState: WechatBridgeSessionState | undefined
-let wechatBridgeAutoCloseAttached = false
+type WechatBridgeGlobalState = {
+  lifecycleState?: WechatBridgeLifecycleState
+  sessionState?: WechatBridgeSessionState
+  autoCloseAttached: boolean
+  autoCloseListeners?: {
+    beforeExit: () => void
+    sigint: () => void
+    sigterm: () => void
+  }
+}
+
+const WECHAT_BRIDGE_GLOBAL_STATE_KEY = Symbol.for(
+  "opencode-copilot-account-switcher.wechat-bridge-global-state",
+)
+
+function getWechatBridgeGlobalState(): WechatBridgeGlobalState {
+  const stateContainer = globalThis as typeof globalThis & {
+    [WECHAT_BRIDGE_GLOBAL_STATE_KEY]?: WechatBridgeGlobalState
+  }
+
+  if (!stateContainer[WECHAT_BRIDGE_GLOBAL_STATE_KEY]) {
+    stateContainer[WECHAT_BRIDGE_GLOBAL_STATE_KEY] = {
+      autoCloseAttached: false,
+    }
+  }
+
+  return stateContainer[WECHAT_BRIDGE_GLOBAL_STATE_KEY]
+}
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0
 }
 
 function ensureWechatBridgeSessionState(key: string): WechatBridgeSessionState {
-  if (wechatBridgeSessionState?.key === key) {
-    return wechatBridgeSessionState
+  const globalState = getWechatBridgeGlobalState()
+  if (globalState.sessionState?.key === key) {
+    return globalState.sessionState
   }
 
   const state: WechatBridgeSessionState = { key }
-  wechatBridgeSessionState = state
+  globalState.sessionState = state
   return state
 }
 
@@ -201,20 +227,27 @@ function buildWechatBridgeLifecycleKey(input: {
 }
 
 function attachWechatBridgeAutoClose() {
-  if (wechatBridgeAutoCloseAttached) {
+  const globalState = getWechatBridgeGlobalState()
+  if (globalState.autoCloseAttached) {
     return
   }
-  wechatBridgeAutoCloseAttached = true
+  globalState.autoCloseAttached = true
 
   const closeLifecycle = () => {
-    const state = wechatBridgeLifecycleState
+    const state = getWechatBridgeGlobalState().lifecycleState
     if (!state) return
     closeWechatBridgeLifecycleState(state)
   }
 
-  process.once("beforeExit", closeLifecycle)
-  process.once("SIGINT", closeLifecycle)
-  process.once("SIGTERM", closeLifecycle)
+  globalState.autoCloseListeners = {
+    beforeExit: closeLifecycle,
+    sigint: closeLifecycle,
+    sigterm: closeLifecycle,
+  }
+
+  process.once("beforeExit", globalState.autoCloseListeners.beforeExit)
+  process.once("SIGINT", globalState.autoCloseListeners.sigint)
+  process.once("SIGTERM", globalState.autoCloseListeners.sigterm)
 }
 
 function closeWechatBridgeLifecycleState(state: WechatBridgeLifecycleState) {
@@ -231,18 +264,20 @@ function ensureWechatBridgeLifecycle(input: {
   key: string
   create: () => Promise<WechatBridgeLifecycle>
 }) {
-  if (wechatBridgeLifecycleState?.key === input.key) {
-    return wechatBridgeLifecycleState.promise
+  const globalState = getWechatBridgeGlobalState()
+
+  if (globalState.lifecycleState?.key === input.key) {
+    return globalState.lifecycleState.promise
   }
 
-  const previous = wechatBridgeLifecycleState
+  const previous = globalState.lifecycleState
   const promise = input.create()
   const state: WechatBridgeLifecycleState = {
     key: input.key,
     promise,
     closeRequested: false,
   }
-  wechatBridgeLifecycleState = state
+  globalState.lifecycleState = state
 
   if (previous) {
     closeWechatBridgeLifecycleState(previous)
@@ -250,20 +285,45 @@ function ensureWechatBridgeLifecycle(input: {
 
   void promise
     .then((lifecycle) => {
-      if (wechatBridgeLifecycleState !== state) {
+      if (getWechatBridgeGlobalState().lifecycleState !== state) {
         closeWechatBridgeLifecycleState(state)
         return
       }
       state.lifecycle = lifecycle
     })
     .catch((error) => {
-      if (wechatBridgeLifecycleState === state) {
-        wechatBridgeLifecycleState = undefined
+      const nextGlobalState = getWechatBridgeGlobalState()
+      if (nextGlobalState.lifecycleState === state) {
+        nextGlobalState.lifecycleState = undefined
       }
       console.warn("[plugin-hooks] failed to initialize wechat bridge lifecycle", error)
     })
 
   return promise
+}
+
+export async function resetWechatBridgeGlobalsForTest() {
+  const globalState = getWechatBridgeGlobalState()
+  const currentLifecycleState = globalState.lifecycleState
+
+  globalState.lifecycleState = undefined
+  globalState.sessionState = undefined
+
+  if (currentLifecycleState) {
+    closeWechatBridgeLifecycleState(currentLifecycleState)
+    await currentLifecycleState.promise
+      .then((lifecycle) => lifecycle.close().catch(() => {}))
+      .catch(() => {})
+  }
+
+  if (globalState.autoCloseListeners) {
+    process.removeListener("beforeExit", globalState.autoCloseListeners.beforeExit)
+    process.removeListener("SIGINT", globalState.autoCloseListeners.sigint)
+    process.removeListener("SIGTERM", globalState.autoCloseListeners.sigterm)
+  }
+
+  globalState.autoCloseAttached = false
+  globalState.autoCloseListeners = undefined
 }
 
 type TriggerBillingCompensationInput = {

@@ -293,6 +293,238 @@ test("terminal request 不会被 open lookup helper 返回", async () => {
   assert.equal(byIdentity, undefined)
 })
 
+test("request store: 旧 question / permission 终结后仍可按 handle 查到 terminal metadata", async () => {
+  const question = await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-terminal-metadata-1",
+    routeKey: handle.createRouteKey({ kind: "question", requestID: "q-terminal-metadata-1" }),
+    handle: "q12",
+    wechatAccountId: "wx-terminal-metadata",
+    userId: "u-terminal-metadata",
+    createdAt: 1_700_000_334_000,
+  })
+  const permission = await requestStore.upsertRequest({
+    kind: "permission",
+    requestID: "p-terminal-metadata-1",
+    routeKey: handle.createRouteKey({ kind: "permission", requestID: "p-terminal-metadata-1" }),
+    handle: "p12",
+    wechatAccountId: "wx-terminal-metadata",
+    userId: "u-terminal-metadata",
+    createdAt: 1_700_000_334_100,
+  })
+
+  await requestStore.markRequestAnswered({
+    kind: "question",
+    routeKey: question.routeKey,
+    answeredAt: 1_700_000_334_200,
+  })
+  await requestStore.markRequestRejected({
+    kind: "permission",
+    routeKey: permission.routeKey,
+    rejectedAt: 1_700_000_334_300,
+  })
+
+  const terminalQuestion = await requestStore.findTerminalRequestByHandle({
+    kind: "question",
+    handle: "q12",
+  })
+  const terminalPermission = await requestStore.findTerminalRequestByHandle({
+    kind: "permission",
+    handle: "p12",
+  })
+
+  assert.equal(terminalQuestion?.terminalReason, "answered")
+  assert.equal(terminalQuestion?.terminalResultSent, false)
+  assert.equal(terminalPermission?.terminalReason, "rejected")
+  assert.equal(terminalPermission?.terminalResultSent, false)
+})
+
+test("request store: cleanup 不覆盖更早的用户可见 terminal 原因", async () => {
+  const created = await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-terminal-cleanup-1",
+    routeKey: handle.createRouteKey({ kind: "question", requestID: "q-terminal-cleanup-1" }),
+    handle: "q13",
+    wechatAccountId: "wx-terminal-cleanup",
+    userId: "u-terminal-cleanup",
+    createdAt: 1_700_000_334_400,
+  })
+
+  await requestStore.markRequestAnswered({
+    kind: "question",
+    routeKey: created.routeKey,
+    answeredAt: 1_700_000_334_500,
+  })
+  await requestStore.markCleaned({
+    kind: "question",
+    routeKey: created.routeKey,
+    cleanedAt: 1_700_000_334_600,
+  })
+
+  const terminal = await requestStore.findTerminalRequestByHandle({
+    kind: "question",
+    handle: "q13",
+  })
+
+  assert.equal(terminal?.status, "cleaned")
+  assert.equal(terminal?.terminalReason, "answered")
+})
+
+test("request store: terminalResultSent 写回后不会回退，且 replacement 只有在存在新 handle 时才允许", async () => {
+  const created = await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-terminal-sent-1",
+    routeKey: handle.createRouteKey({ kind: "question", requestID: "q-terminal-sent-1" }),
+    handle: "q14",
+    wechatAccountId: "wx-terminal-sent",
+    userId: "u-terminal-sent",
+    createdAt: 1_700_000_334_700,
+  })
+
+  await requestStore.markRequestExpired({
+    kind: "question",
+    routeKey: created.routeKey,
+    expiredAt: 1_700_000_334_800,
+  })
+  await requestStore.markTerminalResultSent({
+    kind: "question",
+    routeKey: created.routeKey,
+    sentAt: 1_700_000_334_900,
+  })
+  await requestStore.markTerminalMetadata({
+    kind: "question",
+    routeKey: created.routeKey,
+    terminalReason: "replaced",
+  })
+
+  const terminal = await requestStore.findTerminalRequestByHandle({
+    kind: "question",
+    handle: "q14",
+  })
+
+  assert.equal(terminal?.terminalResultSent, true)
+  assert.equal(terminal?.terminalReason, "expired")
+  assert.equal(terminal?.replacementHandle, undefined)
+})
+
+test("request store: recovery commit 会保留旧 handle 的 terminal metadata 并指向新 handle", async () => {
+  const created = await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-terminal-recovery-1",
+    routeKey: handle.createRouteKey({ kind: "question", requestID: "q-terminal-recovery-1" }),
+    handle: "q15",
+    wechatAccountId: "wx-terminal-recovery",
+    userId: "u-terminal-recovery",
+    createdAt: 1_700_000_335_000,
+  })
+
+  await requestStore.markRequestExpired({
+    kind: "question",
+    routeKey: created.routeKey,
+    expiredAt: 1_700_000_335_100,
+  })
+
+  const prepared = await requestStore.prepareRecoveryRequestReopen({
+    kind: "question",
+    routeKey: created.routeKey,
+    recoveredAt: 1_700_000_335_200,
+  })
+  const reopened = await requestStore.commitPreparedRecoveryRequestReopen(prepared)
+
+  const oldTerminal = await requestStore.findTerminalRequestByHandle({
+    kind: "question",
+    handle: "q15",
+  })
+  const newOpen = await requestStore.findOpenRequestByHandle({
+    kind: "question",
+    handle: reopened.handle,
+  })
+
+  assert.equal(oldTerminal?.routeKey, created.routeKey)
+  assert.equal(oldTerminal?.terminalReason, "replaced")
+  assert.equal(oldTerminal?.replacementHandle, reopened.handle)
+  assert.equal(newOpen?.routeKey, reopened.routeKey)
+  assert.equal(newOpen?.requestID, created.requestID)
+})
+
+test("request store: recovery commit 后 rollback 会恢复旧 request 的 terminal metadata，不保留失效 replacementHandle", async () => {
+  const created = await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-terminal-recovery-rollback-1",
+    routeKey: handle.createRouteKey({ kind: "question", requestID: "q-terminal-recovery-rollback-1" }),
+    handle: "q16",
+    wechatAccountId: "wx-terminal-recovery-rollback",
+    userId: "u-terminal-recovery-rollback",
+    createdAt: 1_700_000_335_300,
+  })
+
+  await requestStore.markRequestExpired({
+    kind: "question",
+    routeKey: created.routeKey,
+    expiredAt: 1_700_000_335_400,
+  })
+
+  const prepared = await requestStore.prepareRecoveryRequestReopen({
+    kind: "question",
+    routeKey: created.routeKey,
+    recoveredAt: 1_700_000_335_500,
+  })
+  const reopened = await requestStore.commitPreparedRecoveryRequestReopen(prepared)
+  await requestStore.rollbackPreparedRecoveryRequestReopen(prepared)
+
+  const restoredOld = await requestStore.findTerminalRequestByHandle({
+    kind: "question",
+    handle: "q16",
+  })
+  const removedNew = await requestStore.findOpenRequestByHandle({
+    kind: "question",
+    handle: reopened.handle,
+  })
+
+  assert.equal(restoredOld?.routeKey, created.routeKey)
+  assert.equal(restoredOld?.terminalReason, "expired")
+  assert.equal(restoredOld?.replacementHandle, undefined)
+  assert.equal(removedNew, undefined)
+})
+
+test("request store: 已有 terminal result 的 recovery commit 不再把旧 metadata 升级成 replaced", async () => {
+  const created = await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-terminal-recovery-sent-1",
+    routeKey: handle.createRouteKey({ kind: "question", requestID: "q-terminal-recovery-sent-1" }),
+    handle: "q17",
+    wechatAccountId: "wx-terminal-recovery-sent",
+    userId: "u-terminal-recovery-sent",
+    createdAt: 1_700_000_335_600,
+  })
+
+  await requestStore.markRequestExpired({
+    kind: "question",
+    routeKey: created.routeKey,
+    expiredAt: 1_700_000_335_700,
+  })
+  await requestStore.markTerminalResultSent({
+    kind: "question",
+    routeKey: created.routeKey,
+    sentAt: 1_700_000_335_800,
+  })
+
+  const prepared = await requestStore.prepareRecoveryRequestReopen({
+    kind: "question",
+    routeKey: created.routeKey,
+    recoveredAt: 1_700_000_335_900,
+  })
+  await requestStore.commitPreparedRecoveryRequestReopen(prepared)
+
+  const oldTerminal = await requestStore.findTerminalRequestByHandle({
+    kind: "question",
+    handle: "q17",
+  })
+
+  assert.equal(oldTerminal?.terminalReason, "expired")
+  assert.equal(oldTerminal?.replacementHandle, undefined)
+})
+
 test("permission 被 rejected 后不再可被 handle 命中", async () => {
   const created = await requestStore.upsertRequest({
     kind: "permission",

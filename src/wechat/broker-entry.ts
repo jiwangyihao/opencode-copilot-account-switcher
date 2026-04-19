@@ -31,14 +31,18 @@ import {
   commitPreparedRecoveryRequestReopen,
   findRequestByRouteKey,
   findOpenRequestByHandle,
+  findTerminalRequestByHandle,
   markRequestAnswered,
   markRequestRejected,
   prepareRecoveryRequestReopen,
   rollbackPreparedRecoveryRequestReopen,
 } from "./request-store.js"
 import {
+  findActiveNaturalStopByHandle,
   findSentNotificationByRequest,
+  findTerminalNaturalStopByHandle,
   listPendingNotifications,
+  markNaturalStopTerminal,
   markNotificationResolved,
 } from "./notification-store.js"
 import {
@@ -48,6 +52,7 @@ import {
   type RecoveryMutation,
 } from "./broker-mutation-queue.js"
 import { buildQuestionAnswersFromReply } from "./question-interaction.js"
+import { formatNaturalStopClosedText, formatTerminalRequestClosedText } from "./notification-format.js"
 
 type ReplyMutationResult = {
   mutationId: string
@@ -189,6 +194,13 @@ type BrokerWechatStatusRuntimeLifecycleDeps = {
     reply: "once" | "always" | "reject"
     message?: string
   }) => Promise<ReplyMutationResult>
+  sendReplyNaturalStopRpc?: (input: {
+    instanceID: string
+    mutationId: string
+    sessionID: string
+    handle: string
+    text: string
+  }) => Promise<ReplyMutationResult>
   handleNotificationDeliveryFailure?: (input: {
     instanceID: string
     wechatAccountId: string
@@ -299,6 +311,13 @@ export function createBrokerWechatSlashCommandHandler(input: {
     requestID: string
     reply: "once" | "always" | "reject"
     message?: string
+  }) => Promise<ReplyMutationResult>
+  sendReplyNaturalStopRpc?: (input: {
+    instanceID: string
+    mutationId: string
+    sessionID: string
+    handle: string
+    text: string
   }) => Promise<ReplyMutationResult>
   directory?: string
   mutationQueue?: BrokerMutationQueue
@@ -428,6 +447,42 @@ export function createBrokerWechatSlashCommandHandler(input: {
   }) => {
     try {
       return await findOpenRequestByHandle(requestInput)
+    } catch (error) {
+      if (isInvalidHandleError(error)) {
+        return undefined
+      }
+      throw error
+    }
+  }
+
+  const findTerminalRequestSafely = async (requestInput: {
+    kind: "question" | "permission"
+    handle: string
+  }) => {
+    try {
+      return await findTerminalRequestByHandle(requestInput)
+    } catch (error) {
+      if (isInvalidHandleError(error)) {
+        return undefined
+      }
+      throw error
+    }
+  }
+
+  const findActiveNaturalStopSafely = async (handle: string) => {
+    try {
+      return await findActiveNaturalStopByHandle({ handle })
+    } catch (error) {
+      if (isInvalidHandleError(error)) {
+        return undefined
+      }
+      throw error
+    }
+  }
+
+  const findTerminalNaturalStopSafely = async (handle: string) => {
+    try {
+      return await findTerminalNaturalStopByHandle({ handle })
     } catch (error) {
       if (isInvalidHandleError(error)) {
         return undefined
@@ -654,6 +709,63 @@ export function createBrokerWechatSlashCommandHandler(input: {
         handle: command.handle,
       })
       if (!openQuestion) {
+        const terminalQuestion = await findTerminalRequestSafely({
+          kind: "question",
+          handle: command.handle,
+        })
+        if (terminalQuestion) {
+          return formatTerminalRequestClosedText({
+            requestKind: "question",
+            handle: terminalQuestion.handle,
+            terminalReason: terminalQuestion.terminalReason,
+            replacementHandle: terminalQuestion.replacementHandle,
+          })
+        }
+        const openNaturalStop = await findActiveNaturalStopSafely(command.handle)
+        if (openNaturalStop) {
+          const instanceID = openNaturalStop.replyTarget?.instanceID ?? openNaturalStop.scopeKey
+          const sessionID = openNaturalStop.replyTarget?.sessionID ?? openNaturalStop.sessionID
+          if (!instanceID || !sessionID) {
+            return `回复中止通知失败：bridge unavailable`
+          }
+
+          const mutationId = `reply-natural-stop-${Date.now()}-${Math.random().toString(16).slice(2)}`
+          let result: ReplyMutationResult
+          if (input.sendReplyNaturalStopRpc) {
+            try {
+              result = await input.sendReplyNaturalStopRpc({
+                instanceID,
+                mutationId,
+                sessionID,
+                handle: openNaturalStop.handle ?? command.handle,
+                text: command.text,
+              })
+            } catch (error) {
+              result = { mutationId, ok: false, errorMessage: toErrorMessage(error) }
+            }
+          } else {
+            result = { mutationId, ok: false, errorMessage: "natural-stop reply unavailable" }
+          }
+
+          if (result.ok !== true) {
+            return `回复中止通知失败：${result.errorMessage ?? "unknown"}`
+          }
+
+          await markNaturalStopTerminal({
+            idempotencyKey: openNaturalStop.idempotencyKey,
+            resolvedAt: Date.now(),
+            terminalReason: "replied",
+          })
+          return `已回复中止通知：${openNaturalStop.handle ?? command.handle}`
+        }
+
+        const terminalNaturalStop = await findTerminalNaturalStopSafely(command.handle)
+        if (terminalNaturalStop) {
+          return formatNaturalStopClosedText({
+            handle: terminalNaturalStop.handle,
+            terminalReason: terminalNaturalStop.naturalStopTerminalReason,
+          })
+        }
         return `未找到待回复问题：${command.handle}`
       }
       let answers: QuestionAnswer[]
@@ -798,6 +910,18 @@ export function createBrokerWechatSlashCommandHandler(input: {
       handle: command.handle,
     })
     if (!openPermission) {
+      const terminalPermission = await findTerminalRequestSafely({
+        kind: "permission",
+        handle: command.handle,
+      })
+      if (terminalPermission) {
+        return formatTerminalRequestClosedText({
+          requestKind: "permission",
+          handle: terminalPermission.handle,
+          terminalReason: terminalPermission.terminalReason,
+          replacementHandle: terminalPermission.replacementHandle,
+        })
+      }
       return `未找到待处理权限请求：${command.handle}`
     }
     const mutationId = `reply-permission-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -864,6 +988,7 @@ export function createBrokerWechatStatusRuntimeLifecycle(
     handleStatusCommand: async () => "命令暂未实现：/status",
     sendReplyQuestionRpc: deps.sendReplyQuestionRpc,
     sendReplyPermissionRpc: deps.sendReplyPermissionRpc,
+    sendReplyNaturalStopRpc: deps.sendReplyNaturalStopRpc,
     directory: process.cwd(),
   })
   const createStatusRuntime =
@@ -912,12 +1037,15 @@ export function createBrokerWechatStatusRuntimeLifecycle(
           if (failure.kind === "sessionError") {
             return
           }
+          const requestKind = failure.kind === "requestTerminal"
+            ? failure.requestKind
+            : (failure.kind === "question" || failure.kind === "permission" ? failure.kind : undefined)
           const immutableScopeKey = typeof failure.scopeKey === "string" && failure.scopeKey.trim().length > 0
             ? failure.scopeKey
             : undefined
-          const request = !immutableScopeKey && typeof failure.routeKey === "string" && failure.routeKey.trim().length > 0
+          const request = !immutableScopeKey && requestKind && typeof failure.routeKey === "string" && failure.routeKey.trim().length > 0
             ? await findRequestByRouteKey({
-                kind: failure.kind,
+                kind: requestKind,
                 routeKey: failure.routeKey,
               })
             : undefined
@@ -1003,10 +1131,12 @@ async function run() {
       handleStatusCommand: async () => server.handleWechatSlashCommand({ type: "status" }),
       sendReplyQuestionRpc: server.dispatchReplyQuestionToInstance,
       sendReplyPermissionRpc: server.dispatchReplyPermissionToInstance,
+      sendReplyNaturalStopRpc: server.dispatchReplyNaturalStopToInstance,
       directory: stateRoot,
     }),
     sendReplyQuestionRpc: server.dispatchReplyQuestionToInstance,
     sendReplyPermissionRpc: server.dispatchReplyPermissionToInstance,
+    sendReplyNaturalStopRpc: server.dispatchReplyNaturalStopToInstance,
     handleNotificationDeliveryFailure: server.handleNotificationDeliveryFailure,
   })
   const ownership: BrokerOwnership = {

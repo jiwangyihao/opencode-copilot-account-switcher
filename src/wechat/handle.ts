@@ -6,6 +6,8 @@ const HANDLE_PREFIX: Record<WechatRequestKind, string> = {
   permission: "p",
 }
 
+const SESSION_REPLY_HANDLE_PREFIX = "s"
+
 function normalizeRequestID(requestID: string) {
   return requestID.trim().toLowerCase()
 }
@@ -41,7 +43,14 @@ export function assertValidHandleInput(input: string) {
 }
 
 export function createHandle(kind: WechatRequestKind, existingHandles: Iterable<string>) {
-  const prefix = HANDLE_PREFIX[kind]
+  return createPrefixedHandle(HANDLE_PREFIX[kind], existingHandles)
+}
+
+export function createSessionReplyHandle(existingHandles: Iterable<string>) {
+  return createPrefixedHandle(SESSION_REPLY_HANDLE_PREFIX, existingHandles)
+}
+
+function createPrefixedHandle(prefix: string, existingHandles: Iterable<string>) {
   const seen = new Set<string>()
 
   for (const item of existingHandles) {

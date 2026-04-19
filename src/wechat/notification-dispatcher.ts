@@ -20,6 +20,7 @@ export type WechatNotificationSendInput = {
 
 export type WechatNotificationDeliveryFailureInput = {
   kind: NotificationKind
+  requestKind?: NotificationRecord["requestKind"]
   routeKey?: string
   scopeKey?: string
   wechatAccountId: string
@@ -60,7 +61,7 @@ function toPositiveNumber(rawValue: string | undefined, fallback: number): numbe
   return parsed
 }
 
-function shouldSendKind(kind: NotificationKind, notifications: {
+function shouldSendRecord(record: Pick<NotificationRecord, "kind" | "requestKind">, notifications: {
   enabled: boolean
   question: boolean
   permission: boolean
@@ -69,11 +70,17 @@ function shouldSendKind(kind: NotificationKind, notifications: {
   if (!notifications.enabled) {
     return false
   }
-  if (kind === "question") {
+  if (record.kind === "question") {
     return notifications.question
   }
-  if (kind === "permission") {
+  if (record.kind === "permission") {
     return notifications.permission
+  }
+  if (record.kind === "requestTerminal") {
+    return record.requestKind === "permission" ? notifications.permission : notifications.question
+  }
+  if (record.kind === "naturalStop") {
+    return notifications.sessionError
   }
   return notifications.sessionError
 }
@@ -112,6 +119,12 @@ async function shouldSuppressPendingNotification(record: {
   if (record.kind === "sessionError") {
     const tokenState = await readTokenState(record.wechatAccountId, record.userId).catch(() => undefined)
     return isLiveTokenState(tokenState) && tokenState.updatedAt > record.createdAt
+  }
+  if (record.kind === "requestTerminal") {
+    return false
+  }
+  if (record.kind === "naturalStop") {
+    return false
   }
   if (typeof record.routeKey !== "string" || record.routeKey.trim().length === 0) {
     return false
@@ -210,7 +223,7 @@ export function createWechatNotificationDispatcher(
             continue
           }
 
-          if (!shouldSendKind(record.kind, notifications)) {
+          if (!shouldSendRecord(record, notifications)) {
             continue
           }
           if (record.userId !== targetUserId || record.wechatAccountId !== targetAccountId) {
@@ -246,6 +259,7 @@ export function createWechatNotificationDispatcher(
             if (persistedFailed) {
               await input.onDeliveryFailed?.({
                 kind: record.kind,
+                requestKind: record.requestKind,
                 routeKey: record.routeKey,
                 scopeKey: record.scopeKey,
                 wechatAccountId: record.wechatAccountId,

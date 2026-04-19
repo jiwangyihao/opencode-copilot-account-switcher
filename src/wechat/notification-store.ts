@@ -7,10 +7,17 @@ import {
   notificationStatePath,
   notificationsDir,
 } from "./state-paths.js"
-import { type NotificationKind, type NotificationRecord } from "./notification-types.js"
+import {
+  type NaturalStopTerminalReason,
+  type NotificationKind,
+  type NotificationRecord,
+  type SessionReplyTarget,
+} from "./notification-types.js"
+import { normalizeHandle } from "./handle.js"
 import { normalizeRequestPromptSummary } from "./question-interaction.js"
 import { findRequestByRouteKey } from "./request-store.js"
 import { isLiveTokenState, readTokenState } from "./token-store.js"
+import type { RequestTerminalReason } from "./request-store.js"
 
 type NotificationStoreTestHooks = {
   beforePersistBackfilledScopeKey?: (input: { record: NotificationRecord; scopeKey: string }) => Promise<void> | void
@@ -28,7 +35,26 @@ function isFiniteNumber(value: unknown): value is number {
 }
 
 function isNotificationKind(value: unknown): value is NotificationKind {
-  return value === "question" || value === "permission" || value === "sessionError"
+  return value === "question" || value === "permission" || value === "sessionError" || value === "requestTerminal" || value === "naturalStop"
+}
+
+function isRequestNotificationKind(value: unknown): value is "question" | "permission" {
+  return value === "question" || value === "permission"
+}
+
+function isRequestTerminalReason(value: unknown): value is RequestTerminalReason {
+  return value === "answered" || value === "rejected" || value === "expired" || value === "replaced"
+}
+
+function isNaturalStopTerminalReason(value: unknown): value is NaturalStopTerminalReason {
+  return value === "replied" || value === "continued" || value === "expired"
+}
+
+function isSessionReplyTarget(value: unknown): value is SessionReplyTarget {
+  return typeof value === "object"
+    && value !== null
+    && isNonEmptyString((value as { instanceID?: unknown }).instanceID)
+    && isNonEmptyString((value as { sessionID?: unknown }).sessionID)
 }
 
 function isNotificationStatus(value: unknown): value is NotificationRecord["status"] {
@@ -54,7 +80,6 @@ function normalizeRecord(input: NotificationRecord): NotificationRecord {
     ...(isNonEmptyString(input.registrationEpoch) ? { registrationEpoch: input.registrationEpoch } : {}),
     createdAt: input.createdAt,
     status: input.status,
-    ...(input.kind !== "sessionError" && input.prompt !== undefined ? { prompt: normalizeRequestPromptSummary(input.kind, input.prompt) } : {}),
     ...(typeof input.sentAt === "number" ? { sentAt: input.sentAt } : {}),
     ...(typeof input.resolvedAt === "number" ? { resolvedAt: input.resolvedAt } : {}),
     ...(typeof input.failedAt === "number" ? { failedAt: input.failedAt } : {}),
@@ -63,7 +88,35 @@ function normalizeRecord(input: NotificationRecord): NotificationRecord {
   }
 
   if (input.kind === "sessionError") {
-    return base
+    return {
+      ...base,
+      ...(isNonEmptyString(input.sessionID) ? { sessionID: input.sessionID.trim() } : {}),
+      ...(isNonEmptyString(input.action) ? { action: input.action.trim() } : {}),
+      ...(isNonEmptyString(input.redactedSummary) ? { redactedSummary: input.redactedSummary.trim() } : {}),
+      ...(isNonEmptyString(input.severityAdvice) ? { severityAdvice: input.severityAdvice.trim() } : {}),
+    }
+  }
+
+  if (input.kind === "naturalStop") {
+    return {
+      ...base,
+      ...(isNonEmptyString(input.handle) ? { handle: normalizeHandle(input.handle) } : {}),
+      ...(isNonEmptyString(input.scopeKey) ? { scopeKey: input.scopeKey } : {}),
+      ...(isNonEmptyString(input.sessionID) ? { sessionID: input.sessionID.trim() } : {}),
+      ...(isNonEmptyString(input.redactedSummary) ? { redactedSummary: input.redactedSummary.trim() } : {}),
+      ...(isNonEmptyString(input.severityAdvice) ? { severityAdvice: input.severityAdvice.trim() } : {}),
+      ...(isSessionReplyTarget(input.replyTarget)
+        ? {
+            replyTarget: {
+              instanceID: input.replyTarget.instanceID.trim(),
+              sessionID: input.replyTarget.sessionID.trim(),
+            },
+          }
+        : {}),
+      ...(isNaturalStopTerminalReason(input.naturalStopTerminalReason)
+        ? { naturalStopTerminalReason: input.naturalStopTerminalReason }
+        : {}),
+    }
   }
 
   return {
@@ -71,6 +124,18 @@ function normalizeRecord(input: NotificationRecord): NotificationRecord {
     ...(isNonEmptyString(input.routeKey) ? { routeKey: input.routeKey } : {}),
     ...(isNonEmptyString(input.handle) ? { handle: input.handle } : {}),
     ...(isNonEmptyString(input.scopeKey) ? { scopeKey: input.scopeKey } : {}),
+    ...(isRequestNotificationKind(input.kind) && input.prompt !== undefined
+      ? { prompt: normalizeRequestPromptSummary(input.kind, input.prompt) }
+      : {}),
+    ...(input.kind === "requestTerminal" && isRequestNotificationKind(input.requestKind)
+      ? { requestKind: input.requestKind }
+      : {}),
+    ...(input.kind === "requestTerminal" && isRequestTerminalReason(input.terminalReason)
+      ? { terminalReason: input.terminalReason }
+      : {}),
+    ...(input.kind === "requestTerminal" && isNonEmptyString(input.replacementHandle)
+      ? { replacementHandle: normalizeHandle(input.replacementHandle) }
+      : {}),
   }
 }
 
@@ -106,10 +171,46 @@ function toRecord(input: unknown): NotificationRecord {
   }
 
   if (parsed.kind === "sessionError") {
-    if (parsed.routeKey !== undefined || parsed.handle !== undefined || parsed.prompt !== undefined) {
+    if (
+      parsed.routeKey !== undefined
+      || parsed.handle !== undefined
+      || parsed.scopeKey !== undefined
+      || parsed.prompt !== undefined
+      || parsed.replyTarget !== undefined
+      || parsed.naturalStopTerminalReason !== undefined
+      || parsed.requestKind !== undefined
+      || parsed.terminalReason !== undefined
+      || parsed.replacementHandle !== undefined
+    ) {
       throw new Error("invalid notification record format")
     }
-  } else {
+    if (
+      (parsed.sessionID !== undefined && !isNonEmptyString(parsed.sessionID))
+      || (parsed.action !== undefined && !isNonEmptyString(parsed.action))
+      || (parsed.redactedSummary !== undefined && !isNonEmptyString(parsed.redactedSummary))
+      || (parsed.severityAdvice !== undefined && !isNonEmptyString(parsed.severityAdvice))
+    ) {
+      throw new Error("invalid notification record format")
+    }
+  } else if (parsed.kind === "naturalStop") {
+    if (
+      parsed.routeKey !== undefined
+      || parsed.prompt !== undefined
+      || parsed.requestKind !== undefined
+      || parsed.terminalReason !== undefined
+      || parsed.replacementHandle !== undefined
+      || parsed.action !== undefined
+      || !isNonEmptyString(parsed.handle)
+      || !isNonEmptyString(parsed.sessionID)
+      || !isSessionReplyTarget(parsed.replyTarget)
+      || !isNonEmptyString(parsed.redactedSummary)
+      || !isNonEmptyString(parsed.severityAdvice)
+      || (parsed.scopeKey !== undefined && !isNonEmptyString(parsed.scopeKey))
+      || (parsed.naturalStopTerminalReason !== undefined && !isNaturalStopTerminalReason(parsed.naturalStopTerminalReason))
+    ) {
+      throw new Error("invalid notification record format")
+    }
+  } else if (isRequestNotificationKind(parsed.kind)) {
     if (!isNonEmptyString(parsed.routeKey) || !isNonEmptyString(parsed.handle)) {
       throw new Error("invalid notification record format")
     }
@@ -118,6 +219,54 @@ function toRecord(input: unknown): NotificationRecord {
     }
     if (parsed.prompt !== undefined) {
       normalizeRequestPromptSummary(parsed.kind, parsed.prompt)
+    }
+    if (
+      parsed.requestKind !== undefined
+      || parsed.terminalReason !== undefined
+      || parsed.replacementHandle !== undefined
+      || parsed.sessionID !== undefined
+      || parsed.action !== undefined
+      || parsed.redactedSummary !== undefined
+      || parsed.severityAdvice !== undefined
+      || parsed.replyTarget !== undefined
+      || parsed.naturalStopTerminalReason !== undefined
+    ) {
+      throw new Error("invalid notification record format")
+    }
+  } else {
+    if (
+      !isNonEmptyString(parsed.routeKey)
+      || !isNonEmptyString(parsed.handle)
+      || !isRequestNotificationKind(parsed.requestKind)
+      || !isRequestTerminalReason(parsed.terminalReason)
+    ) {
+      throw new Error("invalid notification record format")
+    }
+    if (parsed.scopeKey !== undefined && !isNonEmptyString(parsed.scopeKey)) {
+      throw new Error("invalid notification record format")
+    }
+    if (parsed.prompt !== undefined) {
+      throw new Error("invalid notification record format")
+    }
+    if (
+      parsed.sessionID !== undefined
+      || parsed.action !== undefined
+      || parsed.redactedSummary !== undefined
+      || parsed.severityAdvice !== undefined
+      || parsed.replyTarget !== undefined
+      || parsed.naturalStopTerminalReason !== undefined
+    ) {
+      throw new Error("invalid notification record format")
+    }
+    if (parsed.replacementHandle !== undefined && !isNonEmptyString(parsed.replacementHandle)) {
+      throw new Error("invalid notification record format")
+    }
+    if (parsed.terminalReason === "replaced") {
+      if (!isNonEmptyString(parsed.replacementHandle)) {
+        throw new Error("invalid notification record format")
+      }
+    } else if (parsed.replacementHandle !== undefined) {
+      throw new Error("invalid notification record format")
     }
   }
 
@@ -163,16 +312,26 @@ async function readNotificationSnapshot(idempotencyKey: string): Promise<Notific
 }
 
 async function backfillNotificationScopeKey(record: NotificationRecord): Promise<NotificationRecord> {
-  if (record.kind === "sessionError" || !isNonEmptyString(record.routeKey) || isNonEmptyString(record.scopeKey)) {
+  if (
+    record.kind === "sessionError"
+    || record.kind === "naturalStop"
+    || !isNonEmptyString(record.routeKey)
+    || isNonEmptyString(record.scopeKey)
+  ) {
+    return record
+  }
+
+  const requestKind = record.kind === "requestTerminal" ? record.requestKind : record.kind
+  if (!isRequestNotificationKind(requestKind)) {
     return record
   }
 
   const request = await findRequestByRouteKey({
-    kind: record.kind,
+    kind: requestKind,
     routeKey: record.routeKey,
   }).catch(() => undefined)
   const fallbackScopeKey = request?.scopeKey
-    ?? await readDeadLetter(record.kind, record.routeKey)
+    ?? await readDeadLetter(requestKind, record.routeKey)
       .then((deadLetter) => deadLetter?.scopeKey ?? deadLetter?.instanceID)
       .catch(() => undefined)
 
@@ -186,7 +345,7 @@ async function backfillNotificationScopeKey(record: NotificationRecord): Promise
   })
 
   const current = await readNotificationSnapshot(record.idempotencyKey)
-  if (current.kind === "sessionError") {
+  if (current.kind === "sessionError" || current.kind === "naturalStop") {
     return current
   }
   if (isNonEmptyString(current.scopeKey)) {
@@ -243,16 +402,107 @@ export async function upsertNotification(
   }
 
   if (input.kind === "sessionError") {
-    if ((input as { routeKey?: string }).routeKey !== undefined || (input as { handle?: string }).handle !== undefined) {
+    if (
+      (input as { routeKey?: string }).routeKey !== undefined
+      || (input as { handle?: string }).handle !== undefined
+      || (input as { scopeKey?: string }).scopeKey !== undefined
+      || (input as { requestKind?: string }).requestKind !== undefined
+      || (input as { terminalReason?: string }).terminalReason !== undefined
+      || (input as { replacementHandle?: string }).replacementHandle !== undefined
+      || (input as { replyTarget?: SessionReplyTarget }).replyTarget !== undefined
+      || (input as { naturalStopTerminalReason?: NaturalStopTerminalReason }).naturalStopTerminalReason !== undefined
+    ) {
+      throw new Error("invalid notification record format")
+    }
+    const sessionID = (input as { sessionID?: unknown }).sessionID
+    const action = (input as { action?: unknown }).action
+    const redactedSummary = (input as { redactedSummary?: unknown }).redactedSummary
+    const severityAdvice = (input as { severityAdvice?: unknown }).severityAdvice
+    if (
+      (sessionID !== undefined && !isNonEmptyString(sessionID))
+      || (action !== undefined && !isNonEmptyString(action))
+      || (redactedSummary !== undefined && !isNonEmptyString(redactedSummary))
+      || (severityAdvice !== undefined && !isNonEmptyString(severityAdvice))
+    ) {
+      throw new Error("invalid notification record format")
+    }
+  } else if (input.kind === "naturalStop") {
+    const handle = (input as { handle?: unknown }).handle
+    const sessionID = (input as { sessionID?: unknown }).sessionID
+    const replyTarget = (input as { replyTarget?: unknown }).replyTarget
+    const redactedSummary = (input as { redactedSummary?: unknown }).redactedSummary
+    const severityAdvice = (input as { severityAdvice?: unknown }).severityAdvice
+    if (
+      !isNonEmptyString(handle)
+      || !isNonEmptyString(sessionID)
+      || !isSessionReplyTarget(replyTarget)
+      || !isNonEmptyString(redactedSummary)
+      || !isNonEmptyString(severityAdvice)
+      || (input as { routeKey?: unknown }).routeKey !== undefined
+      || (input as { requestKind?: unknown }).requestKind !== undefined
+      || (input as { terminalReason?: unknown }).terminalReason !== undefined
+      || (input as { replacementHandle?: unknown }).replacementHandle !== undefined
+      || (input as { action?: unknown }).action !== undefined
+      || (input as { naturalStopTerminalReason?: unknown }).naturalStopTerminalReason !== undefined
+    ) {
+      throw new Error("invalid notification record format")
+    }
+    if ((input as { scopeKey?: unknown }).scopeKey !== undefined && !isNonEmptyString((input as { scopeKey?: unknown }).scopeKey)) {
+      throw new Error("invalid notification record format")
+    }
+  } else if (isRequestNotificationKind(input.kind)) {
+    if (
+      !isNonEmptyString((input as { routeKey?: unknown }).routeKey)
+      || !isNonEmptyString((input as { handle?: unknown }).handle)
+    ) {
+      throw new Error("invalid notification record format")
+    }
+    if ((input as { scopeKey?: unknown }).scopeKey !== undefined && !isNonEmptyString((input as { scopeKey?: unknown }).scopeKey)) {
+      throw new Error("invalid notification record format")
+    }
+    if (
+      (input as { requestKind?: unknown }).requestKind !== undefined
+      || (input as { terminalReason?: unknown }).terminalReason !== undefined
+      || (input as { replacementHandle?: unknown }).replacementHandle !== undefined
+      || (input as { sessionID?: unknown }).sessionID !== undefined
+      || (input as { action?: unknown }).action !== undefined
+      || (input as { redactedSummary?: unknown }).redactedSummary !== undefined
+      || (input as { severityAdvice?: unknown }).severityAdvice !== undefined
+      || (input as { replyTarget?: unknown }).replyTarget !== undefined
+      || (input as { naturalStopTerminalReason?: unknown }).naturalStopTerminalReason !== undefined
+    ) {
       throw new Error("invalid notification record format")
     }
   } else if (
     !isNonEmptyString((input as { routeKey?: unknown }).routeKey) ||
-    !isNonEmptyString((input as { handle?: unknown }).handle)
+    !isNonEmptyString((input as { handle?: unknown }).handle) ||
+    !isRequestNotificationKind((input as { requestKind?: unknown }).requestKind) ||
+    !isRequestTerminalReason((input as { terminalReason?: unknown }).terminalReason)
   ) {
     throw new Error("invalid notification record format")
-  } else if ((input as { scopeKey?: unknown }).scopeKey !== undefined && !isNonEmptyString((input as { scopeKey?: unknown }).scopeKey)) {
-    throw new Error("invalid notification record format")
+  } else {
+    if ((input as { scopeKey?: unknown }).scopeKey !== undefined && !isNonEmptyString((input as { scopeKey?: unknown }).scopeKey)) {
+      throw new Error("invalid notification record format")
+    }
+    if (
+      (input as { sessionID?: unknown }).sessionID !== undefined
+      || (input as { action?: unknown }).action !== undefined
+      || (input as { redactedSummary?: unknown }).redactedSummary !== undefined
+      || (input as { severityAdvice?: unknown }).severityAdvice !== undefined
+      || (input as { replyTarget?: unknown }).replyTarget !== undefined
+      || (input as { naturalStopTerminalReason?: unknown }).naturalStopTerminalReason !== undefined
+    ) {
+      throw new Error("invalid notification record format")
+    }
+    const replacementHandle = (input as { replacementHandle?: unknown }).replacementHandle
+    const terminalReason = (input as { terminalReason?: unknown }).terminalReason
+    if (terminalReason === "replaced") {
+      if (!isNonEmptyString(replacementHandle)) {
+        throw new Error("invalid notification record format")
+      }
+    } else if (replacementHandle !== undefined) {
+      throw new Error("invalid notification record format")
+    }
   }
 
   try {
@@ -376,7 +626,7 @@ function isMergeableNotificationStatus(status: NotificationRecord["status"]): bo
 }
 
 export async function findMergeableNotification(input: {
-  kind: Exclude<NotificationKind, "sessionError">
+  kind: "question" | "permission"
   routeKey: string
   handle: string
   scopeKey: string
@@ -427,7 +677,7 @@ export async function findMergeableNotification(input: {
 }
 
 export async function findSentNotificationByRequest(input: {
-  kind: Exclude<NotificationKind, "sessionError">
+  kind: "question" | "permission"
   routeKey: string
   handle: string
 }): Promise<NotificationRecord | undefined> {
@@ -460,6 +710,167 @@ export async function findSentNotificationByRequest(input: {
   }
 
   return undefined
+}
+
+function isActiveNaturalStopRecord(record: NotificationRecord): boolean {
+  return record.kind === "naturalStop" && (record.status === "pending" || record.status === "sent")
+}
+
+function isTerminalNaturalStopRecord(record: NotificationRecord): boolean {
+  return record.kind === "naturalStop" && isNaturalStopTerminalReason(record.naturalStopTerminalReason)
+}
+
+function isSameReplyTarget(record: NotificationRecord, replyTarget: SessionReplyTarget): boolean {
+  return record.replyTarget?.instanceID === replyTarget.instanceID
+    && record.replyTarget?.sessionID === replyTarget.sessionID
+}
+
+async function listAllNotifications(): Promise<NotificationRecord[]> {
+  await ensureWechatStateLayout()
+  const files = await readdir(notificationsDir()).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return []
+    throw error
+  })
+
+  const records: NotificationRecord[] = []
+  for (const fileName of files) {
+    if (!fileName.endsWith(".json")) continue
+    records.push(await readNotification(fileName.slice(0, -5)))
+  }
+  return records
+}
+
+export async function listActiveNaturalStops(input: {
+  wechatAccountId?: string
+  userId?: string
+  scopeKey?: string
+} = {}): Promise<NotificationRecord[]> {
+  if (input.wechatAccountId !== undefined && !isNonEmptyString(input.wechatAccountId)) {
+    throw new Error("invalid notification record format")
+  }
+  if (input.userId !== undefined && !isNonEmptyString(input.userId)) {
+    throw new Error("invalid notification record format")
+  }
+  if (input.scopeKey !== undefined && !isNonEmptyString(input.scopeKey)) {
+    throw new Error("invalid notification record format")
+  }
+
+  const records = await listAllNotifications()
+  return records
+    .filter((record) => (
+      isActiveNaturalStopRecord(record)
+      && (input.wechatAccountId === undefined || record.wechatAccountId === input.wechatAccountId)
+      && (input.userId === undefined || record.userId === input.userId)
+      && (input.scopeKey === undefined || record.scopeKey === input.scopeKey)
+    ))
+    .sort((left, right) => left.createdAt - right.createdAt)
+}
+
+export async function listRetainedNaturalStopHandles(): Promise<string[]> {
+  const records = await listAllNotifications()
+  return records
+    .filter((record) => record.kind === "naturalStop" && isNonEmptyString(record.handle))
+    .map((record) => record.handle as string)
+}
+
+export async function findActiveNaturalStopByReplyTarget(input: {
+  replyTarget: SessionReplyTarget
+  wechatAccountId?: string
+  userId?: string
+}): Promise<NotificationRecord | undefined> {
+  if (!isSessionReplyTarget(input.replyTarget)) {
+    throw new Error("invalid notification record format")
+  }
+  if (input.wechatAccountId !== undefined && !isNonEmptyString(input.wechatAccountId)) {
+    throw new Error("invalid notification record format")
+  }
+  if (input.userId !== undefined && !isNonEmptyString(input.userId)) {
+    throw new Error("invalid notification record format")
+  }
+
+  const records = await listActiveNaturalStops({
+    ...(input.wechatAccountId ? { wechatAccountId: input.wechatAccountId } : {}),
+    ...(input.userId ? { userId: input.userId } : {}),
+  })
+  return records
+    .filter((record) => isSameReplyTarget(record, input.replyTarget))
+    .sort((left, right) => right.createdAt - left.createdAt)[0]
+}
+
+export async function findActiveNaturalStopByHandle(input: { handle: string }): Promise<NotificationRecord | undefined> {
+  if (!isNonEmptyString(input.handle)) {
+    throw new Error("invalid notification record format")
+  }
+
+  const expectedHandle = normalizeLookupValue(normalizeHandle(input.handle))
+  const records = await listAllNotifications()
+  return records
+    .filter((record) => (
+    isActiveNaturalStopRecord(record)
+    && isNonEmptyString(record.handle)
+    && normalizeLookupValue(record.handle) === expectedHandle
+    ))
+    .sort((left, right) => right.createdAt - left.createdAt)[0]
+}
+
+export async function findTerminalNaturalStopByHandle(input: { handle: string }): Promise<NotificationRecord | undefined> {
+  if (!isNonEmptyString(input.handle)) {
+    throw new Error("invalid notification record format")
+  }
+
+  const expectedHandle = normalizeLookupValue(normalizeHandle(input.handle))
+  const records = await listAllNotifications()
+  return records
+    .filter((record) => (
+    isTerminalNaturalStopRecord(record)
+    && isNonEmptyString(record.handle)
+    && normalizeLookupValue(record.handle) === expectedHandle
+    ))
+    .sort((left, right) => right.createdAt - left.createdAt)[0]
+}
+
+export async function listActiveNaturalStopsForScope(input: {
+  scopeKey: string
+  wechatAccountId?: string
+  userId?: string
+}): Promise<NotificationRecord[]> {
+  if (!isNonEmptyString(input.scopeKey)) {
+    throw new Error("invalid notification record format")
+  }
+  return listActiveNaturalStops({
+    scopeKey: input.scopeKey,
+    ...(input.wechatAccountId ? { wechatAccountId: input.wechatAccountId } : {}),
+    ...(input.userId ? { userId: input.userId } : {}),
+  })
+}
+
+export async function markNaturalStopTerminal(input: {
+  idempotencyKey: string
+  resolvedAt: number
+  terminalReason: NaturalStopTerminalReason
+}): Promise<NotificationRecord> {
+  if (!isNonEmptyString(input.idempotencyKey) || !isFiniteNumber(input.resolvedAt) || !isNaturalStopTerminalReason(input.terminalReason)) {
+    throw new Error("invalid notification record format")
+  }
+
+  assertValidIdempotencyKey(input.idempotencyKey)
+  const current = await readNotification(input.idempotencyKey)
+  if (current.kind !== "naturalStop") {
+    throw new Error("invalid notification record format")
+  }
+  if (isNaturalStopTerminalReason(current.naturalStopTerminalReason)) {
+    return current
+  }
+  if (current.status !== "pending" && current.status !== "sent") {
+    throw new Error("notification is neither pending nor sent")
+  }
+
+  return writeNotification({
+    ...current,
+    status: "resolved",
+    resolvedAt: input.resolvedAt,
+    naturalStopTerminalReason: input.terminalReason,
+  })
 }
 
 function terminalAt(record: NotificationRecord): number | undefined {

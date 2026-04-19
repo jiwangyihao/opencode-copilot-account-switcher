@@ -11,6 +11,7 @@ import {
   type BrokerEnvelope,
   type BrokerMessageType,
   type CollectStatusPayload,
+  type ReplyNaturalStopPayload,
   type ReplyMutationResult,
   type ReplyPermissionPayload,
   type ReplyQuestionPayload,
@@ -33,14 +34,25 @@ import {
 } from "./state-paths.js"
 import { formatAggregatedStatusReply } from "./status-format.js"
 import type { WechatSlashCommand } from "./command-parser.js"
-import { findMergeableNotification, upsertNotification } from "./notification-store.js"
+import {
+  findActiveNaturalStopByReplyTarget,
+  listRetainedNaturalStopHandles,
+  findMergeableNotification,
+  listActiveNaturalStopsForScope,
+  markNaturalStopTerminal,
+  upsertNotification,
+} from "./notification-store.js"
 import { readOperatorBinding } from "./operator-store.js"
-import { createHandle, createRouteKey } from "./handle.js"
+import { createHandle, createRouteKey, createSessionReplyHandle } from "./handle.js"
 import {
   expireOpenRequestsForScope,
+  findRequestByRouteKey,
   findOpenRequestByIdentity,
   listActiveRequests,
   markCleaned,
+  markRequestAnswered,
+  markTerminalMetadata,
+  markTerminalResultSent,
   purgeCleanedRequestsBefore,
   upsertRequest,
   type RequestRecord,
@@ -68,6 +80,12 @@ const DEFAULT_REQUEST_PURGE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const DEFAULT_REQUEST_CLEANUP_SCAN_INTERVAL_MS = 60_000
 const DEFAULT_DEAD_LETTER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const DEFAULT_DEAD_LETTER_SCAN_INTERVAL_MS = 60_000
+
+type BrokerServerTestHooks = {
+  beforeFinalizeOpenRequest?: (input: { request: RequestRecord }) => Promise<void> | void
+}
+
+let brokerServerTestHooks: BrokerServerTestHooks | undefined
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0
@@ -260,6 +278,132 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value)
 }
 
+function normalizeRequestIdentityForSync(value: string): string {
+  return value.trim().toLowerCase()
+}
+
+function toNotificationCandidateIdentityKey(candidate: Extract<WechatNotificationCandidate, { kind: "question" | "permission" }>): string {
+  return `${candidate.kind}:${normalizeRequestIdentityForSync(candidate.requestID)}`
+}
+
+function toRequestIdentityKey(record: Pick<RequestRecord, "kind" | "requestID">): string {
+  return `${record.kind}:${normalizeRequestIdentityForSync(record.requestID)}`
+}
+
+function toNaturalStopIdentityKey(input: {
+  scopeKey?: string
+  sessionID?: string
+  replyTarget?: { instanceID: string; sessionID: string }
+}): string | undefined {
+  const instanceID = input.replyTarget?.instanceID ?? input.scopeKey
+  const sessionID = input.replyTarget?.sessionID ?? input.sessionID
+  if (!isNonEmptyString(instanceID) || !isNonEmptyString(sessionID)) {
+    return undefined
+  }
+  return `${instanceID.trim().toLowerCase()}:${sessionID.trim().toLowerCase()}`
+}
+
+function createRequestTerminalIdempotencyKey(record: Pick<RequestRecord, "kind" | "routeKey">): string {
+  return `request-terminal-${record.kind}-${record.routeKey}`
+}
+
+function findReplacementHandle(record: RequestRecord, activeRequests: RequestRecord[]): string | undefined {
+  const replacement = activeRequests
+    .filter((item) => (
+      item.status === "open"
+      && item.kind === record.kind
+      && item.routeKey !== record.routeKey
+      && normalizeRequestIdentityForSync(item.requestID) === normalizeRequestIdentityForSync(record.requestID)
+      && item.wechatAccountId === record.wechatAccountId
+      && item.userId === record.userId
+    ))
+    .sort((left, right) => right.createdAt - left.createdAt)[0]
+
+  return replacement?.handle
+}
+
+export function setBrokerServerTestHooks(hooks: BrokerServerTestHooks | undefined): void {
+  brokerServerTestHooks = hooks
+}
+
+async function finalizeExitedReplyableRequest(input: {
+  request: RequestRecord
+  activeRequestsAfterSync: RequestRecord[]
+  registrationEpoch?: string
+}) {
+  const current = await findRequestByRouteKey({
+    kind: input.request.kind,
+    routeKey: input.request.routeKey,
+  })
+  if (!current) {
+    return
+  }
+
+  const finalizedAt = Date.now()
+  let terminal = current
+  if (current.status === "open") {
+    await brokerServerTestHooks?.beforeFinalizeOpenRequest?.({ request: current })
+
+    try {
+      terminal = await markRequestAnswered({
+        kind: current.kind,
+        routeKey: current.routeKey,
+        answeredAt: finalizedAt,
+      })
+    } catch (error) {
+      if (!(error instanceof Error) || !/request is not open/i.test(error.message)) {
+        throw error
+      }
+
+      const raced = await findRequestByRouteKey({
+        kind: current.kind,
+        routeKey: current.routeKey,
+      })
+      if (!raced || raced.status === "open") {
+        throw error
+      }
+      terminal = raced
+    }
+
+    if (terminal.status === "answered") {
+      const replacementHandle = findReplacementHandle(terminal, input.activeRequestsAfterSync)
+      if (replacementHandle) {
+        terminal = await markTerminalMetadata({
+          kind: terminal.kind,
+          routeKey: terminal.routeKey,
+          terminalReason: "replaced",
+          replacementHandle,
+        })
+      }
+    }
+  }
+
+  if (terminal.terminalResultSent === true || !terminal.terminalReason) {
+    return
+  }
+
+  await upsertNotification({
+    idempotencyKey: createRequestTerminalIdempotencyKey(terminal),
+    kind: "requestTerminal",
+    requestKind: terminal.kind,
+    terminalReason: terminal.terminalReason,
+    ...(terminal.replacementHandle ? { replacementHandle: terminal.replacementHandle } : {}),
+    wechatAccountId: terminal.wechatAccountId,
+    userId: terminal.userId,
+    registrationEpoch: input.registrationEpoch,
+    routeKey: terminal.routeKey,
+    handle: terminal.handle,
+    ...(terminal.scopeKey ? { scopeKey: terminal.scopeKey } : {}),
+    createdAt: finalizedAt,
+  })
+
+  await markTerminalResultSent({
+    kind: terminal.kind,
+    routeKey: terminal.routeKey,
+    sentAt: finalizedAt,
+  })
+}
+
 function hasCollectStatusPayload(payload: unknown): payload is CollectStatusPayload {
   return asObject(payload).requestId !== undefined && isNonEmptyString(asObject(payload).requestId)
 }
@@ -275,7 +419,19 @@ function isWechatNotificationCandidate(value: unknown): value is WechatNotificat
     return false
   }
   if (record.kind === "sessionError") {
-    return true
+    return isNonEmptyString(record.sessionID)
+      && isNonEmptyString(record.action)
+      && isNonEmptyString(record.redactedSummary)
+      && isNonEmptyString(record.severityAdvice)
+  }
+  if (record.kind === "naturalStop") {
+    const replyTarget = asObject(record.replyTarget)
+    return isNonEmptyString(record.sessionID)
+      && isNonEmptyString(record.handle)
+      && isNonEmptyString(record.redactedSummary)
+      && isNonEmptyString(record.severityAdvice)
+      && isNonEmptyString(replyTarget.instanceID)
+      && isNonEmptyString(replyTarget.sessionID)
   }
   if (record.kind === "question" || record.kind === "permission") {
     return isNonEmptyString(record.requestID) && isNonEmptyString(record.routeKey) && isNonEmptyString(record.handle)
@@ -518,6 +674,21 @@ async function markStaleSnapshots(now: number, heartbeatTimeoutMs: number): Prom
         kind: request.kind,
         routeKey: request.routeKey,
         reason: "instanceStale",
+      })
+      await finalizeExitedReplyableRequest({
+        request,
+        activeRequestsAfterSync: [],
+      })
+    }
+
+    const expiredNaturalStops = await listActiveNaturalStopsForScope({
+      scopeKey: instanceID,
+    })
+    for (const notification of expiredNaturalStops) {
+      await markNaturalStopTerminal({
+        idempotencyKey: notification.idempotencyKey,
+        resolvedAt: now,
+        terminalReason: "expired",
       })
     }
   }
@@ -792,7 +963,11 @@ async function handleMessage(envelope: BrokerEnvelope, socket: net.Socket): Prom
     return
   }
 
-  if (envelope.type === "replyQuestionResult" || envelope.type === "replyPermissionResult") {
+  if (
+    envelope.type === "replyQuestionResult"
+    || envelope.type === "replyPermissionResult"
+    || envelope.type === "replyNaturalStopResult"
+  ) {
     if (!requireAuthorized(envelope)) {
       writeError(socket, "unauthorized", "session token is invalid", requestId)
       return
@@ -843,6 +1018,33 @@ async function handleMessage(envelope: BrokerEnvelope, socket: net.Socket): Prom
     }
 
     await queueSyncWechatNotifications(async () => {
+      const relevantRequestsBeforeSync = (await listActiveRequests()).filter((item) => (
+        item.scopeKey === envelope.instanceID
+        && item.wechatAccountId === binding.wechatAccountId
+        && item.userId === binding.userId
+        && (item.status === "open" || item.terminalResultSent !== true)
+      ))
+      const relevantNaturalStopsBeforeSync = isNonEmptyString(envelope.instanceID)
+        ? await listActiveNaturalStopsForScope({
+            scopeKey: envelope.instanceID,
+            wechatAccountId: binding.wechatAccountId,
+            userId: binding.userId,
+          })
+        : []
+      const currentCandidateIdentityKeys = new Set(
+        payload.candidates
+          .filter((candidate): candidate is Extract<WechatNotificationCandidate, { kind: "question" | "permission" }> => (
+            candidate.kind === "question" || candidate.kind === "permission"
+          ))
+          .map((candidate) => toNotificationCandidateIdentityKey(candidate)),
+      )
+      const currentNaturalStopIdentityKeys = new Set(
+        payload.candidates
+          .filter((candidate): candidate is Extract<WechatNotificationCandidate, { kind: "naturalStop" }> => candidate.kind === "naturalStop")
+          .map((candidate) => toNaturalStopIdentityKey(candidate))
+          .filter((key): key is string => isNonEmptyString(key)),
+      )
+
       for (const candidate of payload.candidates) {
         if (candidate.kind === "sessionError") {
           await upsertNotification({
@@ -851,6 +1053,47 @@ async function handleMessage(envelope: BrokerEnvelope, socket: net.Socket): Prom
             wechatAccountId: binding.wechatAccountId,
             userId: binding.userId,
             registrationEpoch: capturedRegistrationEpoch,
+            createdAt: candidate.createdAt,
+            sessionID: candidate.sessionID,
+            action: candidate.action,
+            redactedSummary: candidate.redactedSummary,
+            severityAdvice: candidate.severityAdvice,
+          })
+          continue
+        }
+
+        if (candidate.kind === "naturalStop") {
+          const existingActiveNaturalStop = await findActiveNaturalStopByReplyTarget({
+            replyTarget: candidate.replyTarget,
+          }).catch(() => undefined)
+
+          if (existingActiveNaturalStop && existingActiveNaturalStop.idempotencyKey !== candidate.idempotencyKey) {
+            await markNaturalStopTerminal({
+              idempotencyKey: existingActiveNaturalStop.idempotencyKey,
+              resolvedAt: Date.now(),
+              terminalReason: "continued",
+            })
+          }
+
+          const canonicalHandle = existingActiveNaturalStop?.idempotencyKey === candidate.idempotencyKey
+            ? existingActiveNaturalStop.handle
+            : createSessionReplyHandle([
+                ...(existingActiveNaturalStop?.handle ? [existingActiveNaturalStop.handle] : []),
+                ...(await listRetainedNaturalStopHandles()),
+              ])
+
+          await upsertNotification({
+            idempotencyKey: candidate.idempotencyKey,
+            kind: "naturalStop",
+            wechatAccountId: binding.wechatAccountId,
+            userId: binding.userId,
+            registrationEpoch: capturedRegistrationEpoch,
+            handle: canonicalHandle,
+            scopeKey: candidate.replyTarget.instanceID,
+            sessionID: candidate.sessionID,
+            replyTarget: candidate.replyTarget,
+            redactedSummary: candidate.redactedSummary,
+            severityAdvice: candidate.severityAdvice,
             createdAt: candidate.createdAt,
           })
           continue
@@ -931,6 +1174,36 @@ async function handleMessage(envelope: BrokerEnvelope, socket: net.Socket): Prom
             }
           : undefined)
       }
+
+      const activeRequestsAfterSync = await listActiveRequests()
+      for (const request of relevantRequestsBeforeSync) {
+        if (currentCandidateIdentityKeys.has(toRequestIdentityKey(request))) {
+          continue
+        }
+
+        await finalizeExitedReplyableRequest({
+          request,
+          activeRequestsAfterSync,
+          registrationEpoch: capturedRegistrationEpoch,
+        })
+      }
+
+      for (const notification of relevantNaturalStopsBeforeSync) {
+        const identityKey = toNaturalStopIdentityKey({
+          scopeKey: notification.scopeKey,
+          sessionID: notification.sessionID,
+          replyTarget: notification.replyTarget,
+        })
+        if (identityKey && currentNaturalStopIdentityKeys.has(identityKey)) {
+          continue
+        }
+
+        await markNaturalStopTerminal({
+          idempotencyKey: notification.idempotencyKey,
+          resolvedAt: Date.now(),
+          terminalReason: "continued",
+        })
+      }
     })
     return
   }
@@ -1003,6 +1276,12 @@ export type BrokerServerHandle = {
     requestID: string
     reply: "once" | "always" | "reject"
     message?: string
+  }) => Promise<ReplyMutationResult>
+  dispatchReplyNaturalStopToInstance: (input: {
+    instanceID: string
+    mutationId: string
+    sessionID: string
+    text: string
   }) => Promise<ReplyMutationResult>
   hasBlockingActivity: () => Promise<boolean>
   close: () => Promise<void>
@@ -1307,6 +1586,44 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     })
   }
 
+  const dispatchReplyNaturalStopToInstance = async (input: {
+    instanceID: string
+    mutationId: string
+    sessionID: string
+    text: string
+  }): Promise<ReplyMutationResult> => {
+    const registration = registrationByInstanceID.get(input.instanceID)
+    if (!registration) {
+      return { mutationId: input.mutationId, ok: false, errorMessage: `bridge unavailable: ${input.instanceID}` }
+    }
+
+    const requestId = `replyNaturalStop-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    return new Promise<ReplyMutationResult>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingReplyMutationsByRequestId.delete(requestId)
+        resolve({ mutationId: input.mutationId, ok: false, errorMessage: `replyNaturalStop timeout: ${input.mutationId}` })
+      }, 10_000)
+
+      pendingReplyMutationsByRequestId.set(requestId, {
+        mutationId: input.mutationId,
+        resolve,
+        timer,
+      })
+
+      writeEnvelope(registration.socket, {
+        id: requestId,
+        type: "replyNaturalStop",
+        instanceID: input.instanceID,
+        sessionToken: registration.sessionToken,
+        payload: {
+          mutationId: input.mutationId,
+          sessionID: input.sessionID,
+          text: input.text,
+        } satisfies ReplyNaturalStopPayload,
+      })
+    })
+  }
+
   const close = async () => {
     if (closed) {
       return
@@ -1357,6 +1674,7 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     handleNotificationDeliveryFailure,
     dispatchReplyQuestionToInstance,
     dispatchReplyPermissionToInstance,
+    dispatchReplyNaturalStopToInstance,
     hasBlockingActivity,
     close,
   }

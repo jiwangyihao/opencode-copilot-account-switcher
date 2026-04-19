@@ -1,9 +1,20 @@
-import test from "node:test"
+import test, { afterEach } from "node:test"
 import assert from "node:assert/strict"
+
+const serialTest = (name, fn) => test(name, { concurrency: false }, fn)
 
 async function importPluginHooks() {
   return import(`../dist/plugin-hooks.js?reload=${Date.now()}-${Math.random()}`)
 }
+
+async function resetPluginHooksGlobals() {
+  const module = await import("../dist/plugin-hooks.js")
+  await module.resetWechatBridgeGlobalsForTest?.()
+}
+
+afterEach(async () => {
+  await resetPluginHooksGlobals()
+})
 
 async function importBridgeModule() {
   return import(`../dist/wechat/bridge.js?reload=${Date.now()}-${Math.random()}`)
@@ -43,7 +54,7 @@ function createBridgeCapableClient(extra = {}) {
   }
 }
 
-test("plugin-hooks 仅接入 /status bridge 生命周期", async () => {
+serialTest("plugin-hooks 仅接入 /status bridge 生命周期", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const calls = []
   const client = {
@@ -97,7 +108,7 @@ test("plugin-hooks 仅接入 /status bridge 生命周期", async () => {
   assert.equal(Object.hasOwn(plugin, "wechat.permission.reply"), false)
 })
 
-test("plugin-hooks 对根 SDK client 应包装出带 question/permission 的 bridge client", async () => {
+serialTest("plugin-hooks 对根 SDK client 应包装出带 question/permission 的 bridge client", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const { createOpencodeClient } = await import("@opencode-ai/sdk/client")
   const calls = []
@@ -134,7 +145,7 @@ test("plugin-hooks 对根 SDK client 应包装出带 question/permission 的 bri
   assert.equal(calls[0]?.statusCollectionEnabled, true)
 })
 
-test("plugin-hooks 用事件与请求作用域共同维护当前前台 session", async () => {
+serialTest("plugin-hooks 用事件与请求作用域共同维护当前前台 session", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const client = {
     session: {
@@ -197,7 +208,7 @@ test("plugin-hooks 用事件与请求作用域共同维护当前前台 session",
   assert.equal(lifecycleInput?.getActiveSessionID?.(), "sess-ui")
 })
 
-test("plugin-hooks 不再把实例初始化当作第二条 eager broker 启动入口", async () => {
+serialTest("plugin-hooks 不再把实例初始化当作第二条 eager broker 启动入口", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const { createWechatBridgeLifecycle } = await importBridgeModule()
   const client = createBridgeCapableClient()
@@ -242,7 +253,7 @@ test("plugin-hooks 不再把实例初始化当作第二条 eager broker 启动�
   assert.deepEqual(connectedEndpoints, ["fake-endpoint-from-plugin"])
 })
 
-test("plugin-hooks 在非 bridge-capable 输入下不会额外 eager ensure broker 或显示启动提示", async () => {
+serialTest("plugin-hooks 在非 bridge-capable 输入下不会额外 eager ensure broker 或显示启动提示", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const toastCalls = []
   const client = createBridgeCapableClient({
@@ -283,7 +294,7 @@ test("plugin-hooks 在非 bridge-capable 输入下不会额外 eager ensure brok
   assert.equal(toastCalls.length, 0)
 })
 
-test("plugin-hooks 将 wechat fallback toast 透传到现有 UI toast", async () => {
+serialTest("plugin-hooks 将 wechat fallback toast 透传到现有 UI toast", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const toastCalls = []
   const client = {
@@ -338,7 +349,7 @@ test("plugin-hooks 将 wechat fallback toast 透传到现有 UI toast", async ()
   assert.equal(warningToast?.body?.message, "微信会话可能已失效，请在微信发送 /status 重新激活")
 })
 
-test("plugin-hooks lifecycle 初始化不依赖 eager broker ensure", async () => {
+serialTest("plugin-hooks lifecycle 初始化不依赖 eager broker ensure", async () => {
   const runCase = async (ensureWechatBrokerStarted) => {
     const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
     const client = createBridgeCapableClient()
@@ -381,7 +392,7 @@ test("plugin-hooks lifecycle 初始化不依赖 eager broker ensure", async () =
   })
 })
 
-test("plugin-hooks 重复 build 不应重复初始化 bridge lifecycle", async () => {
+serialTest("plugin-hooks 重复 build 不应重复初始化 bridge lifecycle", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const calls = []
   const client = {
@@ -435,7 +446,7 @@ test("plugin-hooks 重复 build 不应重复初始化 bridge lifecycle", async (
   assert.equal(calls.length, 1)
 })
 
-test("plugin-hooks lifecycle key 变化时必须关闭旧实例，最终仅保留一个活跃 lifecycle", async () => {
+serialTest("plugin-hooks lifecycle key 变化时必须关闭旧实例，最终仅保留一个活跃 lifecycle", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const active = new Set()
   let closeCount = 0
@@ -500,7 +511,7 @@ test("plugin-hooks lifecycle key 变化时必须关闭旧实例，最终仅保�
   assert.equal(active.size, 1)
 })
 
-test("plugin-hooks 旧 lifecycle 仍在初始化中时切 key，旧 promise resolve 后也必须 close", async () => {
+serialTest("plugin-hooks 旧 lifecycle 仍在初始化中时切 key，旧 promise resolve 后也必须 close", async () => {
   const { buildPluginHooks: buildPluginHooksRaw } = await importPluginHooks()
   const active = new Set()
   let closeCount = 0
@@ -580,7 +591,7 @@ test("plugin-hooks 旧 lifecycle 仍在初始化中时切 key，旧 promise reso
   assert.equal(active.size, 1)
 })
 
-test("bridge lifecycle register 失败时会回收已建立 brokerClient", async () => {
+serialTest("bridge lifecycle register 失败时会回收已建立 brokerClient", async () => {
   const { createWechatBridgeLifecycle } = await importBridgeModule()
   let closed = 0
 
@@ -620,7 +631,7 @@ test("bridge lifecycle register 失败时会回收已建立 brokerClient", async
   assert.equal(closed, 1)
 })
 
-test("bridge lifecycle 生成的 instanceID 应按进程唯一，而不是目录派生", async () => {
+serialTest("bridge lifecycle 生成的 instanceID 应按进程唯一，而不是目录派生", async () => {
   const { createWechatBridgeLifecycle } = await importBridgeModule()
   let registeredInstanceID = ""
 
@@ -659,7 +670,7 @@ test("bridge lifecycle 生成的 instanceID 应按进程唯一，而不是目录
   await lifecycle.close()
 })
 
-test("bridge lifecycle heartbeat 与 close 边界：仅定时心跳，close 清理且幂等", async () => {
+serialTest("bridge lifecycle heartbeat 与 close 边界：仅定时心跳，close 清理且幂等", async () => {
   const { createWechatBridgeLifecycle } = await importBridgeModule()
   let heartbeatCalls = 0
   let closeCalls = 0
@@ -719,7 +730,7 @@ test("bridge lifecycle heartbeat 与 close 边界：仅定时心跳，close 清�
   assert.equal(closeCalls, 1)
 })
 
-test("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次 full sync", async () => {
+serialTest("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次 full sync", async () => {
   const { createWechatBridgeLifecycle } = await importBridgeModule()
   let connectOrSpawnCalls = 0
   let connectCalls = 0
@@ -817,4 +828,79 @@ test("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次 full 
   assert.deepEqual(liveReadCalls, ["session.list", "session.status", "question.list", "permission.list"])
 
   await lifecycle.close()
+})
+
+serialTest("plugin-hooks fresh import 不会重复附加 auto-close listeners，且会接管并关闭旧 lifecycle", async () => {
+  const beforeExitListeners = process.listeners("beforeExit")
+  const sigintListeners = process.listeners("SIGINT")
+  const sigtermListeners = process.listeners("SIGTERM")
+
+  const closeCalls = []
+  const firstModule = await importPluginHooks()
+  const secondModule = await importPluginHooks()
+
+  firstModule.buildPluginHooks({
+    auth: {
+      provider: "github-copilot",
+      methods: [],
+    },
+    client: createBridgeCapableClient(),
+    project: { id: "project-a", name: "wechat-stage-a" },
+    directory: "/workspace/wechat-stage-a",
+    serverUrl: new URL("http://127.0.0.1:4096"),
+    ensureWechatBrokerStarted: async () => ({ endpoint: "fake-endpoint-a" }),
+    createWechatBridgeLifecycleImpl: async () => ({
+      close: async () => {
+        closeCalls.push("first")
+      },
+    }),
+  })
+
+  await Promise.resolve()
+  await Promise.resolve()
+
+  secondModule.buildPluginHooks({
+    auth: {
+      provider: "github-copilot",
+      methods: [],
+    },
+    client: createBridgeCapableClient(),
+    project: { id: "project-b", name: "wechat-stage-b" },
+    directory: "/workspace/wechat-stage-b",
+    serverUrl: new URL("http://127.0.0.1:4096"),
+    ensureWechatBrokerStarted: async () => ({ endpoint: "fake-endpoint-b" }),
+    createWechatBridgeLifecycleImpl: async () => ({
+      close: async () => {
+        closeCalls.push("second")
+      },
+    }),
+  })
+
+  await Promise.resolve()
+  await Promise.resolve()
+
+  const afterBeforeExitListeners = process.listeners("beforeExit")
+  const afterSigintListeners = process.listeners("SIGINT")
+  const afterSigtermListeners = process.listeners("SIGTERM")
+
+  const addedBeforeExitListeners = afterBeforeExitListeners.filter((listener) => !beforeExitListeners.includes(listener))
+  const addedSigintListeners = afterSigintListeners.filter((listener) => !sigintListeners.includes(listener))
+  const addedSigtermListeners = afterSigtermListeners.filter((listener) => !sigtermListeners.includes(listener))
+
+  try {
+    assert.equal(addedBeforeExitListeners.length, 1)
+    assert.equal(addedSigintListeners.length, 1)
+    assert.equal(addedSigtermListeners.length, 1)
+    assert.deepEqual(closeCalls, ["first"])
+  } finally {
+    for (const listener of addedBeforeExitListeners) {
+      process.removeListener("beforeExit", listener)
+    }
+    for (const listener of addedSigintListeners) {
+      process.removeListener("SIGINT", listener)
+    }
+    for (const listener of addedSigtermListeners) {
+      process.removeListener("SIGTERM", listener)
+    }
+  }
 })

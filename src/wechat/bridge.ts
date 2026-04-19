@@ -22,10 +22,11 @@ import {
   type SessionDigest,
 } from "./session-digest.js"
 import { readOperatorBinding } from "./operator-store.js"
-import { createHandle, createRouteKey } from "./handle.js"
+import { createHandle, createRouteKey, createSessionReplyHandle } from "./handle.js"
 import type {
   BrokerEnvelope,
   ReplyMutationResult,
+  ReplyNaturalStopPayload,
   ReplyPermissionPayload,
   ReplyQuestionPayload,
   ShowFallbackToastPayload,
@@ -52,6 +53,7 @@ type WechatBridgeClient = {
     status: () => Promise<SdkReadResult<Record<string, SessionStatus | undefined>>>
     todo: (parameters: { sessionID: string } | string) => Promise<SdkReadResult<Todo[]>>
     messages: (parameters: { sessionID: string; limit?: number } | string) => Promise<SdkReadResult<SessionMessages>>
+    reply?: (input: { sessionID: string; text: string }) => Promise<SdkReadResult<unknown>>
   }
   question: {
     list: () => Promise<SdkReadResult<QuestionRequest[]>>
@@ -343,10 +345,78 @@ function normalizeReplyMutationResult(mutationId: string, value: unknown): Reply
   }
 }
 
+function asStatusRecord(status: SessionStatus | undefined): Record<string, unknown> {
+  if (typeof status !== "object" || status === null) {
+    return {}
+  }
+  return status as Record<string, unknown>
+}
+
+function readStatusText(status: SessionStatus | undefined, key: string): string | undefined {
+  const value = asStatusRecord(status)[key]
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+}
+
+function readStatusNumber(status: SessionStatus | undefined, key: string): number | undefined {
+  const value = asStatusRecord(status)[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function isSensitiveSummary(summary: string): boolean {
+  return /\n|\r|stack|trace|token|secret|password|authorization|cookie|set-cookie|bearer/i.test(summary)
+}
+
+function deriveStatusSummary(status: SessionStatus | undefined): string {
+  const explicit = readStatusText(status, "redactedSummary")
+  if (explicit) {
+    return explicit
+  }
+
+  const message = readStatusText(status, "message")
+  if (!message || isSensitiveSummary(message)) {
+    return "原因摘要不可安全展示"
+  }
+  return message
+}
+
+function deriveRetryAction(status: SessionStatus | undefined): string {
+  const explicit = readStatusText(status, "action") ?? readStatusText(status, "stage")
+  if (explicit) {
+    return explicit
+  }
+
+  const attempt = readStatusNumber(status, "attempt")
+  if (typeof attempt === "number") {
+    return `自动重试第 ${attempt} 次`
+  }
+  return "重试处理中"
+}
+
+function deriveRetrySeverity(status: SessionStatus | undefined): string {
+  const explicit = readStatusText(status, "severityAdvice")
+  if (explicit === "可等待自动重试" || explicit === "建议尽快人工查看") {
+    return explicit
+  }
+
+  const attempt = readStatusNumber(status, "attempt")
+  if (typeof attempt === "number" && attempt > 1) {
+    return "建议尽快人工查看"
+  }
+  return "可等待自动重试"
+}
+
+function deriveNaturalStopSeverity(status: SessionStatus | undefined): string {
+  void status
+  return "已停止并等待你的回复"
+}
+
 export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
   const retryEventSequenceBySessionID = new Map<string, number>()
   const retrySignatureBySessionID = new Map<string, string>()
   const isRetryBySessionID = new Map<string, boolean>()
+  const naturalStopEventSequenceBySessionID = new Map<string, number>()
+  const naturalStopSignatureBySessionID = new Map<string, string>()
+  const isNaturalStopBySessionID = new Map<string, boolean>()
 
   function toIdempotencyPart(value: string): string {
     const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
@@ -578,7 +648,8 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
       const seenSessionIDs = new Set<string>()
       for (const [sessionID, status] of Object.entries(statusResult.value)) {
         seenSessionIDs.add(sessionID)
-        if (status?.type === "retry") {
+        const statusType = readStatusText(status, "type")
+        if (statusType === "retry") {
           const signature = stableStringify(status)
           const previousWasRetry = isRetryBySessionID.get(sessionID) === true
           const previousSignature = retrySignatureBySessionID.get(sessionID)
@@ -594,10 +665,50 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
             idempotencyKey: `session-error-${toIdempotencyPart(input.instanceID)}-${toIdempotencyPart(sessionID)}-${eventSequence}`,
             kind: "sessionError",
             createdAt: Date.now(),
+            sessionID,
+            action: deriveRetryAction(status),
+            redactedSummary: deriveStatusSummary(status),
+            severityAdvice: deriveRetrySeverity(status),
+          })
+          isNaturalStopBySessionID.set(sessionID, false)
+          naturalStopSignatureBySessionID.delete(sessionID)
+          continue
+        }
+
+        if (statusType === "natural-stop") {
+          const signature = stableStringify(status)
+          const previousWasNaturalStop = isNaturalStopBySessionID.get(sessionID) === true
+          const previousSignature = naturalStopSignatureBySessionID.get(sessionID)
+          if (!previousWasNaturalStop || previousSignature !== signature) {
+            const nextSequence = (naturalStopEventSequenceBySessionID.get(sessionID) ?? 0) + 1
+            naturalStopEventSequenceBySessionID.set(sessionID, nextSequence)
+          }
+
+          isNaturalStopBySessionID.set(sessionID, true)
+          naturalStopSignatureBySessionID.set(sessionID, signature)
+          isRetryBySessionID.set(sessionID, false)
+          retrySignatureBySessionID.delete(sessionID)
+          const handle = createSessionReplyHandle(existingHandles)
+          existingHandles.add(handle)
+          const eventSequence = naturalStopEventSequenceBySessionID.get(sessionID) ?? 1
+          candidates.push({
+            idempotencyKey: `natural-stop-${toIdempotencyPart(input.instanceID)}-${toIdempotencyPart(sessionID)}-${eventSequence}`,
+            kind: "naturalStop",
+            createdAt: Date.now(),
+            sessionID,
+            handle,
+            replyTarget: {
+              instanceID: input.instanceID,
+              sessionID,
+            },
+            redactedSummary: deriveStatusSummary(status),
+            severityAdvice: deriveNaturalStopSeverity(status),
           })
         } else {
           isRetryBySessionID.set(sessionID, false)
           retrySignatureBySessionID.delete(sessionID)
+          isNaturalStopBySessionID.set(sessionID, false)
+          naturalStopSignatureBySessionID.delete(sessionID)
         }
       }
 
@@ -607,6 +718,14 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
         }
         isRetryBySessionID.set(knownSessionID, false)
         retrySignatureBySessionID.delete(knownSessionID)
+      }
+
+      for (const knownSessionID of isNaturalStopBySessionID.keys()) {
+        if (seenSessionIDs.has(knownSessionID)) {
+          continue
+        }
+        isNaturalStopBySessionID.set(knownSessionID, false)
+        naturalStopSignatureBySessionID.delete(knownSessionID)
       }
     }
 
@@ -696,6 +815,30 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
       return {
         id: envelope.id,
         type: "replyPermissionResult",
+        payload: normalizeReplyMutationResult(payload.mutationId, response),
+      }
+    }
+
+    if (envelope.type === "replyNaturalStop") {
+      const payload = envelope.payload as ReplyNaturalStopPayload
+      if (!input.client.session.reply) {
+        return {
+          id: envelope.id,
+          type: "replyNaturalStopResult",
+          payload: {
+            mutationId: payload.mutationId,
+            ok: false,
+            errorMessage: "session.reply unavailable",
+          },
+        }
+      }
+      const response = await input.client.session.reply({
+        sessionID: payload.sessionID,
+        text: payload.text,
+      })
+      return {
+        id: envelope.id,
+        type: "replyNaturalStopResult",
         payload: normalizeReplyMutationResult(payload.mutationId, response),
       }
     }

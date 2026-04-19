@@ -1,4 +1,5 @@
-import type { NotificationRecord } from "./notification-types.js"
+import type { NaturalStopTerminalReason, NotificationRecord } from "./notification-types.js"
+import type { RequestTerminalReason } from "./request-store.js"
 import {
   SHOW_FALLBACK_TOAST_DELIVERY_FAILED_REASON,
   type ShowFallbackToastPayload,
@@ -33,23 +34,26 @@ function formatQuestionType(mode: string | undefined) {
   return "文本"
 }
 
-function formatQuestionOptions(options: Array<{ index: number; label: string }> = []) {
-  return options.map((option) => `${option.index}. ${option.label}`)
+function formatQuestionOptions(options: Array<{ index: number; label: string; description?: string }> = []) {
+  return options.flatMap((option) => [
+    `${option.index}. ${option.label}`,
+    ...(typeof option.description === "string" && option.description.trim().length > 0 ? [option.description.trim()] : []),
+  ])
 }
 
 function formatQuestionReplyExamples(handle: string, mode: string | undefined, allowCustom: boolean) {
   const examples: string[] = []
   if (mode === "single") {
-    examples.push(`编号回复：/reply ${handle} 1`)
+    examples.push(`/reply ${handle} 1`)
   }
   if (mode === "multiple") {
-    examples.push(`编号回复：/reply ${handle} 1,2`)
+    examples.push(`/reply ${handle} 1,2`)
   }
   if (mode === "text" || allowCustom) {
-    examples.push(`自定义回复：/reply ${handle} 你的自定义回答`)
+    examples.push(`/reply ${handle} 你的自定义回答`)
   }
   if (mode === "multiple" && allowCustom) {
-    examples.push(`混合回复：/reply ${handle} 1,3; 其他：先灰度再全量`)
+    examples.push(`/reply ${handle} 1,3; 其他：先灰度再全量`)
   }
   return examples
 }
@@ -60,6 +64,93 @@ function formatPermissionReplySemantics() {
     "always：后续同类请求自动允许",
     "reject：拒绝当前请求",
   ]
+}
+
+function formatTerminalReasonLabel(reason: RequestTerminalReason | undefined): string {
+  if (reason === "answered") return "已在电脑端回复"
+  if (reason === "rejected") return "已在电脑端拒绝"
+  if (reason === "expired") return "已过期"
+  if (reason === "replaced") return "已被新入口替代"
+  return "已结束"
+}
+
+function formatTerminalRefusalLabel(requestKind: "question" | "permission"): string {
+  return requestKind === "permission" ? "该入口不再接受权限处理。" : "该入口不再接受回复。"
+}
+
+function formatNaturalStopTerminalReasonLabel(reason: NaturalStopTerminalReason | undefined): string {
+  if (reason === "replied") return "已在微信端补充回复"
+  if (reason === "continued") return "已在电脑端继续处理"
+  if (reason === "expired") return "已过期"
+  return "已结束"
+}
+
+export function formatNaturalStopClosedText(input: {
+  handle?: string
+  terminalReason?: NaturalStopTerminalReason
+}): string {
+  const handle = formatHandle(input.handle, "s?")
+  return [
+    `中止通知 ${handle} 已结束`,
+    `原因：${formatNaturalStopTerminalReasonLabel(input.terminalReason)}`,
+    "说明：该入口不再接受回复。",
+  ].join("\n")
+}
+
+function formatSessionErrorText(record: NotificationRecord): string {
+  if (
+    typeof record.action !== "string"
+    || record.action.trim().length === 0
+    || typeof record.redactedSummary !== "string"
+    || record.redactedSummary.trim().length === 0
+    || typeof record.severityAdvice !== "string"
+    || record.severityAdvice.trim().length === 0
+  ) {
+    return "检测到会话异常（retry），请在 OpenCode 中检查并处理。"
+  }
+
+  return [
+    `检测到会话异常（${record.sessionID?.trim() || "session?"}）`,
+    `动作：${record.action.trim()}`,
+    `原因摘要：${record.redactedSummary.trim()}`,
+    `处理建议：${record.severityAdvice.trim()}`,
+  ].join("\n")
+}
+
+function formatNaturalStopText(record: NotificationRecord): string {
+  if (record.naturalStopTerminalReason) {
+    return formatNaturalStopClosedText({
+      handle: record.handle,
+      terminalReason: record.naturalStopTerminalReason,
+    })
+  }
+
+  const handle = formatHandle(record.handle, "s?")
+  return [
+    `会话已自然中止（${handle}）`,
+    `原因摘要：${record.redactedSummary?.trim() || "原因摘要不可安全展示"}`,
+    `处理建议：${record.severityAdvice?.trim() || "已停止并等待你的回复"}`,
+    `/reply ${handle} 你的补充内容`,
+    "发送后会把补充说明回到当前会话。",
+  ].join("\n")
+}
+
+export function formatTerminalRequestClosedText(input: {
+  requestKind: "question" | "permission"
+  handle?: string
+  terminalReason?: RequestTerminalReason
+  replacementHandle?: string
+}): string {
+  const handle = formatHandle(input.handle, input.requestKind === "permission" ? "p?" : "q?")
+  const lines = [
+    `${input.requestKind === "permission" ? "权限" : "问题"}入口 ${handle} 已结束`,
+    `原因：${formatTerminalReasonLabel(input.terminalReason)}`,
+    `说明：${formatTerminalRefusalLabel(input.requestKind)}`,
+    ...(input.terminalReason === "replaced" && typeof input.replacementHandle === "string" && input.replacementHandle.trim().length > 0
+      ? [`请改用新入口：${input.replacementHandle.trim()}`]
+      : []),
+  ]
+  return lines.join("\n")
 }
 
 export function formatWechatNotificationText(record: NotificationRecord): string {
@@ -89,9 +180,9 @@ export function formatWechatNotificationText(record: NotificationRecord): string
         prompt.title ?? "请在 OpenCode 中处理该权限请求。",
         `类型：${prompt.type ?? "unknown"}`,
         prompt.description,
-        `允许一次：/allow ${handle} once`,
-        `始终允许：/allow ${handle} always`,
-        `拒绝：/allow ${handle} reject`,
+        `/allow ${handle} once`,
+        `/allow ${handle} always`,
+        `/allow ${handle} reject`,
         ...formatPermissionReplySemantics(),
       ].filter(Boolean)
       return lines.join("\n")
@@ -99,5 +190,18 @@ export function formatWechatNotificationText(record: NotificationRecord): string
     return `收到新的权限请求（${handle}），请在 OpenCode 中处理。`
   }
 
-  return "检测到会话异常（retry），请在 OpenCode 中检查并处理。"
+  if (record.kind === "requestTerminal") {
+    return formatTerminalRequestClosedText({
+      requestKind: record.requestKind === "permission" ? "permission" : "question",
+      handle: record.handle,
+      terminalReason: record.terminalReason,
+      replacementHandle: record.replacementHandle,
+    })
+  }
+
+  if (record.kind === "naturalStop") {
+    return formatNaturalStopText(record)
+  }
+
+  return formatSessionErrorText(record)
 }

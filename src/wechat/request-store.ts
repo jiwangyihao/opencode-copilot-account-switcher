@@ -12,6 +12,8 @@ import { normalizeRequestPromptSummary, type RequestPromptSummary } from "./ques
 
 export type RequestStatus = "open" | "answered" | "rejected" | "expired" | "cleaned"
 
+export type RequestTerminalReason = "answered" | "rejected" | "expired" | "replaced"
+
 export type RequestRecord = {
   kind: WechatRequestKind
   requestID: string
@@ -27,10 +29,118 @@ export type RequestRecord = {
   rejectedAt?: number
   expiredAt?: number
   cleanedAt?: number
+  terminalReason?: RequestTerminalReason
+  replacementHandle?: string
+  terminalResultSent?: boolean
+}
+
+const TERMINAL_REASON_PRIORITY: Record<RequestTerminalReason, number> = {
+  expired: 1,
+  rejected: 2,
+  answered: 3,
+  replaced: 4,
+}
+
+function isRequestTerminalReason(value: unknown): value is RequestTerminalReason {
+  return ["answered", "rejected", "expired", "replaced"].includes(value as RequestTerminalReason)
+}
+
+function deriveTerminalReason(record: Pick<
+  RequestRecord,
+  "status" | "terminalReason" | "replacementHandle" | "answeredAt" | "rejectedAt" | "expiredAt"
+>): RequestTerminalReason | undefined {
+  if (record.status === "open") {
+    return undefined
+  }
+
+  if (record.terminalReason === "replaced" && isNonEmptyString(record.replacementHandle)) {
+    return "replaced"
+  }
+  if (record.terminalReason === "answered" || record.status === "answered" || typeof record.answeredAt === "number") {
+    return "answered"
+  }
+  if (record.terminalReason === "rejected" || record.status === "rejected" || typeof record.rejectedAt === "number") {
+    return "rejected"
+  }
+  if (record.terminalReason === "expired" || record.status === "expired" || typeof record.expiredAt === "number") {
+    return "expired"
+  }
+  return undefined
+}
+
+function normalizeTerminalMetadata(record: RequestRecord): RequestRecord {
+  const terminalReason = deriveTerminalReason(record)
+  const replacementHandle = terminalReason === "replaced" && isNonEmptyString(record.replacementHandle)
+    ? normalizeHandle(record.replacementHandle)
+    : undefined
+
+  return {
+    ...record,
+    terminalReason,
+    replacementHandle,
+    terminalResultSent: terminalReason ? record.terminalResultSent === true : undefined,
+  }
+}
+
+function selectHigherPriorityTerminalReason(input: {
+  currentReason?: RequestTerminalReason
+  currentReplacementHandle?: string
+  nextReason?: RequestTerminalReason
+  nextReplacementHandle?: string
+}): {
+  terminalReason?: RequestTerminalReason
+  replacementHandle?: string
+} {
+  const currentReason = input.currentReason === "replaced" && !isNonEmptyString(input.currentReplacementHandle)
+    ? undefined
+    : input.currentReason
+  const nextReason = input.nextReason === "replaced" && !isNonEmptyString(input.nextReplacementHandle)
+    ? undefined
+    : input.nextReason
+
+  if (!currentReason && !nextReason) {
+    return {}
+  }
+  if (!currentReason) {
+    return {
+      terminalReason: nextReason,
+      ...(nextReason === "replaced" && isNonEmptyString(input.nextReplacementHandle)
+        ? { replacementHandle: normalizeHandle(input.nextReplacementHandle) }
+        : {}),
+    }
+  }
+  if (!nextReason) {
+    return {
+      terminalReason: currentReason,
+      ...(currentReason === "replaced" && isNonEmptyString(input.currentReplacementHandle)
+        ? { replacementHandle: normalizeHandle(input.currentReplacementHandle) }
+        : {}),
+    }
+  }
+
+  if (TERMINAL_REASON_PRIORITY[nextReason] > TERMINAL_REASON_PRIORITY[currentReason]) {
+    return {
+      terminalReason: nextReason,
+      ...(nextReason === "replaced" && isNonEmptyString(input.nextReplacementHandle)
+        ? { replacementHandle: normalizeHandle(input.nextReplacementHandle) }
+        : {}),
+    }
+  }
+
+  return {
+    terminalReason: currentReason,
+    ...(currentReason === "replaced" && isNonEmptyString(input.currentReplacementHandle)
+      ? { replacementHandle: normalizeHandle(input.currentReplacementHandle) }
+      : {}),
+  }
+}
+
+function terminalSortTimestamp(record: RequestRecord): number {
+  return record.cleanedAt ?? record.answeredAt ?? record.rejectedAt ?? record.expiredAt ?? record.createdAt
 }
 
 function normalizeRecord(input: RequestRecord): RequestRecord {
-  return {
+  const normalized = normalizeTerminalMetadata({
     kind: input.kind,
     requestID: input.requestID,
     routeKey: input.routeKey,
@@ -45,6 +155,31 @@ function normalizeRecord(input: RequestRecord): RequestRecord {
     ...(typeof input.rejectedAt === "number" ? { rejectedAt: input.rejectedAt } : {}),
     ...(typeof input.expiredAt === "number" ? { expiredAt: input.expiredAt } : {}),
     ...(typeof input.cleanedAt === "number" ? { cleanedAt: input.cleanedAt } : {}),
+    ...(isRequestTerminalReason(input.terminalReason) ? { terminalReason: input.terminalReason } : {}),
+    ...(isNonEmptyString(input.replacementHandle) ? { replacementHandle: input.replacementHandle } : {}),
+    ...(input.terminalResultSent === true ? { terminalResultSent: true } : {}),
+  })
+
+  return {
+    kind: normalized.kind,
+    requestID: normalized.requestID,
+    routeKey: normalized.routeKey,
+    handle: normalized.handle,
+    ...(isNonEmptyString(normalized.scopeKey) ? { scopeKey: normalized.scopeKey } : {}),
+    ...(normalized.prompt !== undefined ? { prompt: normalized.prompt } : {}),
+    wechatAccountId: normalized.wechatAccountId,
+    userId: normalized.userId,
+    status: normalized.status,
+    createdAt: normalized.createdAt,
+    ...(typeof normalized.answeredAt === "number" ? { answeredAt: normalized.answeredAt } : {}),
+    ...(typeof normalized.rejectedAt === "number" ? { rejectedAt: normalized.rejectedAt } : {}),
+    ...(typeof normalized.expiredAt === "number" ? { expiredAt: normalized.expiredAt } : {}),
+    ...(typeof normalized.cleanedAt === "number" ? { cleanedAt: normalized.cleanedAt } : {}),
+    ...(isRequestTerminalReason(normalized.terminalReason) ? { terminalReason: normalized.terminalReason } : {}),
+    ...(isNonEmptyString(normalized.replacementHandle) ? { replacementHandle: normalized.replacementHandle } : {}),
+    ...(isRequestTerminalReason(normalized.terminalReason)
+      ? { terminalResultSent: normalized.terminalResultSent === true }
+      : {}),
   }
 }
 
@@ -110,7 +245,10 @@ function toRequestRecord(input: unknown): RequestRecord {
     (parsed.answeredAt !== undefined && !isFiniteNumber(parsed.answeredAt)) ||
     (parsed.rejectedAt !== undefined && !isFiniteNumber(parsed.rejectedAt)) ||
     (parsed.expiredAt !== undefined && !isFiniteNumber(parsed.expiredAt)) ||
-    (parsed.cleanedAt !== undefined && !isFiniteNumber(parsed.cleanedAt))
+    (parsed.cleanedAt !== undefined && !isFiniteNumber(parsed.cleanedAt)) ||
+    (parsed.terminalReason !== undefined && !isRequestTerminalReason(parsed.terminalReason)) ||
+    (parsed.replacementHandle !== undefined && !isNonEmptyString(parsed.replacementHandle)) ||
+    (parsed.terminalResultSent !== undefined && parsed.terminalResultSent !== true && parsed.terminalResultSent !== false)
   ) {
     throw new Error("invalid request record format")
   }
@@ -174,6 +312,9 @@ async function markTerminalStatus(input: {
     ...current,
     status: input.status,
     [input.atField]: input.at,
+    terminalReason: input.status,
+    replacementHandle: undefined,
+    terminalResultSent: current.terminalResultSent === true,
   })
 }
 
@@ -443,16 +584,26 @@ export async function commitPreparedRecoveryRequestReopen(
     rejectedAt: undefined,
     expiredAt: undefined,
     cleanedAt: undefined,
+    terminalReason: undefined,
+    replacementHandle: undefined,
+    terminalResultSent: undefined,
   })
 
   try {
-    await rm(requestStatePath(prepared.originalRequest.kind, prepared.originalRequest.routeKey), { force: true })
+    if (current.terminalResultSent !== true) {
+      await markTerminalMetadata({
+        kind: current.kind,
+        routeKey: current.routeKey,
+        terminalReason: "replaced",
+        replacementHandle: prepared.nextHandle,
+      })
+    }
   } catch (error) {
     try {
       await rm(requestStatePath(prepared.originalRequest.kind, prepared.nextRouteKey), { force: true })
     } catch (cleanupError) {
       throw new Error(
-        `failed to cleanup fresh recovery request after original removal failure: ${toErrorMessage(cleanupError)}`,
+        `failed to cleanup fresh recovery request after original metadata update failure: ${toErrorMessage(cleanupError)}`,
       )
     }
     throw error
@@ -474,10 +625,7 @@ export async function rollbackPreparedRecoveryRequestReopen(
   }
 
   try {
-    const original = await readRequestIfExists(prepared.originalRequest.kind, prepared.originalRequest.routeKey)
-    if (!original) {
-      await writeRequest(prepared.originalRequest)
-    }
+    await writeRequest(prepared.originalRequest)
   } catch (error) {
     restoreOriginalError = new Error(toErrorMessage(error))
   }
@@ -535,10 +683,28 @@ export async function markCleaned(input: {
     throw new Error("request cannot be cleaned from current status")
   }
   return writeRequest({
-    ...current,
+    ...normalizeTerminalMetadata(current),
     status: "cleaned",
     cleanedAt: input.cleanedAt,
   })
+}
+
+async function listStoredRequests(kind: WechatRequestKind): Promise<RequestRecord[]> {
+  await ensureWechatStateLayout()
+  const dir = requestKindDir(kind)
+  const files = await readdir(dir).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return []
+    throw error
+  })
+
+  const records: RequestRecord[] = []
+  for (const fileName of files) {
+    if (!fileName.endsWith(".json")) continue
+    const routeKey = fileName.slice(0, -5)
+    records.push(await readRequest(kind, routeKey))
+  }
+  records.sort((a, b) => a.createdAt - b.createdAt)
+  return records
 }
 
 export async function purgeCleanedBefore(input: { cutoffAt: number }) {
@@ -574,20 +740,11 @@ export async function purgeCleanedRequestsBefore(input: { cutoffAt: number }) {
 }
 
 export async function listActiveRequests(): Promise<RequestRecord[]> {
-  await ensureWechatStateLayout()
   const result: RequestRecord[] = []
 
   for (const kind of ["question", "permission"] as const) {
-    const dir = requestKindDir(kind)
-    const files = await readdir(dir).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return []
-      throw error
-    })
-
-    for (const fileName of files) {
-      if (!fileName.endsWith(".json")) continue
-      const routeKey = fileName.slice(0, -5)
-      const current = await readRequest(kind, routeKey)
+    const records = await listStoredRequests(kind)
+    for (const current of records) {
       if (current.status === "cleaned") continue
       result.push(current)
     }
@@ -608,6 +765,21 @@ export async function findOpenRequestByHandle(input: {
   const normalizedHandle = normalizeHandle(input.handle)
   const all = await listActiveRequests()
   return all.find((item) => item.kind === input.kind && item.status === "open" && item.handle === normalizedHandle)
+}
+
+export async function findTerminalRequestByHandle(input: {
+  kind: WechatRequestKind
+  handle: string
+}): Promise<RequestRecord | undefined> {
+  if (!isRequestKind((input as { kind: unknown }).kind) || !isNonEmptyString((input as { handle: unknown }).handle)) {
+    throw new Error("invalid request record format")
+  }
+
+  const normalizedHandle = normalizeHandle(input.handle)
+  const all = await listStoredRequests(input.kind)
+  const matches = all.filter((item) => item.status !== "open" && item.handle === normalizedHandle)
+  matches.sort((left, right) => terminalSortTimestamp(right) - terminalSortTimestamp(left))
+  return matches[0]
 }
 
 export async function findOpenRequestByIdentity(input: {
@@ -653,4 +825,67 @@ export async function findRequestByRouteKey(input: {
 
   assertValidRouteKey(input.routeKey)
   return readRequestIfExists(input.kind, input.routeKey)
+}
+
+export async function markTerminalMetadata(input: {
+  kind: WechatRequestKind
+  routeKey: string
+  terminalReason: RequestTerminalReason
+  replacementHandle?: string
+}) {
+  if (
+    !isRequestKind((input as { kind: unknown }).kind)
+    || !isNonEmptyString((input as { routeKey: unknown }).routeKey)
+    || !isRequestTerminalReason((input as { terminalReason: unknown }).terminalReason)
+  ) {
+    throw new Error("invalid request record format")
+  }
+  if ((input as { replacementHandle?: unknown }).replacementHandle !== undefined && !isNonEmptyString(input.replacementHandle)) {
+    throw new Error("invalid request record format")
+  }
+
+  assertValidRouteKey(input.routeKey)
+  const current = await readRequest(input.kind, input.routeKey)
+  if (current.status === "open") {
+    throw new Error("request is still open")
+  }
+
+  const selected = selectHigherPriorityTerminalReason({
+    currentReason: current.terminalReason,
+    currentReplacementHandle: current.replacementHandle,
+    nextReason: input.terminalReason,
+    nextReplacementHandle: input.replacementHandle,
+  })
+
+  return writeRequest({
+    ...current,
+    terminalReason: selected.terminalReason,
+    replacementHandle: selected.replacementHandle,
+    terminalResultSent: current.terminalResultSent === true,
+  })
+}
+
+export async function markTerminalResultSent(input: {
+  kind: WechatRequestKind
+  routeKey: string
+  sentAt: number
+}) {
+  if (
+    !isRequestKind((input as { kind: unknown }).kind)
+    || !isNonEmptyString((input as { routeKey: unknown }).routeKey)
+    || !isFiniteNumber((input as { sentAt: unknown }).sentAt)
+  ) {
+    throw new Error("invalid request record format")
+  }
+
+  assertValidRouteKey(input.routeKey)
+  const current = await readRequest(input.kind, input.routeKey)
+  if (current.status === "open") {
+    throw new Error("request is still open")
+  }
+
+  return writeRequest({
+    ...current,
+    terminalResultSent: true,
+  })
 }

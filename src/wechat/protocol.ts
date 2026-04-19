@@ -14,6 +14,8 @@ export type BrokerFutureMessageType =
   | "collectStatus"
   | "replyQuestion"
   | "replyQuestionResult"
+  | "replyNaturalStop"
+  | "replyNaturalStopResult"
   | "rejectQuestion"
   | "replyPermission"
   | "replyPermissionResult"
@@ -59,6 +61,17 @@ export type ReplyPermissionPayload = {
   message?: string
 }
 
+export type ReplyNaturalStopPayload = {
+  mutationId: string
+  sessionID: string
+  text: string
+}
+
+export type SessionReplyTarget = {
+  instanceID: string
+  sessionID: string
+}
+
 export type WechatNotificationCandidate =
   | {
       idempotencyKey: string
@@ -73,6 +86,20 @@ export type WechatNotificationCandidate =
       idempotencyKey: string
       kind: "sessionError"
       createdAt: number
+      sessionID: string
+      action: string
+      redactedSummary: string
+      severityAdvice: string
+    }
+  | {
+      idempotencyKey: string
+      kind: "naturalStop"
+      createdAt: number
+      sessionID: string
+      handle: string
+      replyTarget: SessionReplyTarget
+      redactedSummary: string
+      severityAdvice: string
     }
 
 export type SyncWechatNotificationsPayload = {
@@ -115,6 +142,8 @@ function isMessageType(value: unknown): value is BrokerMessageType {
     value === "collectStatus" ||
     value === "replyQuestion" ||
     value === "replyQuestionResult" ||
+    value === "replyNaturalStop" ||
+    value === "replyNaturalStopResult" ||
     value === "rejectQuestion" ||
     value === "replyPermission" ||
     value === "replyPermissionResult" ||

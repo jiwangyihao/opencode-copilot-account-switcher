@@ -11,6 +11,7 @@ export type QuestionPromptSummary = {
     index: number
     label: string
     value: string
+    description?: string
   }>
 }
 
@@ -39,7 +40,7 @@ function normalizeQuestionPromptSummary(input: unknown): QuestionPromptSummary {
 
   const options = Array.isArray(record.options)
     ? record.options.map((option) => {
-        const item = option as { index?: unknown; label?: unknown; value?: unknown }
+        const item = option as { index?: unknown; label?: unknown; value?: unknown; description?: unknown }
         if (!isFiniteNumber(item.index) || !isNonEmptyString(item.label) || !isNonEmptyString(item.value)) {
           throw new Error("invalid request prompt format")
         }
@@ -47,6 +48,7 @@ function normalizeQuestionPromptSummary(input: unknown): QuestionPromptSummary {
           index: item.index,
           label: item.label,
           value: item.value,
+          ...(isNonEmptyString(item.description) ? { description: item.description.trim() } : {}),
         }
       })
     : undefined
@@ -93,6 +95,7 @@ export function extractQuestionPromptSummary(question: QuestionRequest): Questio
           index: index + 1,
           label: option.label.trim(),
           value: option.label.trim(),
+          ...(isNonEmptyString(option?.description) ? { description: option.description.trim() } : {}),
         }))
     : undefined
 

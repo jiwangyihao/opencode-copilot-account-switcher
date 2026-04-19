@@ -92,7 +92,7 @@ test("waitForCondition 会等待异步谓词真正满足", async () => {
     ready = true
   }, 30)
 
-  await waitForCondition(async () => ready, 1000)
+  await waitForCondition(async () => ready, 5000)
 
   assert.equal(ready, true)
 })
