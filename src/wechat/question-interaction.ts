@@ -103,7 +103,7 @@ export function extractQuestionPromptSummary(question: QuestionRequest): Questio
     title: isNonEmptyString(first.header) ? first.header : undefined,
     body: isNonEmptyString(first.question) ? first.question : undefined,
     mode,
-    custom: first.custom === true,
+    custom: first.custom !== false,
     options,
   })
 }

@@ -4562,6 +4562,54 @@ test("broker-entry slash handler: /reply 单选题且允许自定义时，自由
   assert.deepEqual(replyCalls, [{ requestID: "q-reply-single-custom-text-1", answers: [["请直接发到 preview 环境"]] }])
 })
 
+test("broker-entry slash handler: /reply 单选题在 custom 字段缺失时默认仍允许自定义回答", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-reply-single-default-custom-text`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-reply-single-default-custom-text-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-reply-single-default-custom-text-request-store`)
+  const questionInteraction = await import(`../dist/wechat/question-interaction.js?reload=${Date.now()}-reply-single-default-custom-text-question`)
+
+  const replyCalls = []
+  const routeKey = handle.createRouteKey({ kind: "question", requestID: "q-reply-single-default-custom-text-1" })
+  await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-reply-single-default-custom-text-1",
+    routeKey,
+    handle: "qsingledefaultcustom1",
+    wechatAccountId: "wx-reply-single-default-custom",
+    userId: "u-reply-single-default-custom",
+    createdAt: 1_700_600_239_000,
+    prompt: questionInteraction.extractQuestionPromptSummary({
+      questions: [
+        {
+          header: "请选择发布环境",
+          question: "可以直接给出自定义说明。",
+          options: [
+            { label: "staging" },
+            { label: "production" },
+          ],
+        },
+      ],
+    }),
+  })
+
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    handleStatusCommand: async () => "status reply",
+    client: {
+      question: {
+        reply: async (input) => {
+          replyCalls.push(input)
+          return { data: true }
+        },
+      },
+      permission: {},
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qsingledefaultcustom1", text: "请直接发到 preview 环境" })
+  assert.equal(result, "已回复问题：qsingledefaultcustom1")
+  assert.deepEqual(replyCalls, [{ requestID: "q-reply-single-default-custom-text-1", answers: [["请直接发到 preview 环境"]] }])
+})
+
 test("broker-entry slash handler: /reply 单选题且允许自定义时，编号输入仍走结构化选项答案", async () => {
   const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-reply-single-custom-number`)
   const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-reply-single-custom-number-handle`)
@@ -4649,6 +4697,56 @@ test("broker-entry slash handler: /reply 多选题且允许自定义时，自由
   const result = await handler({ type: "reply", handle: "qmulticustom1", text: "请额外通知 canary 环境" })
   assert.equal(result, "已回复问题：qmulticustom1")
   assert.deepEqual(replyCalls, [{ requestID: "q-reply-multiple-custom-text-1", answers: [["请额外通知 canary 环境"]] }])
+})
+
+test("broker-entry slash handler: /reply 多选题在 custom 字段缺失时默认仍允许自定义回答", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-reply-multiple-default-custom-text`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-reply-multiple-default-custom-text-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-reply-multiple-default-custom-text-request-store`)
+  const questionInteraction = await import(`../dist/wechat/question-interaction.js?reload=${Date.now()}-reply-multiple-default-custom-text-question`)
+
+  const replyCalls = []
+  const routeKey = handle.createRouteKey({ kind: "question", requestID: "q-reply-multiple-default-custom-text-1" })
+  await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-reply-multiple-default-custom-text-1",
+    routeKey,
+    handle: "qmultidefaultcustom1",
+    wechatAccountId: "wx-reply-multi-default-custom",
+    userId: "u-reply-multi-default-custom",
+    createdAt: 1_700_600_259_000,
+    prompt: questionInteraction.extractQuestionPromptSummary({
+      questions: [
+        {
+          header: "请选择需要通知的环境",
+          question: "可以直接写补充说明。",
+          multiple: true,
+          options: [
+            { label: "staging" },
+            { label: "production" },
+            { label: "preview" },
+          ],
+        },
+      ],
+    }),
+  })
+
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    handleStatusCommand: async () => "status reply",
+    client: {
+      question: {
+        reply: async (input) => {
+          replyCalls.push(input)
+          return { data: true }
+        },
+      },
+      permission: {},
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qmultidefaultcustom1", text: "请额外通知 canary 环境" })
+  assert.equal(result, "已回复问题：qmultidefaultcustom1")
+  assert.deepEqual(replyCalls, [{ requestID: "q-reply-multiple-default-custom-text-1", answers: [["请额外通知 canary 环境"]] }])
 })
 
 test("broker-entry slash handler: /reply 多选题且允许自定义时，编号输入仍走结构化多值答案", async () => {

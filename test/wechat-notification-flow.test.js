@@ -2172,6 +2172,41 @@ test("通知文案格式化：question 说明会穿过 extractQuestionPromptSumm
   assert.match(questionText, /1\. 灰度发布\n先给少量用户验证/)
 })
 
+test("通知文案格式化：question 在 custom 字段缺失时默认仍展示自定义回复示例", async () => {
+  const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-question-summary-default-custom`)
+  const questionInteraction = await import(`${DIST_QUESTION_INTERACTION_MODULE}?reload=${Date.now()}-question-summary-default-custom`)
+
+  const prompt = questionInteraction.extractQuestionPromptSummary({
+    questions: [
+      {
+        header: "请选择发布策略",
+        question: "请优先选择一条可执行路径。",
+        options: [
+          { label: "灰度发布", description: "先给少量用户验证" },
+          { label: "全量发布" },
+        ],
+      },
+    ],
+  })
+
+  assert.equal(prompt?.custom, true)
+
+  const questionText = notificationFormat.formatWechatNotificationText({
+    idempotencyKey: "question-summary-default-custom-1",
+    kind: "question",
+    wechatAccountId: "wx-main",
+    userId: "u-main",
+    routeKey: "route-question-summary-default-custom-1",
+    handle: "qdefaultcustom1",
+    createdAt: 1_700_600_100_141,
+    status: "pending",
+    prompt,
+  })
+
+  const lines = questionText.split("\n")
+  assert(lines.includes("/reply qdefaultcustom1 你的自定义回答"))
+})
+
 test("通知文案格式化：question 与 permission 示例都逐行独立", async () => {
   const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-question-permission-copy-lines`)
 
