@@ -4,6 +4,12 @@
 [![npm downloads](https://img.shields.io/npm/dw/opencode-copilot-account-switcher.svg)](https://www.npmjs.com/package/opencode-copilot-account-switcher)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-brightgreen.svg)](LICENSE)
 
+> **Latest in v0.14.46 | v0.14.46 最近更新**
+>
+> - Line-by-line question / permission examples for easier WeChat copy | question / permission 示例逐行独立，更方便在微信里整行复制
+> - Closed qid / handle entries now return explicit terminal reasons | 电脑端结束后旧 qid / handle 会回收，并给出明确终结原因
+> - natural-stop stays replyable, while retry / error summaries are easier to scan | natural-stop 可继续 `/reply`，retry / error 摘要更容易看懂
+
 [中文](#中文) | [English](#english)
 
 ---
@@ -35,6 +41,39 @@
 - **`/copilot-inject`** — 默认开启；无参数实验性强干预开关，下一次非 `question` 工具输出会自动附加 marker，要求模型立刻调用 `question`
 - **`wait` 工具** — 默认开启；最短等待 30 秒，返回开始时间、等待秒数和当前时间
 - **无需模型配置** — 使用官方 provider，无需改模型
+
+## 微信通知功能
+
+微信通知现在会覆盖 5 类常见场景。你看到通知时，可以先判断它是不是可回复入口，再决定是直接在微信里继续，还是回到电脑端处理。
+
+- **question**：当 Agent 需要你的明确回答时，你会收到带 `qid` 的问题通知；这是可回复入口；下一步直接发送 `/reply <qid> 你的回复`。
+- **permission**：当工具或动作需要你授权时，你会收到带 `handle` 的授权请求；这是可处理入口；下一步发送 `/allow <handle> once|always|reject`。
+- **terminal result**：当电脑端已经把旧 question 或 permission 处理完、拒绝、过期或替代时，你会先收到一条终结结果通知；这不是新的可回复入口；下一步按通知里的结果判断是否还需要回到电脑端继续。
+- **natural-stop**：当 Agent 自然停在一个可继续的分支并等你补充信息时，你会收到带 `s*` 标识的停点通知；这是可回复入口；下一步发送 `/reply <s*> 你的补充内容`。
+- **retry / error**：当执行过程中出现普通重试或错误摘要时，你会收到一条信息型说明；这不是可回复入口；下一步根据摘要判断是否继续观察，或回到电脑端处理。
+
+### 什么时候可以直接回复
+
+- question：`/reply <qid> 你的回复`
+- permission：`/allow <handle> once|always|reject`
+- natural-stop：`/reply <s*> 你的补充内容`
+
+### 电脑端终结后会发生什么
+
+- 如果电脑端已经回复、拒绝、过期或替代了某个旧入口，微信侧会先收到一条终结结果通知，告诉你这个入口为什么结束。
+- 这个旧 `qid` / `handle` 随后会失效，不会继续悬挂成可回复入口。
+- 你之后再发一次对应的 `/reply ...` 或 `/allow ...`，会收到稳定的“已结束 + 原因”提示，而不是没有反应。
+
+### natural-stop 和 retry / error 的区别
+
+- `natural-stop` 是可回复分支，表示 Agent 还在等你的补充，你可以继续用 `/reply <s*> ...` 往下接。
+- 普通 `retry / error` 是信息型摘要，不是可回复入口；如果摘要显示问题还在，通常需要你回到电脑端继续处理。
+
+### 为什么现在更容易复制
+
+- question / permission 的命令示例会逐行独立展示，你在微信里更容易整行复制。
+- question 里的选项如果有标题和说明，会一起显示出来，减少只复制到半句的情况。
+- 可回复入口和信息型摘要现在分得更清楚，不容易把不能回复的通知误当成命令入口。
 
 ---
 
@@ -268,6 +307,40 @@ Default behavior and optional switches:
 - **`/copilot-inject`** — enabled by default; no-arg force-intervention command that appends a marker to the next non-`question` tool output to force immediate `question`
 - **`wait` tool** — enabled by default; minimum wait is 30 seconds and response contains start/wait/current timestamps
 - **Zero model config** — no model changes required (official provider only)
+
+## WeChat Notifications
+
+### Overview
+
+WeChat notifications now cover five user-facing cases. Each one tells you whether you can keep going in WeChat or should return to desktop first.
+
+- **question** — a replyable question with a `qid`; next step: send `/reply <qid> your answer`.
+- **permission** — a replyable permission request with a `handle`; next step: send `/allow <handle> once|always|reject`.
+- **terminal result** — a closure notice after an old question or permission was already resolved, rejected, expired, or replaced on the desktop side; informational only; next step: use the closure result to decide whether you still need to return to desktop.
+- **natural-stop** — a replyable stop point with an `s*` handle when the agent is waiting for more input; next step: send `/reply <s*> your follow-up`.
+- **retry / error** — an informational-only summary for ordinary retries or errors, not a replyable entry; next step: use it to decide whether to keep watching or return to desktop.
+
+### Replyable entries
+
+- question: `/reply <qid> your answer`
+- permission: `/allow <handle> once|always|reject`
+- natural-stop: `/reply <s*> your follow-up`
+
+### After desktop-side completion
+
+- You first receive a terminal result notification explaining that the old entry has ended.
+- That old `qid` / `handle` is no longer replyable.
+- If you send the old `/reply ...` or `/allow ...` again later, you get a stable closed reason instead of a silent no-op.
+
+### natural-stop vs retry / error
+
+- `natural-stop` is replyable and means the agent is explicitly waiting for more input.
+- Ordinary `retry / error` is informational only, not a replyable entry.
+
+### Copy-friendly message format
+
+- Command examples stay on their own lines so they are easier to copy from WeChat.
+- When question options include both a title and an explanation, both are shown together.
 
 ---
 
