@@ -24,6 +24,9 @@ import {
 import { readOperatorBinding } from "./operator-store.js"
 import { createHandle, createRouteKey, createSessionReplyHandle } from "./handle.js"
 import type {
+  BrokerToBridgeCommand,
+  BrokerToBridgeControl,
+  BridgeToBrokerEvent,
   BrokerEnvelope,
   ReplyMutationResult,
   ReplyNaturalStopPayload,
@@ -120,6 +123,8 @@ export type WechatBridgeLifecycle = {
 
 const DEFAULT_LIVE_READ_TIMEOUT_MS = 2_000
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000
+const DEFAULT_BRIDGE_PROTOCOL_VERSION = 2
+const DEFAULT_BRIDGE_STATE_GENERATION = "wechat-ws-v1"
 const PROCESS_INSTANCE_ID = toSafeInstanceID(`wechat-${process.pid}-${randomUUID().slice(0, 8)}`)
 
 type WechatBridgeLifecycleDeps = {
@@ -888,13 +893,287 @@ export async function createWechatBridgeLifecycle(
   })
 
   let brokerClient!: Awaited<ReturnType<typeof connect>>
+  const instanceIncarnation = randomUUID()
+  let lastSeenBrokerSeq = 0
+  let nextEventSeq = 0
+  let lastSentEventSeq = 0
+  let lastAckedEventSeq = 0
+  let stagedRegisterFullSyncCandidates: WechatNotificationCandidate[] | null = null
+  const bridgeEventLog: BridgeToBrokerEvent[] = []
+
+  const supportsLiveBrokerClient = (candidate: unknown): candidate is Awaited<ReturnType<typeof connect>> => {
+    if (typeof candidate !== "object" || candidate === null) {
+      return false
+    }
+    return typeof (candidate as { setLiveHandlers?: unknown }).setLiveHandlers === "function"
+      && typeof (candidate as { registerHello?: unknown }).registerHello === "function"
+      && typeof (candidate as { ping?: unknown }).ping === "function"
+    }
+
+  const supportsCompatBrokerClient = (candidate: unknown): candidate is {
+    registerInstance: (meta: { instanceID: string; pid: number }) => Promise<unknown>
+    heartbeat: () => Promise<unknown>
+  } => {
+    if (typeof candidate !== "object" || candidate === null) {
+      return false
+    }
+    return typeof (candidate as { registerInstance?: unknown }).registerInstance === "function"
+      && typeof (candidate as { heartbeat?: unknown }).heartbeat === "function"
+  }
+
+  function trimAckedBridgeEvents(ackedEventSeq: number) {
+    if (!Number.isSafeInteger(ackedEventSeq) || ackedEventSeq <= lastAckedEventSeq) {
+      return
+    }
+
+    lastAckedEventSeq = ackedEventSeq
+    const firstUnackedIndex = bridgeEventLog.findIndex((event) => event.eventSeq > ackedEventSeq)
+    if (firstUnackedIndex === -1) {
+      bridgeEventLog.length = 0
+      return
+    }
+
+    bridgeEventLog.splice(0, firstUnackedIndex)
+  }
+
+  function createSequencedEvent(
+    type: BridgeToBrokerEvent["type"],
+    payload: Record<string, unknown>,
+    options: { controlId?: string } = {},
+  ): BridgeToBrokerEvent {
+    nextEventSeq += 1
+    return {
+      type,
+      eventSeq: nextEventSeq,
+      instanceIncarnation,
+      payload: {
+        instanceID,
+        ...payload,
+      },
+      ...(options.controlId ? { controlId: options.controlId } : {}),
+    }
+  }
+
+  async function sendSequencedEvent(
+    event: BridgeToBrokerEvent,
+    options: { persist?: boolean; controlId?: string } = {},
+  ) {
+    if (options.persist !== false) {
+      bridgeEventLog.push(event)
+    }
+
+    lastSentEventSeq = Math.max(lastSentEventSeq, event.eventSeq)
+
+    const ack = await brokerClient.sendBridgeEvent(event, {
+      instanceID,
+      ...(options.controlId ?? event.controlId ? { controlId: options.controlId ?? event.controlId } : {}),
+    })
+    trimAckedBridgeEvents(ack.ackedEventSeq)
+  }
+
+  function toCandidateEvent(
+    candidate: WechatNotificationCandidate,
+    controlId: string,
+  ): BridgeToBrokerEvent | null {
+    if (candidate.kind === "question") {
+      return createSequencedEvent("questionOpened", {
+        requestID: candidate.requestID,
+        routeKey: candidate.routeKey,
+        handle: candidate.handle,
+        updatedAt: candidate.createdAt,
+      }, { controlId })
+    }
+
+    if (candidate.kind === "permission") {
+      return createSequencedEvent("permissionOpened", {
+        requestID: candidate.requestID,
+        routeKey: candidate.routeKey,
+        handle: candidate.handle,
+        updatedAt: candidate.createdAt,
+      }, { controlId })
+    }
+
+    if (candidate.kind === "naturalStop") {
+      return createSequencedEvent("naturalStopOpened", {
+        handle: candidate.handle,
+        replyTarget: candidate.replyTarget,
+        redactedSummary: candidate.redactedSummary,
+        severityAdvice: candidate.severityAdvice,
+        updatedAt: candidate.createdAt,
+      }, { controlId })
+    }
+
+    if (candidate.kind === "sessionError") {
+      return createSequencedEvent("retryErrorUpdated", {
+        sessionID: candidate.sessionID,
+        action: candidate.action,
+        redactedSummary: candidate.redactedSummary,
+        severityAdvice: candidate.severityAdvice,
+        updatedAt: candidate.createdAt,
+      }, { controlId })
+    }
+
+    return null
+  }
+
+  async function handleReplayControl(control: BrokerToBridgeControl) {
+    const payload = control.payload as {
+      fromEventSeq?: unknown
+      toEventSeq?: unknown
+    }
+    const fromEventSeq = typeof payload.fromEventSeq === "number" ? payload.fromEventSeq : undefined
+    const toEventSeq = typeof payload.toEventSeq === "number" ? payload.toEventSeq : undefined
+    if (fromEventSeq === undefined || toEventSeq === undefined) {
+      return
+    }
+
+    for (const event of bridgeEventLog) {
+      if (event.eventSeq < fromEventSeq || event.eventSeq > toEventSeq) {
+        continue
+      }
+      await sendSequencedEvent(event, {
+        persist: false,
+        controlId: control.controlId,
+      })
+    }
+  }
+
+  async function handleFullSyncControl(control: BrokerToBridgeControl) {
+    await sendSequencedEvent(createSequencedEvent("instanceOnline", {
+      connectedAt: Date.now(),
+      pid: process.pid,
+      displayName: toInstanceName(projectName, directory),
+      projectDir: directory,
+    }, { controlId: control.controlId }))
+
+    const candidates = stagedRegisterFullSyncCandidates ?? await bridge.collectNotificationCandidates()
+    stagedRegisterFullSyncCandidates = null
+    for (const candidate of candidates) {
+      const event = toCandidateEvent(candidate, control.controlId)
+      if (!event) {
+        continue
+      }
+      await sendSequencedEvent(event)
+    }
+
+    await sendSequencedEvent(createSequencedEvent("fullSyncCompleted", {
+      controlId: control.controlId,
+    }, { controlId: control.controlId }))
+  }
+
+  async function handleBrokerControl(control: BrokerToBridgeControl) {
+    lastSeenBrokerSeq = Math.max(lastSeenBrokerSeq, control.brokerSeq)
+    if (control.type === "requestReplay") {
+      await handleReplayControl(control)
+      return
+    }
+    await handleFullSyncControl(control)
+  }
+
+  async function handleBrokerCommand(command: BrokerToBridgeCommand) {
+    lastSeenBrokerSeq = Math.max(lastSeenBrokerSeq, command.brokerSeq)
+
+    if (!bridge.handleBrokerEnvelope) {
+      await sendSequencedEvent(createSequencedEvent("commandResult", {
+        commandId: command.commandId,
+        status: "failed",
+        completedAt: Date.now(),
+        failure: {
+          message: `${command.type} unavailable`,
+        },
+      }))
+      return
+    }
+
+    await sendSequencedEvent(createSequencedEvent("commandAccepted", {
+      commandId: command.commandId,
+      acceptedAt: Date.now(),
+    }))
+
+    let result: BrokerEnvelope | null = null
+    try {
+      result = await bridge.handleBrokerEnvelope({
+        id: command.commandId,
+        type: command.type,
+        payload: command.payload,
+      })
+    } catch (error) {
+      await sendSequencedEvent(createSequencedEvent("commandResult", {
+        commandId: command.commandId,
+        status: "failed",
+        completedAt: Date.now(),
+        failure: {
+          message: toDiagnosticErrorMessage(error),
+        },
+      }))
+      return
+    }
+
+    const payload = result?.payload as Partial<ReplyMutationResult> | undefined
+    const succeeded = payload?.ok === true
+    await sendSequencedEvent(createSequencedEvent("commandResult", {
+      commandId: command.commandId,
+      status: succeeded ? "completed" : "failed",
+      completedAt: Date.now(),
+      ...(succeeded
+        ? {}
+        : {
+            failure: {
+              message: payload?.errorMessage ?? `${command.type} failed`,
+            },
+          }),
+    }))
+  }
+
+  async function processRegisterResult(result: Awaited<ReturnType<typeof brokerClient.registerHello>>) {
+    lastSeenBrokerSeq = Math.max(lastSeenBrokerSeq, result.ack.brokerSeq)
+
+    if (result.control) {
+      await handleBrokerControl(result.control)
+    }
+
+    for (const command of result.pendingCommands) {
+      await handleBrokerCommand(command)
+    }
+  }
 
   async function registerCurrentBrokerClient() {
     try {
+      const currentBrokerClient = brokerClient as unknown
+      if (!supportsLiveBrokerClient(currentBrokerClient)) {
+        if (!supportsCompatBrokerClient(currentBrokerClient)) {
+          throw new TypeError("broker client does not support live or compat registration")
+        }
+        await currentBrokerClient.registerInstance({
+          instanceID,
+          pid: process.pid,
+        })
+        return
+      }
+
+      brokerClient.setLiveHandlers({
+        onBrokerControl: (control) => handleBrokerControl(control),
+        onBrokerCommand: (command) => handleBrokerCommand(command),
+      })
+
+      const registerResult = await brokerClient.registerHello({
+        protocolVersion: DEFAULT_BRIDGE_PROTOCOL_VERSION,
+        stateGeneration: DEFAULT_BRIDGE_STATE_GENERATION,
+        instanceID,
+        instanceIncarnation,
+        lastSeenBrokerSeq,
+        lastSentEventSeq,
+      })
+      stagedRegisterFullSyncCandidates = registerResult.control?.type === "requestFullSync"
+        ? await bridge.collectNotificationCandidates()
+        : null
       await brokerClient.registerInstance({
         instanceID,
         pid: process.pid,
-      })
+      }, stagedRegisterFullSyncCandidates
+        ? { notificationCandidates: stagedRegisterFullSyncCandidates }
+        : undefined)
+      await processRegisterResult(registerResult)
     } catch (error) {
       await brokerClient.close().catch(() => {})
       throw error
@@ -942,7 +1221,6 @@ export async function createWechatBridgeLifecycle(
 
       try {
         await registerCurrentBrokerClient()
-        await bridge.resyncBrokerState?.({ reason: "brokerReconnect" })
       } catch (error) {
         await nextBrokerClient.close().catch(() => {})
         throw error
@@ -958,7 +1236,13 @@ export async function createWechatBridgeLifecycle(
     if (closed) {
       return
     }
-    void brokerClient.heartbeat().catch(() => reconnectBrokerClient().catch(() => {}))
+    const currentBrokerClient = brokerClient as unknown
+    const heartbeatPromise = supportsLiveBrokerClient(currentBrokerClient)
+      ? currentBrokerClient.ping()
+      : supportsCompatBrokerClient(currentBrokerClient)
+        ? currentBrokerClient.heartbeat()
+        : Promise.reject(new TypeError("broker client does not support keepalive"))
+    void heartbeatPromise.catch(() => reconnectBrokerClient().catch(() => {}))
   }, heartbeatIntervalMs)
 
   return {

@@ -1,4 +1,5 @@
 import type { WechatInstanceStatusSnapshot } from "./bridge.js"
+import type { BrokerAuthoritativeView } from "./broker-state-store.js"
 import type { SessionDigest, SessionDigestHighlight, SessionDigestTodoItem } from "./session-digest.js"
 
 export type AggregatedStatusInstance =
@@ -219,6 +220,96 @@ function formatTodoItem(todo: SessionDigestTodoItem): string {
   return `${prefix} ${todo.content}`
 }
 
+function listBrokerViewInstanceIDs(view: BrokerAuthoritativeView): string[] {
+  const ids = new Set<string>()
+
+  for (const instanceID of Object.keys(view.connections)) {
+    if (instanceID.trim().length > 0) {
+      ids.add(instanceID)
+    }
+  }
+
+  for (const instanceID of Object.keys(view.active.instances)) {
+    if (instanceID.trim().length > 0) {
+      ids.add(instanceID)
+    }
+  }
+
+  for (const record of Object.values(view.active.sessions)) {
+    const candidate = isNonEmptyString(asObject(record).instanceID) ? String(asObject(record).instanceID).trim() : ""
+    if (candidate.length > 0) {
+      ids.add(candidate)
+    }
+  }
+
+  return [...ids].sort((left, right) => left.localeCompare(right))
+}
+
+function countActiveItemsBySession(
+  records: Record<string, Record<string, unknown>>,
+  instanceID: string,
+  sessionID: string,
+): number {
+  return Object.values(records).filter((record) => (
+    asObject(record).instanceID === instanceID && asObject(record).sessionID === sessionID
+  )).length
+}
+
+function buildBrokerViewSnapshot(view: BrokerAuthoritativeView, instanceID: string): WechatInstanceStatusSnapshot {
+  const instanceRecord = asObject(view.active.instances[instanceID])
+  const sessions = Object.values(view.active.sessions)
+    .map((record) => asObject(record))
+    .filter((record) => record.instanceID === instanceID && isNonEmptyString(record.sessionID))
+    .map((record) => ({
+      sessionID: String(record.sessionID).trim(),
+      title: isNonEmptyString(record.title) ? record.title : "",
+      directory: isNonEmptyString(record.directory) ? record.directory : "",
+      updatedAt: toFiniteNumber(record.updatedAt),
+      status: (
+        record.status === "busy" || record.status === "idle" || record.status === "retry" || record.status === "unknown"
+          ? record.status
+          : "unknown"
+      ) as SessionDigest["status"],
+      pendingQuestionCount:
+        typeof record.pendingQuestionCount === "number"
+          ? record.pendingQuestionCount
+          : countActiveItemsBySession(view.active.questions, instanceID, String(record.sessionID).trim()),
+      pendingPermissionCount:
+        typeof record.pendingPermissionCount === "number"
+          ? record.pendingPermissionCount
+          : countActiveItemsBySession(view.active.permissions, instanceID, String(record.sessionID).trim()),
+      todoSummary: {
+        total: toFiniteNumber(asObject(record.todoSummary).total),
+        inProgress: toFiniteNumber(asObject(record.todoSummary).inProgress),
+        completed: toFiniteNumber(asObject(record.todoSummary).completed),
+      },
+      unavailable: toSessionUnavailable(record.unavailable),
+      highlights: Array.isArray(record.highlights) ? record.highlights : [],
+      ...(Array.isArray(record.todoItems) ? { todoItems: record.todoItems } : {}),
+      ...(Array.isArray(record.questionHighlights) ? { questionHighlights: record.questionHighlights } : {}),
+    }))
+
+  return {
+    instanceID,
+    instanceName:
+      (isNonEmptyString(instanceRecord.displayName) ? instanceRecord.displayName : undefined)
+      ?? (isNonEmptyString(instanceRecord.instanceName) ? instanceRecord.instanceName : undefined)
+      ?? "",
+    pid: typeof instanceRecord.pid === "number" && Number.isFinite(instanceRecord.pid) ? instanceRecord.pid : 0,
+    projectName: isNonEmptyString(instanceRecord.projectName) ? instanceRecord.projectName : undefined,
+    directory:
+      (isNonEmptyString(instanceRecord.projectDir) ? instanceRecord.projectDir : undefined)
+      ?? (isNonEmptyString(instanceRecord.directory) ? instanceRecord.directory : undefined)
+      ?? "",
+    collectedAt:
+      (typeof instanceRecord.updatedAt === "number" && Number.isFinite(instanceRecord.updatedAt) ? instanceRecord.updatedAt : undefined)
+      ?? (typeof instanceRecord.connectedAt === "number" && Number.isFinite(instanceRecord.connectedAt) ? instanceRecord.connectedAt : undefined)
+      ?? 0,
+    sessions,
+    unavailable: toInstanceUnavailable(instanceRecord.unavailable) as WechatInstanceStatusSnapshot["unavailable"],
+  }
+}
+
 export function formatInstanceStatusSnapshot(snapshotInput: unknown): string {
   const snapshot = normalizeSnapshot(snapshotInput)
   const lines: string[] = []
@@ -307,4 +398,38 @@ export function formatAggregatedStatusReply(input: AggregatedStatusReplyInput): 
   }
 
   return sections.join("\n")
+}
+
+export function formatAggregatedStatusReplyFromBrokerView(view: BrokerAuthoritativeView | undefined): string {
+  if (!view) {
+    return formatAggregatedStatusReply({
+      requestId: "broker-authoritative-view",
+      instances: [],
+    })
+  }
+
+  const instances = listBrokerViewInstanceIDs(view).map((instanceID) => {
+    const instanceRecord = asObject(view.active.instances[instanceID])
+    const connectionGroup = view.connections[instanceID]
+    const isOnline = Object.values(connectionGroup ?? {}).some((connection) => connection.online)
+      || instanceRecord.online === true
+
+    if (!isOnline) {
+      return {
+        instanceID,
+        status: "timeout/unreachable" as const,
+      }
+    }
+
+    return {
+      instanceID,
+      status: "ok" as const,
+      snapshot: buildBrokerViewSnapshot(view, instanceID),
+    }
+  })
+
+  return formatAggregatedStatusReply({
+    requestId: "broker-authoritative-view",
+    instances,
+  })
 }

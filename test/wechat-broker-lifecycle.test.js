@@ -2480,7 +2480,10 @@ test("stale 恢复时 heartbeat 返回后，磁盘快照应已是 connected（�
     })
     assert.equal(heartbeatResponse.type, "pong")
 
-    const immediateDiskSnapshot = JSON.parse(await readFile(instancePath, "utf8"))
+    const immediateDiskSnapshot = await waitForInstanceSnapshot(
+      instancePath,
+      (snapshot) => snapshot.status === "connected" && !("staleSince" in snapshot),
+    )
     assert.equal(immediateDiskSnapshot.status, "connected")
     assert.equal("staleSince" in immediateDiskSnapshot, false)
 

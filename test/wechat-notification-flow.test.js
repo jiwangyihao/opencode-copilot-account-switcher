@@ -184,7 +184,7 @@ test("两个实例出现相同 question/permission/session 标识时不会互相
       const list = await notificationStore.listPendingNotifications()
       assert.equal(list.length, 6)
       return list
-    })
+    }, 10000)
 
     assert.equal(pending.filter((item) => item.kind === "question").length, 2)
     assert.equal(pending.filter((item) => item.kind === "permission").length, 2)

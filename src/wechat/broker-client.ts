@@ -1,10 +1,18 @@
 import { createBrokerSocket } from "./broker-endpoint.js"
 import {
+  createBridgeEventEnvelope,
+  createHelloRegisterEnvelope,
   parseEnvelopeLine,
   serializeEnvelope,
+  type BrokerAckPayload,
+  type BrokerToBridgeCommand,
+  type BrokerToBridgeControl,
   type BrokerEnvelope,
   type BrokerMessageType,
+  type BridgeToBrokerEvent,
   type CollectStatusPayload,
+  type HelloRegisterPayload,
+  type RegisterAckPayload,
   SHOW_FALLBACK_TOAST_DELIVERY_FAILED_REASON,
   type ShowFallbackToastPayload,
   type SyncWechatNotificationsPayload,
@@ -14,6 +22,10 @@ import type { WechatBridge } from "./bridge.js"
 type RegisterMeta = {
   instanceID: string
   pid: number
+}
+
+type RegisterInstanceOptions = {
+  notificationCandidates?: SyncWechatNotificationsPayload["candidates"]
 }
 
 export type RegisterAck = {
@@ -33,10 +45,20 @@ type SessionSnapshot = {
 
 type BrokerClient = {
   ping: () => Promise<BrokerEnvelope>
-  registerInstance: (meta: RegisterMeta) => Promise<RegisterAck>
+  registerInstance: (meta: RegisterMeta, options?: RegisterInstanceOptions) => Promise<RegisterAck>
+  registerHello: (payload: HelloRegisterPayload) => Promise<LiveRegisterResult>
   heartbeat: () => Promise<BrokerEnvelope>
+  sendBridgeEvent: (event: BridgeToBrokerEvent, options: SendBridgeEventOptions) => Promise<BrokerAckPayload>
   getSessionSnapshot: () => SessionSnapshot | null
+  setLiveHandlers: (handlers: BrokerClientLiveHandlers) => void
   close: () => Promise<void>
+}
+
+type PendingRequest = {
+  resolve: (value: BrokerEnvelope) => void
+  reject: (reason?: unknown) => void
+  requestType: BrokerMessageType
+  requestInstanceID: string | null
 }
 
 export type CollectStatusInput = {
@@ -46,6 +68,24 @@ export type CollectStatusInput = {
 export type BrokerClientOptions = {
   onCollectStatus?: (input: CollectStatusInput) => Promise<unknown> | unknown
   bridge?: WechatBridge
+  onBrokerControl?: (control: BrokerToBridgeControl) => Promise<void> | void
+  onBrokerCommand?: (command: BrokerToBridgeCommand) => Promise<void> | void
+}
+
+export type LiveRegisterResult = {
+  ack: RegisterAckPayload
+  control?: BrokerToBridgeControl
+  pendingCommands: BrokerToBridgeCommand[]
+}
+
+export type SendBridgeEventOptions = {
+  instanceID: string
+  controlId?: string
+}
+
+export type BrokerClientLiveHandlers = {
+  onBrokerControl?: BrokerClientOptions["onBrokerControl"]
+  onBrokerCommand?: BrokerClientOptions["onBrokerCommand"]
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -66,6 +106,30 @@ function isShowFallbackToastPayload(value: unknown): value is ShowFallbackToastP
     && isNonEmptyString(payload.message)
     && isNonEmptyString(payload.registrationEpoch)
     && payload.reason === SHOW_FALLBACK_TOAST_DELIVERY_FAILED_REASON
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function isLiveBrokerCommandPayload(value: unknown): value is BrokerToBridgeCommand {
+  if (!isObject(value)) {
+    return false
+  }
+  return isNonEmptyString(value.commandId)
+    && isFiniteNumber(value.brokerSeq)
+    && isNonEmptyString(value.type)
+    && "payload" in value
+}
+
+function isLiveBrokerControlPayload(value: unknown): value is BrokerToBridgeControl {
+  if (!isObject(value)) {
+    return false
+  }
+  return isNonEmptyString(value.controlId)
+    && isFiniteNumber(value.brokerSeq)
+    && isNonEmptyString(value.type)
+    && "payload" in value
 }
 
 function isResponseForRequest(response: BrokerEnvelope, requestId: string): boolean {
@@ -89,28 +153,37 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
 
   const socket = createBrokerSocket(endpoint)
   let sequence = 0
-  let pendingResolve: ((value: BrokerEnvelope) => void) | null = null
-  let pendingReject: ((reason?: unknown) => void) | null = null
-  let pendingRequestId: string | null = null
-  let pendingRequestType: BrokerMessageType | null = null
-  let pendingRequestInstanceID: string | null = null
+  const pendingRequests = new Map<string, PendingRequest>()
   let buffer = ""
   let connected = false
   let closed = false
   let session: SessionSnapshot | null = null
-
-  function clearPendingRequest() {
-    pendingResolve = null
-    pendingReject = null
-    pendingRequestId = null
-    pendingRequestType = null
-    pendingRequestInstanceID = null
+  let liveRegistrationInstanceID: string | null = null
+  let serverPushChain: Promise<void> = Promise.resolve()
+  let liveHandlers: BrokerClientLiveHandlers = {
+    onBrokerControl: options.onBrokerControl,
+    onBrokerCommand: options.onBrokerCommand,
   }
 
-  function rejectPendingRequest(reason: unknown) {
-    const reject = pendingReject
-    clearPendingRequest()
-    reject?.(reason)
+  function enqueueServerPush(task: () => Promise<void> | void): void {
+    serverPushChain = serverPushChain
+      .then(() => task())
+      .catch(() => {
+        // swallow push handler failures to keep connection alive
+      })
+  }
+
+  function deletePendingRequest(requestId: string): PendingRequest | undefined {
+    const pending = pendingRequests.get(requestId)
+    if (!pending) {
+      return undefined
+    }
+    pendingRequests.delete(requestId)
+    return pending
+  }
+
+  function rejectPendingRequest(requestId: string, reason: unknown) {
+    deletePendingRequest(requestId)?.reject(reason)
   }
 
   function toSessionSnapshot(instanceID: string, payload: Partial<RegisterAck>): SessionSnapshot {
@@ -136,26 +209,40 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
     }
   }
 
-  function stageRegisterAckSession(frames: BrokerEnvelope[]) {
-    if (
-      !pendingResolve
-      || pendingRequestId === null
-      || pendingRequestType !== "registerInstance"
-      || !isNonEmptyString(pendingRequestInstanceID)
-    ) {
+  function findPendingRequest(response: BrokerEnvelope): [string, PendingRequest] | null {
+    if (response.type === "error") {
+      const requestId = (response.payload as { requestId?: unknown }).requestId
+      if (isNonEmptyString(requestId)) {
+        const pending = pendingRequests.get(requestId)
+        if (pending) {
+          return [requestId, pending]
+        }
+      }
+    }
+
+    const direct = pendingRequests.get(response.id)
+    if (direct) {
+      return [response.id, direct]
+    }
+
+    for (const [requestId, pending] of pendingRequests.entries()) {
+      if (isResponseForRequest(response, requestId)) {
+        return [requestId, pending]
+      }
+    }
+
+    return null
+  }
+
+  function stageRegisterAckSession(requestId: string, pending: PendingRequest, response: BrokerEnvelope) {
+    if (pending.requestType !== "registerInstance" || !isNonEmptyString(pending.requestInstanceID)) {
+      return
+    }
+    if (!isResponseForRequest(response, requestId) || response.type !== "registerAck") {
       return
     }
 
-    const requestId = pendingRequestId
-
-    const matchingRegisterAck = frames.find(
-      (frame) => frame.type === "registerAck" && isResponseForRequest(frame, requestId),
-    )
-    if (!matchingRegisterAck) {
-      return
-    }
-
-    session = toSessionSnapshot(pendingRequestInstanceID, matchingRegisterAck.payload as Partial<RegisterAck>)
+    session = toSessionSnapshot(pending.requestInstanceID, response.payload as Partial<RegisterAck>)
   }
 
   const connectedReady = new Promise<void>((resolve, reject) => {
@@ -180,8 +267,8 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
       try {
         parsedFrames.push(parseEnvelopeLine(frame))
       } catch (error) {
-        if (pendingReject) {
-          rejectPendingRequest(error)
+        for (const requestId of [...pendingRequests.keys()]) {
+          rejectPendingRequest(requestId, error)
         }
       }
     }
@@ -190,38 +277,31 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
       return
     }
 
-    try {
-      stageRegisterAckSession(parsedFrames)
-    } catch (error) {
-      if (pendingReject) {
-        rejectPendingRequest(error)
-      }
-      return
-    }
-
     for (const parsed of parsedFrames) {
-      if (pendingResolve) {
-        if (handleServerPush(parsed)) {
-          continue
-        }
-
-        if (pendingRequestId && !isResponseForRequest(parsed, pendingRequestId)) {
-          continue
-        }
-
-        const resolve = pendingResolve
-        clearPendingRequest()
-        resolve?.(parsed)
+      if (handleServerPush(parsed)) {
         continue
       }
 
-      handleServerPush(parsed)
+      const matched = findPendingRequest(parsed)
+      if (!matched) {
+        continue
+      }
+
+      const [requestId, pending] = matched
+      try {
+        stageRegisterAckSession(requestId, pending, parsed)
+      } catch (error) {
+        rejectPendingRequest(requestId, error)
+        continue
+      }
+
+      deletePendingRequest(requestId)?.resolve(parsed)
     }
   })
 
   socket.on("error", (error) => {
-    if (pendingReject) {
-      rejectPendingRequest(error)
+    for (const requestId of [...pendingRequests.keys()]) {
+      rejectPendingRequest(requestId, error)
     }
   })
 
@@ -229,8 +309,8 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
     connected = false
     closed = true
     session = null
-    if (pendingReject) {
-      rejectPendingRequest(new Error("broker connection closed"))
+    for (const requestId of [...pendingRequests.keys()]) {
+      rejectPendingRequest(requestId, new Error("broker connection closed"))
     }
   })
 
@@ -321,16 +401,50 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
     void Promise.resolve(options.bridge?.showFallbackToast?.(payload)).catch(() => {})
   }
 
+  function handleBrokerControlPush(envelope: BrokerEnvelope): boolean {
+    if (envelope.type !== "requestReplay" && envelope.type !== "requestFullSync") {
+      return false
+    }
+    if (!liveHandlers.onBrokerControl || !isLiveBrokerControlPayload(envelope.payload)) {
+      return false
+    }
+
+    const control = envelope.payload
+    enqueueServerPush(() => liveHandlers.onBrokerControl?.(control))
+    return true
+  }
+
+  function handleBrokerCommandPush(envelope: BrokerEnvelope): boolean {
+    if (
+      envelope.type !== "replyQuestion"
+      && envelope.type !== "replyPermission"
+      && envelope.type !== "replyNaturalStop"
+    ) {
+      return false
+    }
+    if (!liveHandlers.onBrokerCommand || !isLiveBrokerCommandPayload(envelope.payload)) {
+      return false
+    }
+
+    const command = envelope.payload
+    enqueueServerPush(() => liveHandlers.onBrokerCommand?.(command))
+    return true
+  }
+
   function handleReplyEnvelope(envelope: BrokerEnvelope): boolean {
     if (!options.bridge?.handleBrokerEnvelope) {
       return false
     }
-    if (envelope.type !== "replyQuestion" && envelope.type !== "replyPermission") {
+    if (
+      envelope.type !== "replyQuestion"
+      && envelope.type !== "replyPermission"
+      && envelope.type !== "replyNaturalStop"
+    ) {
       return false
     }
 
-    void Promise.resolve(options.bridge.handleBrokerEnvelope(envelope))
-      .then((response) => {
+    enqueueServerPush(async () => {
+      const response = await options.bridge?.handleBrokerEnvelope?.(envelope)
         if (!response || !session) {
           return
         }
@@ -340,7 +454,6 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
           sessionToken: session.sessionToken,
         }))
       })
-      .catch(() => {})
     return true
   }
 
@@ -353,6 +466,12 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
       handleShowFallbackToast(envelope)
       return true
     }
+    if (handleBrokerControlPush(envelope)) {
+      return true
+    }
+    if (handleBrokerCommandPush(envelope)) {
+      return true
+    }
     if (handleReplyEnvelope(envelope)) {
       return true
     }
@@ -363,16 +482,14 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
     if (!connected || closed) {
       throw new Error("broker connection closed")
     }
-    if (pendingResolve) {
-      throw new Error("broker client has pending request")
-    }
 
     return new Promise((resolve, reject) => {
-      pendingResolve = resolve
-      pendingReject = reject
-      pendingRequestId = envelope.id
-      pendingRequestType = envelope.type
-      pendingRequestInstanceID = envelope.instanceID ?? null
+      pendingRequests.set(envelope.id, {
+        resolve,
+        reject,
+        requestType: envelope.type,
+        requestInstanceID: envelope.instanceID ?? null,
+      })
       socket.write(serializeEnvelope(envelope))
     })
   }
@@ -385,7 +502,7 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
         payload: {},
       })
     },
-    async registerInstance(meta) {
+    async registerInstance(meta, registerOptions = {}) {
       const instanceID = meta.instanceID
       if (!isNonEmptyString(instanceID)) {
         throw new Error("invalid instanceID")
@@ -407,7 +524,9 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
 
       session = toSessionSnapshot(instanceID, response.payload as Partial<RegisterAck>)
 
-      if (options.bridge?.collectNotificationCandidates) {
+      if (Array.isArray(registerOptions.notificationCandidates)) {
+        sendSyncWechatNotifications(registerOptions.notificationCandidates)
+      } else if (options.bridge?.collectNotificationCandidates && liveRegistrationInstanceID !== instanceID) {
         try {
           const candidates = await options.bridge.collectNotificationCandidates()
           sendSyncWechatNotifications(candidates)
@@ -421,6 +540,40 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
         registeredAt: session.registeredAt,
         registrationEpoch: session.registrationEpoch,
         brokerPid: session.brokerPid,
+      }
+    },
+    async registerHello(payload) {
+      const hello = createHelloRegisterEnvelope(payload)
+      const response = await send({
+        id: nextRequestId("hello-register"),
+        type: "hello/register",
+        instanceID: hello.payload.instanceID,
+        payload: hello.payload,
+      })
+
+      if (response.type !== "registerAck" || !isObject(response.payload)) {
+        throw new Error("hello/register failed")
+      }
+
+      const ackPayload = response.payload as RegisterAckPayload & {
+        control?: BrokerToBridgeControl
+        pendingCommands?: BrokerToBridgeCommand[]
+      }
+      liveRegistrationInstanceID = hello.payload.instanceID
+
+      return {
+        ack: {
+          protocolVersion: ackPayload.protocolVersion,
+          stateGeneration: ackPayload.stateGeneration,
+          instanceIncarnation: ackPayload.instanceIncarnation,
+          brokerSeq: ackPayload.brokerSeq,
+          needReplay: ackPayload.needReplay,
+          needFullSync: ackPayload.needFullSync,
+        },
+        ...(isLiveBrokerControlPayload(ackPayload.control) ? { control: ackPayload.control } : {}),
+        pendingCommands: Array.isArray(ackPayload.pendingCommands)
+          ? ackPayload.pendingCommands.filter((command): command is BrokerToBridgeCommand => isLiveBrokerCommandPayload(command))
+          : [],
       }
     },
     async heartbeat() {
@@ -446,11 +599,34 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
 
       return response
     },
+    async sendBridgeEvent(event, options) {
+      const bridgeEvent = createBridgeEventEnvelope(
+        options.controlId ? { ...event, controlId: options.controlId } : event,
+      )
+      const response = await send({
+        id: nextRequestId(bridgeEvent.type),
+        type: bridgeEvent.type,
+        instanceID: options.instanceID,
+        payload: bridgeEvent,
+      })
+
+      if (response.type !== "ack" || !isObject(response.payload)) {
+        throw new Error(`bridge event ack failed: ${bridgeEvent.type}`)
+      }
+
+      return response.payload as BrokerAckPayload
+    },
     getSessionSnapshot() {
       if (!session) {
         return null
       }
       return { ...session }
+    },
+    setLiveHandlers(handlers) {
+      liveHandlers = {
+        ...liveHandlers,
+        ...handlers,
+      }
     },
     async close() {
       if (closed) {
@@ -460,6 +636,7 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
         closed = true
         connected = false
         session = null
+        liveRegistrationInstanceID = null
         return
       }
 
@@ -478,6 +655,7 @@ export async function connect(endpoint: string, options: BrokerClientOptions = {
           }, 200)
         }),
       ])
+      liveRegistrationInstanceID = null
     },
   }
 }

@@ -4,7 +4,20 @@ import { readFileSync, rmSync } from "node:fs"
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import type { QuestionAnswer } from "@opencode-ai/sdk/v2"
-import { startBrokerServer } from "./broker-server.js"
+import {
+  WECHAT_BROKER_WS_PROTOCOL_VERSION,
+  WECHAT_BROKER_WS_STATE_GENERATION,
+  startBrokerServer,
+} from "./broker-server.js"
+import {
+  prepareBrokerStateStoreForStartup,
+  readBrokerAuthoritativeView as readLiveBrokerAuthoritativeView,
+  readBrokerCommandStateByAction as readLiveBrokerCommandStateByAction,
+  readBrokerStateUpgradeCloseReason,
+  type BrokerAuthoritativeView,
+  type BrokerCommandActionInput,
+  type BrokerCommandRecord,
+} from "./broker-state-store.js"
 import { WECHAT_FILE_MODE, wechatStateRoot, wechatStatusRuntimeDiagnosticsPath } from "./state-paths.js"
 import {
   createWechatStatusRuntime,
@@ -53,12 +66,15 @@ import {
 } from "./broker-mutation-queue.js"
 import { buildQuestionAnswersFromReply } from "./question-interaction.js"
 import { formatNaturalStopClosedText, formatTerminalRequestClosedText } from "./notification-format.js"
+import { formatAggregatedStatusReplyFromBrokerView } from "./status-format.js"
 
 type ReplyMutationResult = {
   mutationId: string
   ok: boolean
   errorMessage?: string
 }
+
+type Awaitable<T> = T | Promise<T>
 
 type BrokerState = {
   pid: number
@@ -297,8 +313,10 @@ function createRecoveryFailureToken(): string {
 const brokerEntryMutationQueue = createBrokerMutationQueue()
 
 export function createBrokerWechatSlashCommandHandler(input: {
-  handleStatusCommand: () => Promise<string>
+  handleStatusCommand?: () => Promise<string>
   client?: BrokerWechatSlashHandlerClient
+  readBrokerAuthoritativeView?: () => Awaitable<BrokerAuthoritativeView | undefined>
+  readBrokerCommandStateByAction?: (input: BrokerCommandActionInput) => Awaitable<BrokerCommandRecord | undefined>
   sendReplyQuestionRpc?: (input: {
     instanceID: string
     mutationId: string
@@ -329,6 +347,13 @@ export function createBrokerWechatSlashCommandHandler(input: {
 }): (command: WechatSlashCommand) => Promise<string> {
   const mutationQueue = input.mutationQueue ?? brokerEntryMutationQueue
   const markDeadLetterRecoveryFailedImpl = input.markDeadLetterRecoveryFailedImpl ?? markDeadLetterRecoveryFailed
+  const readBrokerAuthoritativeView = input.readBrokerAuthoritativeView ?? (() => readLiveBrokerAuthoritativeView())
+  const readBrokerCommandStateByAction = input.readBrokerCommandStateByAction
+    ?? ((action: BrokerCommandActionInput) => readLiveBrokerCommandStateByAction(action))
+  const handleStatusCommand = input.handleStatusCommand ?? (async () => {
+    const brokerView = await readBrokerAuthoritativeView()
+    return formatAggregatedStatusReplyFromBrokerView(brokerView)
+  })
 
   const persistRecoveryFailureWrites = async (records: Array<{
     kind: "question" | "permission"
@@ -512,6 +537,84 @@ export function createBrokerWechatSlashCommandHandler(input: {
     } catch {
       // best-effort only: notification resolve failure should not fail slash reply
     }
+  }
+
+  const commandStatusMessage = (status: BrokerCommandRecord["status"]): string | undefined => {
+    if (status === "queued") {
+      return "命令尚未送达实例，仍在排队"
+    }
+    if (status === "delivered") {
+      return "命令已送达实例，等待实例接受"
+    }
+    if (status === "accepted") {
+      return "命令已被实例接受，正在处理中"
+    }
+    return undefined
+  }
+
+  const readCommandFailureMessage = (record: BrokerCommandRecord): string => {
+    const message = record.failure?.["message"]
+    if (typeof message === "string" && message.trim().length > 0) {
+      return message.trim()
+    }
+    return "unknown"
+  }
+
+  const finalizeQuestionReply = async (openQuestion: {
+    routeKey: string
+    handle: string
+  }) => {
+    await markRequestAnswered({
+      kind: "question",
+      routeKey: openQuestion.routeKey,
+      answeredAt: Date.now(),
+    })
+    await resolveNotificationForOpenRequest({
+      kind: "question",
+      routeKey: openQuestion.routeKey,
+      handle: openQuestion.handle,
+    })
+    return `已回复问题：${openQuestion.handle}`
+  }
+
+  const finalizePermissionReply = async (
+    openPermission: {
+      routeKey: string
+      handle: string
+    },
+    reply: "once" | "always" | "reject",
+  ) => {
+    if (reply === "reject") {
+      await markRequestRejected({
+        kind: "permission",
+        routeKey: openPermission.routeKey,
+        rejectedAt: Date.now(),
+      })
+    } else {
+      await markRequestAnswered({
+        kind: "permission",
+        routeKey: openPermission.routeKey,
+        answeredAt: Date.now(),
+      })
+    }
+    await resolveNotificationForOpenRequest({
+      kind: "permission",
+      routeKey: openPermission.routeKey,
+      handle: openPermission.handle,
+    })
+    return `已处理权限请求：${openPermission.handle} (${reply})`
+  }
+
+  const finalizeNaturalStopReply = async (openNaturalStop: {
+    idempotencyKey: string
+    handle?: string
+  }, handle: string) => {
+    await markNaturalStopTerminal({
+      idempotencyKey: openNaturalStop.idempotencyKey,
+      resolvedAt: Date.now(),
+      terminalReason: "replied",
+    })
+    return `已回复中止通知：${openNaturalStop.handle ?? handle}`
   }
 
   const listDeadLettersByHandleSafely = async (handle: string) => {
@@ -700,7 +803,7 @@ export function createBrokerWechatSlashCommandHandler(input: {
 
   return async (command) => {
     if (command.type === "status") {
-      return input.handleStatusCommand()
+      return handleStatusCommand()
     }
 
     if (command.type === "reply") {
@@ -729,6 +832,28 @@ export function createBrokerWechatSlashCommandHandler(input: {
             return `回复中止通知失败：bridge unavailable`
           }
 
+          const commandState = await readBrokerCommandStateByAction({
+            type: "replyNaturalStop",
+            target: {
+              instanceID,
+              sessionID,
+            },
+            payload: {
+              sessionID,
+              text: command.text,
+            },
+          })
+          const pendingMessage = commandState ? commandStatusMessage(commandState.status) : undefined
+          if (pendingMessage) {
+            return pendingMessage
+          }
+          if (commandState?.status === "completed") {
+            return finalizeNaturalStopReply(openNaturalStop, command.handle)
+          }
+          if (commandState?.status === "failed") {
+            return `回复中止通知失败：${readCommandFailureMessage(commandState)}`
+          }
+
           const mutationId = `reply-natural-stop-${Date.now()}-${Math.random().toString(16).slice(2)}`
           let result: ReplyMutationResult
           if (input.sendReplyNaturalStopRpc) {
@@ -751,12 +876,7 @@ export function createBrokerWechatSlashCommandHandler(input: {
             return `回复中止通知失败：${result.errorMessage ?? "unknown"}`
           }
 
-          await markNaturalStopTerminal({
-            idempotencyKey: openNaturalStop.idempotencyKey,
-            resolvedAt: Date.now(),
-            terminalReason: "replied",
-          })
-          return `已回复中止通知：${openNaturalStop.handle ?? command.handle}`
+          return finalizeNaturalStopReply(openNaturalStop, command.handle)
         }
 
         const terminalNaturalStop = await findTerminalNaturalStopSafely(command.handle)
@@ -765,6 +885,10 @@ export function createBrokerWechatSlashCommandHandler(input: {
             handle: terminalNaturalStop.handle,
             terminalReason: terminalNaturalStop.naturalStopTerminalReason,
           })
+        }
+        const upgradeCloseReason = await readBrokerStateUpgradeCloseReason(command.handle)
+        if (upgradeCloseReason) {
+          return upgradeCloseReason
         }
         return `未找到待回复问题：${command.handle}`
       }
@@ -777,6 +901,31 @@ export function createBrokerWechatSlashCommandHandler(input: {
       } catch (error) {
         return error instanceof Error ? error.message : "问题回复格式无效"
       }
+
+      const commandState = openQuestion.scopeKey
+        ? await readBrokerCommandStateByAction({
+            type: "replyQuestion",
+            target: {
+              instanceID: openQuestion.scopeKey,
+              requestID: openQuestion.requestID,
+            },
+            payload: {
+              requestID: openQuestion.requestID,
+              answers,
+            },
+          })
+        : undefined
+      const pendingMessage = commandState ? commandStatusMessage(commandState.status) : undefined
+      if (pendingMessage) {
+        return pendingMessage
+      }
+      if (commandState?.status === "completed") {
+        return finalizeQuestionReply(openQuestion)
+      }
+      if (commandState?.status === "failed") {
+        return `回复问题失败：${readCommandFailureMessage(commandState)}`
+      }
+
       const mutationId = `reply-question-${Date.now()}-${Math.random().toString(16).slice(2)}`
       let result: ReplyMutationResult
       if (input.sendReplyQuestionRpc) {
@@ -806,13 +955,7 @@ export function createBrokerWechatSlashCommandHandler(input: {
       if (result.ok !== true) {
         return `回复问题失败：${result.errorMessage ?? "unknown"}`
       }
-      await markRequestAnswered({
-        kind: "question",
-        routeKey: openQuestion.routeKey,
-        answeredAt: Date.now(),
-      })
-      await resolveNotificationForOpenRequest(openQuestion)
-      return `已回复问题：${openQuestion.handle}`
+      return finalizeQuestionReply(openQuestion)
     }
 
     if (command.type === "recover") {
@@ -922,8 +1065,38 @@ export function createBrokerWechatSlashCommandHandler(input: {
           replacementHandle: terminalPermission.replacementHandle,
         })
       }
+      const upgradeCloseReason = await readBrokerStateUpgradeCloseReason(command.handle)
+      if (upgradeCloseReason) {
+        return upgradeCloseReason
+      }
       return `未找到待处理权限请求：${command.handle}`
     }
+
+    const commandState = openPermission.scopeKey
+      ? await readBrokerCommandStateByAction({
+          type: "replyPermission",
+          target: {
+            instanceID: openPermission.scopeKey,
+            requestID: openPermission.requestID,
+          },
+          payload: {
+            requestID: openPermission.requestID,
+            reply: command.reply,
+            ...(command.message ? { message: command.message } : {}),
+          },
+        })
+      : undefined
+    const pendingMessage = commandState ? commandStatusMessage(commandState.status) : undefined
+    if (pendingMessage) {
+      return pendingMessage
+    }
+    if (commandState?.status === "completed") {
+      return finalizePermissionReply(openPermission, command.reply)
+    }
+    if (commandState?.status === "failed") {
+      return `处理权限请求失败：${readCommandFailureMessage(commandState)}`
+    }
+
     const mutationId = `reply-permission-${Date.now()}-${Math.random().toString(16).slice(2)}`
     let result: ReplyMutationResult
     if (input.sendReplyPermissionRpc) {
@@ -959,21 +1132,7 @@ export function createBrokerWechatSlashCommandHandler(input: {
       routeKey: openPermission.routeKey,
       handle: openPermission.handle,
     })
-    if (command.reply === "reject") {
-      await markRequestRejected({
-        kind: "permission",
-        routeKey: openPermission.routeKey,
-        rejectedAt: Date.now(),
-      })
-    } else {
-      await markRequestAnswered({
-        kind: "permission",
-        routeKey: openPermission.routeKey,
-        answeredAt: Date.now(),
-      })
-    }
-    await resolveNotificationForOpenRequest(openPermission)
-    return `已处理权限请求：${openPermission.handle} (${command.reply})`
+    return finalizePermissionReply(openPermission, command.reply)
   }
 }
 
@@ -985,7 +1144,6 @@ export function createBrokerWechatStatusRuntimeLifecycle(
   const onDiagnosticEvent =
     deps.onDiagnosticEvent ?? createWechatStatusRuntimeDiagnosticsFileWriter({ stateRoot, onRuntimeError })
   const handleWechatSlashCommand = deps.handleWechatSlashCommand ?? createBrokerWechatSlashCommandHandler({
-    handleStatusCommand: async () => "命令暂未实现：/status",
     sendReplyQuestionRpc: deps.sendReplyQuestionRpc,
     sendReplyPermissionRpc: deps.sendReplyPermissionRpc,
     sendReplyNaturalStopRpc: deps.sendReplyNaturalStopRpc,
@@ -1116,6 +1274,10 @@ async function run() {
   const endpoint = parseEndpointArg(args)
   const stateRoot = parseStateRootArg(args)
   process.env.WECHAT_STATE_ROOT_OVERRIDE = stateRoot
+  await prepareBrokerStateStoreForStartup({
+    protocolVersion: WECHAT_BROKER_WS_PROTOCOL_VERSION,
+    stateGeneration: WECHAT_BROKER_WS_STATE_GENERATION,
+  })
   const server = await startBrokerServer(endpoint)
   const version = await readPackageVersion()
   const state: BrokerState = {
@@ -1128,7 +1290,6 @@ async function run() {
   await writeBrokerState(state, stateRoot)
   const wechatRuntimeLifecycle = createBrokerWechatStatusRuntimeLifecycle({
     handleWechatSlashCommand: createBrokerWechatSlashCommandHandler({
-      handleStatusCommand: async () => server.handleWechatSlashCommand({ type: "status" }),
       sendReplyQuestionRpc: server.dispatchReplyQuestionToInstance,
       sendReplyPermissionRpc: server.dispatchReplyPermissionToInstance,
       sendReplyNaturalStopRpc: server.dispatchReplyNaturalStopToInstance,

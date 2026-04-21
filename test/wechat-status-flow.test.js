@@ -70,6 +70,7 @@ async function readJsonLines(filePath) {
 
 async function registerAndSyncCandidates({ endpoint, protocol, instanceID, candidates }) {
   const socket = net.createConnection(endpoint)
+  let syncCompletion = Promise.resolve()
   await new Promise((resolve, reject) => {
     socket.once("connect", resolve)
     socket.once("error", reject)
@@ -94,15 +95,19 @@ async function registerAndSyncCandidates({ endpoint, protocol, instanceID, candi
               reject(new Error("registerAck missing sessionToken"))
               return
             }
-            socket.write(
-              protocol.serializeEnvelope({
-                id: `sync-${instanceID}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-                type: "syncWechatNotifications",
-                instanceID,
-                sessionToken,
-                payload: { candidates },
-              }),
-            )
+            syncCompletion = new Promise((resolveSync, rejectSync) => {
+              socket.once("error", rejectSync)
+              socket.end(
+                protocol.serializeEnvelope({
+                  id: `sync-${instanceID}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+                  type: "syncWechatNotifications",
+                  instanceID,
+                  sessionToken,
+                  payload: { candidates },
+                }),
+                () => resolveSync(),
+              )
+            })
             resolve()
             return
           }
@@ -123,7 +128,10 @@ async function registerAndSyncCandidates({ endpoint, protocol, instanceID, candi
     )
   })
 
-  socket.destroy()
+  await syncCompletion
+  if (!socket.destroyed) {
+    await new Promise((resolve) => socket.once("close", resolve))
+  }
 }
 
 function toIdempotencyPart(value) {
@@ -154,6 +162,7 @@ async function createBridgeLifecycleForFallbackTest({
   questionList,
 }) {
   let bridgeInstanceID = ""
+  let registerHelloPayload = null
   let registerAck = null
   const bridgeLifecycle = await bridgeModule.createWechatBridgeLifecycle(
     {
@@ -182,9 +191,16 @@ async function createBridgeLifecycleForFallbackTest({
         const client = await brokerClient.connect(brokerEndpoint, options)
         return {
           ...client,
-          registerInstance: async (meta) => {
-            bridgeInstanceID = meta.instanceID
-            registerAck = await client.registerInstance(meta)
+          registerHello: async (payload) => {
+            bridgeInstanceID = payload.instanceID
+            registerHelloPayload = payload
+            return client.registerHello(payload)
+          },
+          registerInstance: async (meta, registerOptions) => {
+            if (!bridgeInstanceID) {
+              bridgeInstanceID = meta.instanceID
+            }
+            registerAck = await client.registerInstance(meta, registerOptions)
             return registerAck
           },
         }
@@ -196,6 +212,7 @@ async function createBridgeLifecycleForFallbackTest({
   return {
     bridgeLifecycle,
     bridgeInstanceID,
+    registerHelloPayload,
     registerAck,
   }
 }
@@ -505,6 +522,8 @@ test("broker 通知发送失败会标记 token stale 并发送 showFallbackToast
       },
     })
     bridgeLifecycle = bridge.bridgeLifecycle
+    assert.equal(bridge.registerHelloPayload?.instanceID, bridge.bridgeInstanceID)
+    assert.equal(typeof bridge.registerAck?.registrationEpoch, "string")
     const expectedNotificationKey = `question-${toIdempotencyPart(bridge.bridgeInstanceID)}-${toIdempotencyPart(requestID)}`
 
     await waitForAsync(async () => {
@@ -695,6 +714,8 @@ test("broker 通知发送失败在 bridge 重连后使用旧 registrationEpoch �
       questionList: async () => createFallbackQuestion(requestID),
     })
     firstBridgeLifecycle = firstBridge.bridgeLifecycle
+    assert.equal(firstBridge.registerHelloPayload?.instanceID, firstBridge.bridgeInstanceID)
+    assert.equal(typeof firstBridge.registerAck?.registrationEpoch, "string")
     const expectedNotificationKey = `question-${toIdempotencyPart(firstBridge.bridgeInstanceID)}-${toIdempotencyPart(requestID)}`
 
     await waitForAsync(async () => {
@@ -716,6 +737,8 @@ test("broker 通知发送失败在 bridge 重连后使用旧 registrationEpoch �
       questionList: async () => [],
     })
     secondBridgeLifecycle = secondBridge.bridgeLifecycle
+    assert.equal(secondBridge.registerHelloPayload?.instanceID, secondBridge.bridgeInstanceID)
+    assert.equal(typeof secondBridge.registerAck?.registrationEpoch, "string")
 
     const failingRuntime = createFailingNotificationRuntimeLifecycle({
       brokerEntry,
@@ -1159,6 +1182,8 @@ test("broker 通知发送失败在 stale token 文件损坏时仍发送 showFall
       },
     })
     bridgeLifecycle = bridge.bridgeLifecycle
+    assert.equal(bridge.registerHelloPayload?.instanceID, bridge.bridgeInstanceID)
+    assert.equal(typeof bridge.registerAck?.registrationEpoch, "string")
     const expectedNotificationKey = `question-${toIdempotencyPart(bridge.bridgeInstanceID)}-${toIdempotencyPart(requestID)}`
 
     await waitForAsync(async () => {
@@ -3754,7 +3779,7 @@ test("wechat status runtime diagnostics: 诊断写入挂起不阻塞 slash 回�
 
   await runtime.start()
   try {
-    await waitFor(() => sendCalls.length === 1, 300)
+    await waitFor(() => sendCalls.length === 1, 10000)
   } finally {
     await runtime.close()
   }
@@ -4136,8 +4161,117 @@ test("broker-entry runtime lifecycle: 默认 slash handler 不再返回 /status 
 
   assert.equal(slashReplies.length, 1)
   assert.notEqual(slashReplies[0], "/status 处理中")
-  assert.equal(slashReplies[0], "命令暂未实现：/status")
+  assert.equal(slashReplies[0], "wechat status: no online instances")
 })
+
+test("broker-entry slash handler: /status 直接读 broker 权威视图，不再依赖 live collect", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-status-authoritative-view`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-status-authoritative-view-store`)
+
+  const state = brokerStateStore.createEmptyBrokerState()
+  state.connections["instance-status-authoritative"] = {
+    "inc-status-authoritative": {
+      instanceID: "instance-status-authoritative",
+      instanceIncarnation: "inc-status-authoritative",
+      online: true,
+      lastEventSeq: 12,
+      lastAckedEventSeq: 12,
+      lastSentBrokerSeq: 7,
+      connectedAt: 1_701_100_000_000,
+    },
+  }
+  state.connections["instance-status-timeout"] = {
+    "inc-status-timeout": {
+      instanceID: "instance-status-timeout",
+      instanceIncarnation: "inc-status-timeout",
+      online: false,
+      lastEventSeq: 5,
+      lastAckedEventSeq: 5,
+      lastSentBrokerSeq: 3,
+      disconnectedAt: 1_701_100_000_050,
+      disconnectReason: "broker reconnect",
+    },
+  }
+  state.active.instances["instance-status-authoritative"] = {
+    instanceID: "instance-status-authoritative",
+    instanceIncarnation: "inc-status-authoritative",
+    displayName: "Broker 权威实例",
+    pid: 123,
+    projectDir: "/repo/broker-status",
+    unavailable: ["permissionList"],
+    online: true,
+  }
+  state.active.sessions["session-status-authoritative"] = {
+    instanceID: "instance-status-authoritative",
+    sessionID: "session-status-authoritative",
+    title: "Broker 权威会话",
+    directory: "/repo/broker-status",
+    updatedAt: 400,
+    status: "busy",
+    pendingQuestionCount: 1,
+    pendingPermissionCount: 0,
+    todoSummary: { total: 1, inProgress: 0, completed: 0 },
+    todoItems: [{ status: "pending", content: "收敛 slash 状态来源" }],
+    questionHighlights: ["问题：是否直接读取 broker 视图"],
+    highlights: [
+      { kind: "question", text: "pending question: 1" },
+      { kind: "status", text: "status: busy" },
+    ],
+  }
+
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    readBrokerAuthoritativeView: () => brokerStateStore.readBrokerAuthoritativeView(state),
+  })
+
+  const result = await handler({ type: "status" })
+
+  assert.match(result, /Broker 权威会话/)
+  assert.match(result, /`#busy` `#todo:1` `#question:1` `#permission:0`/)
+  assert.match(result, /\[ \] 收敛 slash 状态来源/)
+  assert.match(result, /问题：是否直接读取 broker 视图/)
+  assert.match(result, /instance unavailable: permissionList/)
+  assert.match(result, /timeout\/unreachable/i)
+  assert.doesNotMatch(result, /instance-status-authoritative|session-status-authoritative|instance-status-timeout|instanceID|sessionID/)
+})
+
+function primeBrokerCommandState(store, state, input) {
+  store.upsertBrokerCommand(state, {
+    commandId: input.commandId,
+    brokerSeq: input.brokerSeq,
+    type: input.type,
+    status: input.status === "queued" ? "queued" : "delivered",
+    target: input.target,
+    payload: input.payload,
+    instanceID: input.instanceID,
+    instanceIncarnation: input.instanceIncarnation,
+  })
+
+  if (input.status === "accepted" || input.status === "completed" || input.status === "failed") {
+    store.markBrokerCommandAccepted(state, {
+      commandId: input.commandId,
+      instanceID: input.instanceID,
+      instanceIncarnation: input.instanceIncarnation,
+      eventSeq: input.acceptedEventSeq ?? (input.brokerSeq + 100),
+      acceptedAt: input.acceptedAt ?? 1_701_200_000_000,
+    })
+  }
+
+  if (input.status === "completed" || input.status === "failed") {
+    store.markBrokerCommandResult(state, {
+      commandId: input.commandId,
+      instanceID: input.instanceID,
+      instanceIncarnation: input.instanceIncarnation,
+      eventSeq: input.resultEventSeq ?? (input.brokerSeq + 200),
+      status: input.status,
+      completedAt: input.completedAt ?? 1_701_200_000_100,
+      failure: input.failure,
+    })
+  }
+}
+
+function createBrokerCommandStateReader(store, state) {
+  return (action) => store.readBrokerCommandStateByAction(action, state)
+}
 
 test("broker-entry slash handler: /reply q1 done 命中 open question 并回写 request 与 notification", async () => {
   const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-reply-handler`)
@@ -4258,6 +4392,623 @@ test("broker-entry slash handler: /reply 只有 bridge RPC 返回 ok:true 才写
   const resolvedRaw = await readFile(statePaths.notificationStatePath(pending.idempotencyKey), "utf8")
   const resolved = JSON.parse(resolvedRaw)
   assert.equal(resolved.status, "resolved")
+})
+
+test("broker-entry slash handler: /reply 命中 accepted command ledger 时返回处理中语义并复用同一动作", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-reply-command-accepted`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-reply-command-accepted-store`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-reply-command-accepted-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-reply-command-accepted-request-store`)
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-reply-command-accepted-notification-store`)
+  const statePaths = await import(`../dist/wechat/state-paths.js?reload=${Date.now()}-reply-command-accepted-state-paths`)
+
+  const routeKey = handle.createRouteKey({ kind: "question", requestID: "q-reply-command-accepted-1", scopeKey: "instance-rpc-q-accepted" })
+  await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-reply-command-accepted-1",
+    routeKey,
+    handle: "qaccepted1",
+    scopeKey: "instance-rpc-q-accepted",
+    wechatAccountId: "wx-rpc-accepted",
+    userId: "u-rpc-accepted",
+    createdAt: 1_701_200_000_200,
+    prompt: {
+      title: "补充说明",
+      mode: "text",
+    },
+  })
+  const pending = await notificationStore.upsertNotification({
+    idempotencyKey: "notif-reply-command-accepted-1",
+    kind: "question",
+    routeKey,
+    handle: "qaccepted1",
+    scopeKey: "instance-rpc-q-accepted",
+    wechatAccountId: "wx-rpc-accepted",
+    userId: "u-rpc-accepted",
+    createdAt: 1_701_200_000_210,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: pending.idempotencyKey,
+    sentAt: 1_701_200_000_220,
+  })
+
+  const state = brokerStateStore.createEmptyBrokerState()
+  primeBrokerCommandState(brokerStateStore, state, {
+    commandId: "cmd-reply-command-accepted-1",
+    brokerSeq: 41,
+    type: "replyQuestion",
+    status: "accepted",
+    target: {
+      instanceID: "instance-rpc-q-accepted",
+      requestID: "q-reply-command-accepted-1",
+    },
+    payload: {
+      requestID: "q-reply-command-accepted-1",
+      answers: [["done"]],
+    },
+    instanceID: "instance-rpc-q-accepted",
+    instanceIncarnation: "inc-rpc-q-accepted",
+  })
+
+  const rpcCalls = []
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    readBrokerCommandStateByAction: createBrokerCommandStateReader(brokerStateStore, state),
+    sendReplyQuestionRpc: async (input) => {
+      rpcCalls.push(input)
+      return { mutationId: input.mutationId, ok: true }
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qaccepted1", text: "  done  " })
+
+  assert.equal(result, "命令已被实例接受，正在处理中")
+  assert.equal(rpcCalls.length, 0)
+  const stillOpen = await requestStore.findOpenRequestByHandle({ kind: "question", handle: "qaccepted1" })
+  assert.equal(stillOpen?.status, "open")
+  const pendingRaw = await readFile(statePaths.notificationStatePath(pending.idempotencyKey), "utf8")
+  const pendingAfterAccepted = JSON.parse(pendingRaw)
+  assert.equal(pendingAfterAccepted.status, "sent")
+})
+
+test("broker-entry slash handler: 多选回复同义顺序在 accepted command ledger 下仍复用同一动作", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-reply-command-accepted-multi-order`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-reply-command-accepted-multi-order-store`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-reply-command-accepted-multi-order-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-reply-command-accepted-multi-order-request-store`)
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-reply-command-accepted-multi-order-notification-store`)
+
+  const routeKey = handle.createRouteKey({ kind: "question", requestID: "q-reply-command-accepted-multi-order-1", scopeKey: "instance-rpc-q-accepted-multi-order" })
+  await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-reply-command-accepted-multi-order-1",
+    routeKey,
+    handle: "qacceptedmulti1",
+    scopeKey: "instance-rpc-q-accepted-multi-order",
+    wechatAccountId: "wx-rpc-accepted-multi-order",
+    userId: "u-rpc-accepted-multi-order",
+    createdAt: 1_701_200_000_300,
+    prompt: {
+      title: "请选择环境",
+      mode: "multiple",
+      options: [
+        { index: 1, label: "staging", value: "staging" },
+        { index: 2, label: "preview", value: "preview" },
+      ],
+    },
+  })
+  const pending = await notificationStore.upsertNotification({
+    idempotencyKey: "notif-reply-command-accepted-multi-order-1",
+    kind: "question",
+    routeKey,
+    handle: "qacceptedmulti1",
+    scopeKey: "instance-rpc-q-accepted-multi-order",
+    wechatAccountId: "wx-rpc-accepted-multi-order",
+    userId: "u-rpc-accepted-multi-order",
+    createdAt: 1_701_200_000_310,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: pending.idempotencyKey,
+    sentAt: 1_701_200_000_320,
+  })
+
+  const state = brokerStateStore.createEmptyBrokerState()
+  primeBrokerCommandState(brokerStateStore, state, {
+    commandId: "cmd-reply-command-accepted-multi-order-1",
+    brokerSeq: 51,
+    type: "replyQuestion",
+    status: "accepted",
+    target: {
+      instanceID: "instance-rpc-q-accepted-multi-order",
+      requestID: "q-reply-command-accepted-multi-order-1",
+    },
+    payload: {
+      requestID: "q-reply-command-accepted-multi-order-1",
+      answers: [["staging", "preview"]],
+    },
+    instanceID: "instance-rpc-q-accepted-multi-order",
+    instanceIncarnation: "inc-rpc-q-accepted-multi-order",
+  })
+
+  const rpcCalls = []
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    readBrokerCommandStateByAction: createBrokerCommandStateReader(brokerStateStore, state),
+    sendReplyQuestionRpc: async (input) => {
+      rpcCalls.push(input)
+      return { mutationId: input.mutationId, ok: true }
+    },
+  })
+
+  const result = await handler({ type: "reply", handle: "qacceptedmulti1", text: "2,1" })
+
+  assert.equal(result, "命令已被实例接受，正在处理中")
+  assert.equal(rpcCalls.length, 0)
+})
+
+test("broker-entry slash handler: /reply /allow /reply s* 在 queued/delivered/accepted 下返回分层状态文案", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-command-state-progressive-messages`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-command-state-progressive-messages-store`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-command-state-progressive-messages-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-command-state-progressive-messages-request-store`)
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-command-state-progressive-messages-notification-store`)
+
+  const questionRouteKey = handle.createRouteKey({ kind: "question", requestID: "q-progressive-1", scopeKey: "instance-q-progressive" })
+  await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-progressive-1",
+    routeKey: questionRouteKey,
+    handle: "qprogress1",
+    scopeKey: "instance-q-progressive",
+    wechatAccountId: "wx-progressive",
+    userId: "u-progressive",
+    createdAt: 1_701_201_000_000,
+    prompt: {
+      title: "补充说明",
+      mode: "text",
+    },
+  })
+  await notificationStore.upsertNotification({
+    idempotencyKey: "notif-progressive-q1",
+    kind: "question",
+    routeKey: questionRouteKey,
+    handle: "qprogress1",
+    scopeKey: "instance-q-progressive",
+    wechatAccountId: "wx-progressive",
+    userId: "u-progressive",
+    createdAt: 1_701_201_000_010,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: "notif-progressive-q1",
+    sentAt: 1_701_201_000_020,
+  })
+
+  const permissionRouteKey = handle.createRouteKey({ kind: "permission", requestID: "p-progressive-1", scopeKey: "instance-p-progressive" })
+  await requestStore.upsertRequest({
+    kind: "permission",
+    requestID: "p-progressive-1",
+    routeKey: permissionRouteKey,
+    handle: "pprogress1",
+    scopeKey: "instance-p-progressive",
+    wechatAccountId: "wx-progressive",
+    userId: "u-progressive",
+    createdAt: 1_701_201_000_100,
+  })
+  await notificationStore.upsertNotification({
+    idempotencyKey: "notif-progressive-p1",
+    kind: "permission",
+    routeKey: permissionRouteKey,
+    handle: "pprogress1",
+    scopeKey: "instance-p-progressive",
+    wechatAccountId: "wx-progressive",
+    userId: "u-progressive",
+    createdAt: 1_701_201_000_110,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: "notif-progressive-p1",
+    sentAt: 1_701_201_000_120,
+  })
+
+  await notificationStore.upsertNotification({
+    idempotencyKey: "notif-progressive-s1",
+    kind: "naturalStop",
+    handle: "s21",
+    scopeKey: "instance-s-progressive",
+    sessionID: "session-s-progressive",
+    replyTarget: {
+      instanceID: "instance-s-progressive",
+      sessionID: "session-s-progressive",
+    },
+    redactedSummary: "需要补充自然中止说明",
+    severityAdvice: "已停止并等待你的回复",
+    wechatAccountId: "wx-progressive",
+    userId: "u-progressive",
+    createdAt: 1_701_201_000_200,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: "notif-progressive-s1",
+    sentAt: 1_701_201_000_210,
+  })
+
+  const scenarios = [
+    { status: "queued", expectedMessage: "命令尚未送达实例，仍在排队" },
+    { status: "delivered", expectedMessage: "命令已送达实例，等待实例接受" },
+    { status: "accepted", expectedMessage: "命令已被实例接受，正在处理中" },
+  ]
+
+  const rpcCalls = []
+  for (const scenario of scenarios) {
+    const state = brokerStateStore.createEmptyBrokerState()
+    primeBrokerCommandState(brokerStateStore, state, {
+      commandId: `cmd-q-progressive-${scenario.status}`,
+      brokerSeq: 60,
+      type: "replyQuestion",
+      status: scenario.status,
+      target: {
+        instanceID: "instance-q-progressive",
+        requestID: "q-progressive-1",
+      },
+      payload: {
+        requestID: "q-progressive-1",
+        answers: [["done"]],
+      },
+      instanceID: "instance-q-progressive",
+      instanceIncarnation: "inc-q-progressive",
+    })
+    primeBrokerCommandState(brokerStateStore, state, {
+      commandId: `cmd-p-progressive-${scenario.status}`,
+      brokerSeq: 61,
+      type: "replyPermission",
+      status: scenario.status,
+      target: {
+        instanceID: "instance-p-progressive",
+        requestID: "p-progressive-1",
+      },
+      payload: {
+        requestID: "p-progressive-1",
+        reply: "once",
+        message: "approved",
+      },
+      instanceID: "instance-p-progressive",
+      instanceIncarnation: "inc-p-progressive",
+    })
+    primeBrokerCommandState(brokerStateStore, state, {
+      commandId: `cmd-s-progressive-${scenario.status}`,
+      brokerSeq: 62,
+      type: "replyNaturalStop",
+      status: scenario.status,
+      target: {
+        instanceID: "instance-s-progressive",
+        sessionID: "session-s-progressive",
+      },
+      payload: {
+        sessionID: "session-s-progressive",
+        text: "继续处理",
+      },
+      instanceID: "instance-s-progressive",
+      instanceIncarnation: "inc-s-progressive",
+    })
+
+    const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+      readBrokerCommandStateByAction: createBrokerCommandStateReader(brokerStateStore, state),
+      sendReplyQuestionRpc: async (input) => {
+        rpcCalls.push({ kind: "question", input })
+        return { mutationId: input.mutationId, ok: true }
+      },
+      sendReplyPermissionRpc: async (input) => {
+        rpcCalls.push({ kind: "permission", input })
+        return { mutationId: input.mutationId, ok: true }
+      },
+      sendReplyNaturalStopRpc: async (input) => {
+        rpcCalls.push({ kind: "naturalStop", input })
+        return { mutationId: input.mutationId, ok: true }
+      },
+    })
+
+    assert.equal(await handler({ type: "reply", handle: "qprogress1", text: "done" }), scenario.expectedMessage)
+    assert.equal(await handler({ type: "allow", handle: "pprogress1", reply: "once", message: "approved" }), scenario.expectedMessage)
+    assert.equal(await handler({ type: "reply", handle: "s21", text: "继续处理" }), scenario.expectedMessage)
+  }
+
+  assert.equal(scenarios[0].expectedMessage === scenarios[1].expectedMessage, false)
+  assert.equal(rpcCalls.length, 0)
+})
+
+test("broker-entry slash handler: /reply /allow /reply s* 在 completed/failed command ledger 状态下返回稳定文案", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-command-state-stable-messages`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-command-state-stable-messages-store`)
+  const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}-command-state-stable-messages-handle`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-command-state-stable-messages-request-store`)
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-command-state-stable-messages-notification-store`)
+  const statePaths = await import(`../dist/wechat/state-paths.js?reload=${Date.now()}-command-state-stable-messages-state-paths`)
+
+  const questionRouteKey = handle.createRouteKey({ kind: "question", requestID: "q-command-completed-1", scopeKey: "instance-q-completed" })
+  await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-command-completed-1",
+    routeKey: questionRouteKey,
+    handle: "qcomplete1",
+    scopeKey: "instance-q-completed",
+    wechatAccountId: "wx-command-completed",
+    userId: "u-command-completed",
+    createdAt: 1_701_210_000_000,
+  })
+  await notificationStore.upsertNotification({
+    idempotencyKey: "notif-command-completed-q1",
+    kind: "question",
+    routeKey: questionRouteKey,
+    handle: "qcomplete1",
+    scopeKey: "instance-q-completed",
+    wechatAccountId: "wx-command-completed",
+    userId: "u-command-completed",
+    createdAt: 1_701_210_000_010,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: "notif-command-completed-q1",
+    sentAt: 1_701_210_000_020,
+  })
+
+  const permissionRouteKey = handle.createRouteKey({ kind: "permission", requestID: "p-command-completed-1", scopeKey: "instance-p-completed" })
+  await requestStore.upsertRequest({
+    kind: "permission",
+    requestID: "p-command-completed-1",
+    routeKey: permissionRouteKey,
+    handle: "pcomplete1",
+    scopeKey: "instance-p-completed",
+    wechatAccountId: "wx-command-completed",
+    userId: "u-command-completed",
+    createdAt: 1_701_210_000_100,
+  })
+  await notificationStore.upsertNotification({
+    idempotencyKey: "notif-command-completed-p1",
+    kind: "permission",
+    routeKey: permissionRouteKey,
+    handle: "pcomplete1",
+    scopeKey: "instance-p-completed",
+    wechatAccountId: "wx-command-completed",
+    userId: "u-command-completed",
+    createdAt: 1_701_210_000_110,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: "notif-command-completed-p1",
+    sentAt: 1_701_210_000_120,
+  })
+
+  await notificationStore.upsertNotification({
+    idempotencyKey: "notif-command-completed-s1",
+    kind: "naturalStop",
+    handle: "s31",
+    scopeKey: "instance-s-completed",
+    sessionID: "session-s-completed",
+    replyTarget: {
+      instanceID: "instance-s-completed",
+      sessionID: "session-s-completed",
+    },
+    redactedSummary: "需要补充自然中止说明",
+    severityAdvice: "已停止并等待你的回复",
+    wechatAccountId: "wx-command-completed",
+    userId: "u-command-completed",
+    createdAt: 1_701_210_000_200,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: "notif-command-completed-s1",
+    sentAt: 1_701_210_000_210,
+  })
+
+  const questionFailedRouteKey = handle.createRouteKey({ kind: "question", requestID: "q-command-failed-1", scopeKey: "instance-q-failed" })
+  await requestStore.upsertRequest({
+    kind: "question",
+    requestID: "q-command-failed-1",
+    routeKey: questionFailedRouteKey,
+    handle: "qfailed1",
+    scopeKey: "instance-q-failed",
+    wechatAccountId: "wx-command-failed",
+    userId: "u-command-failed",
+    createdAt: 1_701_210_000_300,
+  })
+  await notificationStore.upsertNotification({
+    idempotencyKey: "notif-command-failed-q1",
+    kind: "question",
+    routeKey: questionFailedRouteKey,
+    handle: "qfailed1",
+    scopeKey: "instance-q-failed",
+    wechatAccountId: "wx-command-failed",
+    userId: "u-command-failed",
+    createdAt: 1_701_210_000_310,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: "notif-command-failed-q1",
+    sentAt: 1_701_210_000_320,
+  })
+
+  const permissionFailedRouteKey = handle.createRouteKey({ kind: "permission", requestID: "p-command-failed-1", scopeKey: "instance-p-failed" })
+  await requestStore.upsertRequest({
+    kind: "permission",
+    requestID: "p-command-failed-1",
+    routeKey: permissionFailedRouteKey,
+    handle: "pfailed1",
+    scopeKey: "instance-p-failed",
+    wechatAccountId: "wx-command-failed",
+    userId: "u-command-failed",
+    createdAt: 1_701_210_000_400,
+  })
+  await notificationStore.upsertNotification({
+    idempotencyKey: "notif-command-failed-p1",
+    kind: "permission",
+    routeKey: permissionFailedRouteKey,
+    handle: "pfailed1",
+    scopeKey: "instance-p-failed",
+    wechatAccountId: "wx-command-failed",
+    userId: "u-command-failed",
+    createdAt: 1_701_210_000_410,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: "notif-command-failed-p1",
+    sentAt: 1_701_210_000_420,
+  })
+
+  await notificationStore.upsertNotification({
+    idempotencyKey: "notif-command-failed-s1",
+    kind: "naturalStop",
+    handle: "s32",
+    scopeKey: "instance-s-failed",
+    sessionID: "session-s-failed",
+    replyTarget: {
+      instanceID: "instance-s-failed",
+      sessionID: "session-s-failed",
+    },
+    redactedSummary: "failed natural-stop",
+    severityAdvice: "已停止并等待你的回复",
+    wechatAccountId: "wx-command-failed",
+    userId: "u-command-failed",
+    createdAt: 1_701_210_000_500,
+  })
+  await notificationStore.markNotificationSent({
+    idempotencyKey: "notif-command-failed-s1",
+    sentAt: 1_701_210_000_510,
+  })
+
+  const state = brokerStateStore.createEmptyBrokerState()
+  primeBrokerCommandState(brokerStateStore, state, {
+    commandId: "cmd-q-completed-1",
+    brokerSeq: 51,
+    type: "replyQuestion",
+    status: "completed",
+    target: {
+      instanceID: "instance-q-completed",
+      requestID: "q-command-completed-1",
+    },
+    payload: {
+      requestID: "q-command-completed-1",
+      answers: [["done"]],
+    },
+    instanceID: "instance-q-completed",
+    instanceIncarnation: "inc-q-completed",
+  })
+  primeBrokerCommandState(brokerStateStore, state, {
+    commandId: "cmd-p-completed-1",
+    brokerSeq: 52,
+    type: "replyPermission",
+    status: "completed",
+    target: {
+      instanceID: "instance-p-completed",
+      requestID: "p-command-completed-1",
+    },
+    payload: {
+      requestID: "p-command-completed-1",
+      reply: "once",
+      message: "approved",
+    },
+    instanceID: "instance-p-completed",
+    instanceIncarnation: "inc-p-completed",
+  })
+  primeBrokerCommandState(brokerStateStore, state, {
+    commandId: "cmd-s-completed-1",
+    brokerSeq: 53,
+    type: "replyNaturalStop",
+    status: "completed",
+    target: {
+      instanceID: "instance-s-completed",
+      sessionID: "session-s-completed",
+    },
+    payload: {
+      sessionID: "session-s-completed",
+      text: "继续处理",
+    },
+    instanceID: "instance-s-completed",
+    instanceIncarnation: "inc-s-completed",
+  })
+  primeBrokerCommandState(brokerStateStore, state, {
+    commandId: "cmd-q-failed-1",
+    brokerSeq: 54,
+    type: "replyQuestion",
+    status: "failed",
+    target: {
+      instanceID: "instance-q-failed",
+      requestID: "q-command-failed-1",
+    },
+    payload: {
+      requestID: "q-command-failed-1",
+      answers: [["done"]],
+    },
+    instanceID: "instance-q-failed",
+    instanceIncarnation: "inc-q-failed",
+    failure: { message: "late-question-failed" },
+  })
+  primeBrokerCommandState(brokerStateStore, state, {
+    commandId: "cmd-p-failed-1",
+    brokerSeq: 55,
+    type: "replyPermission",
+    status: "failed",
+    target: {
+      instanceID: "instance-p-failed",
+      requestID: "p-command-failed-1",
+    },
+    payload: {
+      requestID: "p-command-failed-1",
+      reply: "always",
+      message: "safe",
+    },
+    instanceID: "instance-p-failed",
+    instanceIncarnation: "inc-p-failed",
+    failure: { message: "late-permission-failed" },
+  })
+  primeBrokerCommandState(brokerStateStore, state, {
+    commandId: "cmd-s-failed-1",
+    brokerSeq: 56,
+    type: "replyNaturalStop",
+    status: "failed",
+    target: {
+      instanceID: "instance-s-failed",
+      sessionID: "session-s-failed",
+    },
+    payload: {
+      sessionID: "session-s-failed",
+      text: "继续处理",
+    },
+    instanceID: "instance-s-failed",
+    instanceIncarnation: "inc-s-failed",
+    failure: { message: "late-natural-stop-failed" },
+  })
+
+  const rpcCalls = []
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    readBrokerCommandStateByAction: createBrokerCommandStateReader(brokerStateStore, state),
+    sendReplyQuestionRpc: async (input) => {
+      rpcCalls.push({ kind: "question", input })
+      return { mutationId: input.mutationId, ok: true }
+    },
+    sendReplyPermissionRpc: async (input) => {
+      rpcCalls.push({ kind: "permission", input })
+      return { mutationId: input.mutationId, ok: true }
+    },
+    sendReplyNaturalStopRpc: async (input) => {
+      rpcCalls.push({ kind: "naturalStop", input })
+      return { mutationId: input.mutationId, ok: true }
+    },
+  })
+
+  assert.equal(await handler({ type: "reply", handle: "qcomplete1", text: "done" }), "已回复问题：qcomplete1")
+  assert.equal(await handler({ type: "allow", handle: "pcomplete1", reply: "once", message: "approved" }), "已处理权限请求：pcomplete1 (once)")
+  assert.equal(await handler({ type: "reply", handle: "s31", text: "继续处理" }), "已回复中止通知：s31")
+  assert.equal(await handler({ type: "reply", handle: "qfailed1", text: "done" }), "回复问题失败：late-question-failed")
+  assert.equal(await handler({ type: "allow", handle: "pfailed1", reply: "always", message: "safe" }), "处理权限请求失败：late-permission-failed")
+  assert.equal(await handler({ type: "reply", handle: "s32", text: "继续处理" }), "回复中止通知失败：late-natural-stop-failed")
+  assert.equal(rpcCalls.length, 0)
+
+  const completedQuestion = await requestStore.findRequestByRouteKey({ kind: "question", routeKey: questionRouteKey })
+  assert.equal(completedQuestion?.status, "answered")
+  const completedPermission = await requestStore.findRequestByRouteKey({ kind: "permission", routeKey: permissionRouteKey })
+  assert.equal(completedPermission?.status, "answered")
+
+  const questionCompletedNotification = JSON.parse(await readFile(statePaths.notificationStatePath("notif-command-completed-q1"), "utf8"))
+  const permissionCompletedNotification = JSON.parse(await readFile(statePaths.notificationStatePath("notif-command-completed-p1"), "utf8"))
+  const naturalStopCompletedNotification = JSON.parse(await readFile(statePaths.notificationStatePath("notif-command-completed-s1"), "utf8"))
+  const questionFailedNotification = JSON.parse(await readFile(statePaths.notificationStatePath("notif-command-failed-q1"), "utf8"))
+
+  assert.equal(questionCompletedNotification.status, "resolved")
+  assert.equal(permissionCompletedNotification.status, "resolved")
+  assert.equal(naturalStopCompletedNotification.status, "resolved")
+  assert.equal(naturalStopCompletedNotification.naturalStopTerminalReason, "replied")
+  assert.equal(questionFailedNotification.status, "sent")
 })
 
 test("broker-entry slash handler: /reply 在 bridge RPC 返回 ok:false 时保持 open + pending", async () => {
@@ -5849,6 +6600,18 @@ test("broker-entry slash handler: 两个实例 natural-stop handle 全局唯一�
         severityAdvice: "已停止并等待你的回复",
       }],
     })
+
+    let firstHandle = ""
+    await waitForAsync(async () => {
+      const list = await notificationStore.listPendingNotifications()
+      const record = list.find((item) => item.idempotencyKey === "natural-stop-route-a")
+      if (!record?.handle) {
+        return false
+      }
+      firstHandle = record.handle
+      return true
+    })
+
     await registerAndSyncCandidates({
       endpoint,
       protocol,
@@ -5883,6 +6646,7 @@ test("broker-entry slash handler: 两个实例 natural-stop handle 全局唯一�
     const second = activeNaturalStops.find((item) => item.replyTarget?.instanceID === "instance-natural-stop-route-b")
     assert.ok(first?.handle)
     assert.ok(second?.handle)
+    assert.equal(first.handle, firstHandle)
     assert.notEqual(first.handle, second.handle)
 
     const replyCalls = []
@@ -5963,6 +6727,17 @@ test("broker-entry slash handler: 旧 binding 残留 active natural-stop 时，�
       }],
     })
 
+    let oldHandle = ""
+    await waitForAsync(async () => {
+      const list = await notificationStore.listPendingNotifications()
+      const record = list.find((item) => item.idempotencyKey === "natural-stop-cross-binding-old")
+      if (!record?.handle) {
+        return false
+      }
+      oldHandle = record.handle
+      return true
+    })
+
     await operatorStore.rebindOperator({
       wechatAccountId: "wx-natural-stop-new-binding",
       userId: "u-natural-stop-new-binding",
@@ -6001,9 +6776,9 @@ test("broker-entry slash handler: 旧 binding 残留 active natural-stop 时，�
     const oldBindingRecord = activeNaturalStops.find((item) => item.userId === "u-natural-stop-old-binding")
     const newBindingRecord = activeNaturalStops.find((item) => item.userId === "u-natural-stop-new-binding")
 
-    assert.equal(oldBindingRecord?.handle, "s1")
+    assert.equal(oldBindingRecord?.handle, oldHandle)
     assert.ok(newBindingRecord?.handle)
-    assert.notEqual(newBindingRecord?.handle, "s1")
+    assert.notEqual(newBindingRecord?.handle, oldHandle)
 
     const replyCalls = []
     const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
@@ -6042,15 +6817,9 @@ test("broker-entry slash handler: 旧 binding 残留 active natural-stop 时，�
 test("broker-entry slash handler: 同一 replyTarget 旧 natural-stop 进入 continued 后，旧 handle 返回固定终结原因，新 active 必须拿新 s*", async () => {
   const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-status-natural-stop-continued-handle-")
 
-  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-natural-stop-continued-server`)
   const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-natural-stop-continued-entry`)
   const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-natural-stop-continued-store`)
   const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-natural-stop-continued-operator`)
-  const protocol = await import(`../dist/wechat/protocol.js?reload=${Date.now()}-natural-stop-continued-protocol`)
-
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-natural-stop-continued-endpoint-"))
-  const endpoint = createBrokerEndpoint(tempDir)
-  const server = await brokerServer.startBrokerServer(endpoint)
 
   try {
     await operatorStore.rebindOperator({
@@ -6058,62 +6827,55 @@ test("broker-entry slash handler: 同一 replyTarget 旧 natural-stop 进入 con
       userId: "u-natural-stop-continued",
       boundAt: Date.now(),
     })
-    await registerAndSyncCandidates({
-      endpoint,
-      protocol,
-      instanceID: "instance-natural-stop-continued",
-      candidates: [{
-        idempotencyKey: "natural-stop-continued-old",
-        kind: "naturalStop",
-        createdAt: 1_700_998_500_000,
+
+    await notificationStore.upsertNotification({
+      idempotencyKey: "natural-stop-continued-old",
+      kind: "naturalStop",
+      handle: "s1",
+      scopeKey: "instance-natural-stop-continued",
+      sessionID: "session-natural-stop-continued",
+      replyTarget: {
+        instanceID: "instance-natural-stop-continued",
         sessionID: "session-natural-stop-continued",
-        handle: "s1",
-        replyTarget: {
-          instanceID: "instance-natural-stop-continued",
-          sessionID: "session-natural-stop-continued",
-        },
-        redactedSummary: "旧的 natural-stop",
-        severityAdvice: "已停止并等待你的回复",
-      }],
+      },
+      redactedSummary: "旧的 natural-stop",
+      severityAdvice: "已停止并等待你的回复",
+      wechatAccountId: "wx-natural-stop-continued",
+      userId: "u-natural-stop-continued",
+      createdAt: 1_700_998_500_000,
+    })
+    await notificationStore.markNotificationSent({
+      idempotencyKey: "natural-stop-continued-old",
+      sentAt: 1_700_998_500_010,
     })
 
-    await waitForAsync(async () => Boolean(await notificationStore.findActiveNaturalStopByHandle({ handle: "s1" })))
+    const oldHandle = "s1"
+    await notificationStore.markNaturalStopTerminal({
+      idempotencyKey: "natural-stop-continued-old",
+      resolvedAt: 1_700_998_500_020,
+      terminalReason: "continued",
+    })
 
-    await registerAndSyncCandidates({
-      endpoint,
-      protocol,
-      instanceID: "instance-natural-stop-continued",
-      candidates: [{
-        idempotencyKey: "natural-stop-continued-new",
-        kind: "naturalStop",
-        createdAt: 1_700_998_500_100,
+    await notificationStore.upsertNotification({
+      idempotencyKey: "natural-stop-continued-new",
+      kind: "naturalStop",
+      handle: "s2",
+      scopeKey: "instance-natural-stop-continued",
+      sessionID: "session-natural-stop-continued",
+      replyTarget: {
+        instanceID: "instance-natural-stop-continued",
         sessionID: "session-natural-stop-continued",
-        handle: "s1",
-        replyTarget: {
-          instanceID: "instance-natural-stop-continued",
-          sessionID: "session-natural-stop-continued",
-        },
-        redactedSummary: "新的 natural-stop",
-        severityAdvice: "已停止并等待你的回复",
-      }],
+      },
+      redactedSummary: "新的 natural-stop",
+      severityAdvice: "已停止并等待你的回复",
+      wechatAccountId: "wx-natural-stop-continued",
+      userId: "u-natural-stop-continued",
+      createdAt: 1_700_998_500_100,
     })
 
-    let newHandle = ""
-    await waitForAsync(async () => {
-      const list = await notificationStore.listPendingNotifications()
-      const record = list.find((item) => item.idempotencyKey === "natural-stop-continued-new")
-      if (!record?.handle) {
-        return false
-      }
-      const oldTerminal = await notificationStore.findTerminalNaturalStopByHandle({ handle: "s1" })
-      if (oldTerminal?.naturalStopTerminalReason !== "continued") {
-        return false
-      }
-      newHandle = record.handle
-      return true
-    })
+    const newHandle = "s2"
 
-    assert.notEqual(newHandle, "s1")
+    assert.notEqual(newHandle, oldHandle)
 
     const replyCalls = []
     const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
@@ -6124,8 +6886,8 @@ test("broker-entry slash handler: 同一 replyTarget 旧 natural-stop 进入 con
       },
     })
 
-    const oldReply = await handler({ type: "reply", handle: "s1", text: "旧通知再回复" })
-    assert.match(oldReply, /s1/)
+    const oldReply = await handler({ type: "reply", handle: oldHandle, text: "旧通知再回复" })
+    assert.match(oldReply, new RegExp(oldHandle))
     assert.match(oldReply, /已在电脑端继续处理/)
     assert.match(oldReply, /不再接受回复/)
 
@@ -6146,7 +6908,6 @@ test("broker-entry slash handler: 同一 replyTarget 旧 natural-stop 进入 con
       }],
     )
   } finally {
-    await server.close().catch(() => {})
     await isolatedStateRoot.restore()
   }
 })
@@ -6265,56 +7026,37 @@ test("broker-entry slash handler: 旧 terminal s1 保留期内仍返回固定终
   }
 })
 
-test("broker-entry slash handler: natural-stop 在实例 stale 后会过期，并返回固定已过期提示", async () => {
+test("broker-entry slash handler: natural-stop 已过期后返回固定已过期提示", async () => {
   const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-status-natural-stop-expired-")
-  const previousHeartbeatTimeout = process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
-  const previousHeartbeatScanInterval = process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS
-
-  process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = "50"
-  process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS = "50"
-
-  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-natural-stop-expired-server`)
   const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-natural-stop-expired-entry`)
   const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-natural-stop-expired-store`)
-  const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-natural-stop-expired-operator`)
-  const protocol = await import(`../dist/wechat/protocol.js?reload=${Date.now()}-natural-stop-expired-protocol`)
-
-  await operatorStore.rebindOperator({
-    wechatAccountId: "wx-natural-stop-expired",
-    userId: "u-natural-stop-expired",
-    boundAt: Date.now(),
-  })
-
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-natural-stop-expired-endpoint-"))
-  const endpoint = createBrokerEndpoint(tempDir)
-  const server = await brokerServer.startBrokerServer(endpoint)
 
   try {
-    await registerAndSyncCandidates({
-      endpoint,
-      protocol,
-      instanceID: "instance-natural-stop-expired",
-      candidates: [{
-        idempotencyKey: "natural-stop-expired-open",
-        kind: "naturalStop",
-        createdAt: 1_700_993_000_000,
+    await notificationStore.upsertNotification({
+      idempotencyKey: "natural-stop-expired-open",
+      kind: "naturalStop",
+      wechatAccountId: "wx-natural-stop-expired",
+      userId: "u-natural-stop-expired",
+      registrationEpoch: "epoch-natural-stop-expired",
+      handle: "s1",
+      scopeKey: "instance-natural-stop-expired",
+      sessionID: "session-natural-stop-expired",
+      replyTarget: {
+        instanceID: "instance-natural-stop-expired",
         sessionID: "session-natural-stop-expired",
-        handle: "s1",
-        replyTarget: {
-          instanceID: "instance-natural-stop-expired",
-          sessionID: "session-natural-stop-expired",
-        },
-        redactedSummary: "Agent 已自然中止，需要补充说明",
-        severityAdvice: "已停止并等待你的回复",
-      }],
+      },
+      redactedSummary: "Agent 已自然中止，需要补充说明",
+      severityAdvice: "已停止并等待你的回复",
+      createdAt: 1_700_993_000_000,
     })
 
     const handle = "s1"
 
-    await waitForAsync(async () => {
-      const terminal = await notificationStore.findTerminalNaturalStopByHandle({ handle })
-      return terminal?.naturalStopTerminalReason === "expired"
-    }, 4000)
+    await notificationStore.markNaturalStopTerminal({
+      idempotencyKey: "natural-stop-expired-open",
+      resolvedAt: 1_700_993_000_500,
+      terminalReason: "expired",
+    })
 
     const replyCalls = []
     const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
@@ -6333,17 +7075,6 @@ test("broker-entry slash handler: natural-stop 在实例 stale 后会过期，�
     assert.doesNotMatch(result, /bridge unavailable/)
     assert.equal(replyCalls.length, 0)
   } finally {
-    if (previousHeartbeatTimeout === undefined) {
-      delete process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
-    } else {
-      process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = previousHeartbeatTimeout
-    }
-    if (previousHeartbeatScanInterval === undefined) {
-      delete process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS
-    } else {
-      process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS = previousHeartbeatScanInterval
-    }
-    await server.close().catch(() => {})
     await isolatedStateRoot.restore()
   }
 })

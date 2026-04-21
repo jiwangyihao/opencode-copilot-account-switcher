@@ -1,0 +1,1431 @@
+import path from "node:path"
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import type {
+  BrokerAckPayload,
+  BrokerCommandStatus,
+  BrokerToBridgeCommandType,
+  BrokerToBridgeControlType,
+  BridgeToBrokerEvent,
+} from "./protocol.js"
+import {
+  brokerStateSchemaPath,
+  brokerStateStorePath,
+  notificationsDir,
+  requestKindDir,
+} from "./state-paths.js"
+
+type UnknownRecord = Record<string, unknown>
+
+export const BROKER_STATE_SCHEMA_MARKER_KIND = "wechat-broker-state-store"
+export const LEGACY_STATE_RESET_UPGRADE_CLOSE_REASON = "legacy-state-reset-awaiting-full-sync"
+
+export type BrokerStateSchemaMarker = {
+  kind?: string
+  protocolVersion: number
+  stateGeneration: string
+  updatedAt: number
+  upgradeCloseReason?: string
+  legacyHandleClosures?: string[]
+}
+
+export type PrepareBrokerStateStoreForStartupInput = {
+  protocolVersion: number
+  stateGeneration: string
+  now?: () => number
+}
+
+export type PrepareBrokerStateStoreForStartupResult = {
+  state: BrokerState
+  recoveredFromLegacyState: boolean
+  legacyHandleClosures: string[]
+}
+
+export type BrokerConnectionState = {
+  instanceID: string
+  instanceIncarnation: string
+  online: boolean
+  lastEventSeq: number
+  lastAckedEventSeq: number
+  lastSentBrokerSeq: number
+  connectedAt?: number
+  disconnectedAt?: number
+  disconnectReason?: string
+}
+
+export type BrokerConnectionScope = {
+  instanceID: string
+  instanceIncarnation: string
+}
+
+export type BrokerActiveState = {
+  instances: Record<string, UnknownRecord>
+  sessions: Record<string, UnknownRecord>
+  questions: Record<string, UnknownRecord>
+  permissions: Record<string, UnknownRecord>
+  naturalStops: Record<string, UnknownRecord>
+  retryErrors: Record<string, UnknownRecord>
+}
+
+export type BrokerTerminalMetadata = {
+  reason: string
+  replacementHandle?: string
+  terminalResultSent?: boolean
+  retainedUntil?: number
+}
+
+export type BrokerRetainedOccupancy = {
+  handle: string
+  retainedUntil: number
+}
+
+export type BrokerCommandRecord = {
+  commandId: string
+  brokerSeq: number
+  type: BrokerToBridgeCommandType
+  target: UnknownRecord
+  payload?: unknown
+  status: BrokerCommandStatus
+  acceptedAt?: number
+  completedAt?: number
+  failure?: UnknownRecord
+  instanceID?: string
+  instanceIncarnation?: string
+  acceptedEventSeq?: number
+  resultEventSeq?: number
+}
+
+export type BrokerControlStatus = "inFlight" | "completed"
+
+export type BrokerControlRecord = {
+  controlId: string
+  brokerSeq: number
+  type: BrokerToBridgeControlType
+  status: BrokerControlStatus
+  instanceID: string
+  instanceIncarnation: string
+  fromEventSeq?: number
+  toEventSeq?: number
+  reason?: string
+  completedEventSeq?: number
+}
+
+export type BrokerFullSyncStage = {
+  controlId: string
+  instanceID: string
+  instanceIncarnation: string
+  state: BrokerState
+}
+
+export type BrokerFullSyncSnapshot = {
+  connections?: Record<string, Record<string, BrokerConnectionState>>
+  active: BrokerActiveState
+}
+
+export type BrokerState = {
+  connections: Record<string, Record<string, BrokerConnectionState>>
+  active: BrokerActiveState
+  terminalMetadata: Record<string, BrokerTerminalMetadata>
+  retainedOccupancy: Record<string, BrokerRetainedOccupancy>
+  commandLedger: Record<string, BrokerCommandRecord>
+  controlLedger: Record<string, BrokerControlRecord>
+  fullSync: {
+    lastCompletedControlId?: string
+    lastCompletedEventSeq?: number
+    lastCompletedInstanceIncarnation?: string
+    stagedByControlId: Record<string, BrokerFullSyncStage>
+  }
+}
+
+export type UpsertBrokerCommandInput = {
+  commandId: string
+  brokerSeq: number
+  type: BrokerToBridgeCommandType
+  status: "queued" | "delivered"
+  target: UnknownRecord
+  payload?: unknown
+  instanceID?: string
+  instanceIncarnation?: string
+}
+
+export type RequestBrokerReplayInput = {
+  controlId: string
+  brokerSeq: number
+  instanceID: string
+  instanceIncarnation: string
+  fromEventSeq: number
+  toEventSeq: number
+}
+
+export type MarkBrokerReplayCompletedInput = {
+  controlId: string
+  completedEventSeq: number
+}
+
+export type RequestBrokerFullSyncInput = {
+  controlId: string
+  brokerSeq: number
+  instanceID: string
+  instanceIncarnation: string
+  reason: string
+}
+
+export type StageBrokerFullSyncEventInput = {
+  controlId: string
+  event: BridgeToBrokerEvent
+  context?: ApplyBridgeEventContext
+}
+
+export type MarkBrokerFullSyncCompletedInput = {
+  controlId: string
+  instanceID: string
+  instanceIncarnation: string
+  eventSeq: number
+}
+
+export type MarkBrokerCommandAcceptedInput = {
+  commandId: string
+  instanceID: string
+  instanceIncarnation: string
+  eventSeq: number
+  acceptedAt?: number
+}
+
+export type MarkBrokerCommandResultInput = {
+  commandId: string
+  instanceID: string
+  instanceIncarnation: string
+  eventSeq: number
+  status: "completed" | "failed"
+  completedAt?: number
+  failure?: UnknownRecord
+}
+
+export type MarkConnectionAckedEventSeqInput = BrokerAckPayload & {
+  instanceID: string
+}
+
+export type MarkConnectionSentBrokerSeqInput = BrokerConnectionScope & {
+  brokerSeq: number
+}
+
+export type ApplyBridgeEventContext = {
+  instanceID?: string
+}
+
+export type BrokerAuthoritativeView = {
+  connections: Record<string, Record<string, BrokerConnectionState>>
+  active: BrokerActiveState
+  terminalMetadata: Record<string, BrokerTerminalMetadata>
+  retainedOccupancy: Record<string, BrokerRetainedOccupancy>
+}
+
+export type BrokerCommandActionInput = {
+  type: BrokerToBridgeCommandType
+  target: UnknownRecord
+  payload?: unknown
+}
+
+const trackedBrokerStates: BrokerState[] = []
+const trackedBrokerStateTouch = new WeakMap<BrokerState, number>()
+let nextTrackedBrokerStateTouch = 0
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0
+}
+
+function isSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value)
+}
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null
+}
+
+function assertNonNegativeInteger(value: unknown, fieldName: string) {
+  if (!isSafeInteger(value) || value < 0) {
+    throw new Error(`invalid ${fieldName}`)
+  }
+}
+
+function assertCommandType(value: unknown): asserts value is BrokerToBridgeCommandType {
+  if (value !== "replyQuestion" && value !== "replyPermission" && value !== "replyNaturalStop") {
+    throw new Error("invalid broker command type")
+  }
+}
+
+function assertControlType(value: unknown): asserts value is BrokerToBridgeControlType {
+  if (value !== "requestReplay" && value !== "requestFullSync") {
+    throw new Error("invalid broker control type")
+  }
+}
+
+function createEmptyActiveState(): BrokerActiveState {
+  return {
+    instances: {},
+    sessions: {},
+    questions: {},
+    permissions: {},
+    naturalStops: {},
+    retryErrors: {},
+  }
+}
+
+function cloneRecordMap<T extends Record<string, UnknownRecord>>(value: T): T {
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneUnknownValue(item)])) as T
+}
+
+function cloneUnknownValue<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => cloneUnknownValue(item)) as T
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneUnknownValue(item)])) as T
+  }
+  return value
+}
+
+function cloneTerminalMetadataMap(value: Record<string, BrokerTerminalMetadata>) {
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, { ...item }]))
+}
+
+function cloneRetainedOccupancyMap(value: Record<string, BrokerRetainedOccupancy>) {
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, { ...item }]))
+}
+
+function normalizeHandleClosures(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return Array.from(new Set(
+    value
+      .map((item) => normalizeActionString(item))
+      .filter((item): item is string => item !== undefined),
+  )).sort((left, right) => left.localeCompare(right))
+}
+
+function cloneCommandRecord(record: BrokerCommandRecord): BrokerCommandRecord {
+  return {
+    ...record,
+    target: cloneUnknownValue(record.target),
+    ...(record.payload !== undefined ? { payload: cloneUnknownValue(record.payload) } : {}),
+    ...(record.failure ? { failure: cloneUnknownValue(record.failure) } : {}),
+  }
+}
+
+function rememberBrokerState<T extends BrokerState>(state: T): T {
+  if (!trackedBrokerStateTouch.has(state)) {
+    trackedBrokerStates.push(state)
+  }
+  nextTrackedBrokerStateTouch += 1
+  trackedBrokerStateTouch.set(state, nextTrackedBrokerStateTouch)
+  return state
+}
+
+function resolveBrokerState(state?: BrokerState): BrokerState | undefined {
+  if (state) {
+    return rememberBrokerState(state)
+  }
+
+  const stagedStates = new Set<BrokerState>()
+  for (const candidate of trackedBrokerStates) {
+    for (const stage of Object.values(candidate.fullSync.stagedByControlId)) {
+      stagedStates.add(stage.state)
+    }
+  }
+
+  const candidates = trackedBrokerStates
+    .filter((candidate) => trackedBrokerStateTouch.has(candidate) && !stagedStates.has(candidate))
+    .sort((left, right) => (trackedBrokerStateTouch.get(right) ?? 0) - (trackedBrokerStateTouch.get(left) ?? 0))
+
+  const latest = candidates[0]
+  return latest ? rememberBrokerState(latest) : undefined
+}
+
+async function readJsonFile(filePath: string): Promise<unknown | undefined> {
+  try {
+    const raw = await readFile(filePath, "utf8")
+    return JSON.parse(raw) as unknown
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return undefined
+    }
+    return undefined
+  }
+}
+
+async function listJsonFiles(dirPath: string): Promise<string[]> {
+  try {
+    const entries = await readdir(dirPath, { withFileTypes: true })
+    return entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map((entry) => path.join(dirPath, entry.name))
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return []
+    }
+    throw error
+  }
+}
+
+async function collectHandleClosuresFromJsonFiles(
+  filePaths: string[],
+  predicate?: (record: UnknownRecord) => boolean,
+): Promise<string[]> {
+  const handles = new Set<string>()
+
+  for (const filePath of filePaths) {
+    const raw = await readJsonFile(filePath)
+    if (!isRecord(raw)) {
+      continue
+    }
+    if (predicate && !predicate(raw)) {
+      continue
+    }
+
+    const handle = getStringField(raw, "handle")
+    if (handle) {
+      handles.add(handle)
+    }
+  }
+
+  return Array.from(handles)
+}
+
+async function collectLegacyHandleClosures(): Promise<string[]> {
+  const questionFiles = await listJsonFiles(requestKindDir("question"))
+  const permissionFiles = await listJsonFiles(requestKindDir("permission"))
+  const notificationFiles = await listJsonFiles(notificationsDir())
+  const [questionHandles, permissionHandles, naturalStopHandles] = await Promise.all([
+    collectHandleClosuresFromJsonFiles(questionFiles),
+    collectHandleClosuresFromJsonFiles(permissionFiles),
+    collectHandleClosuresFromJsonFiles(notificationFiles, (record) => getStringField(record, "kind") === "naturalStop"),
+  ])
+
+  return Array.from(new Set([
+    ...questionHandles,
+    ...permissionHandles,
+    ...naturalStopHandles,
+  ])).sort((left, right) => left.localeCompare(right))
+}
+
+function restorePersistedBrokerState(raw: unknown): BrokerState | undefined {
+  if (!isRecord(raw) || !isRecord(raw.connections) || !isRecord(raw.active)) {
+    return undefined
+  }
+
+  const active = raw.active
+  if (
+    !isRecord(active.instances)
+    || !isRecord(active.sessions)
+    || !isRecord(active.questions)
+    || !isRecord(active.permissions)
+    || !isRecord(active.naturalStops)
+    || !isRecord(active.retryErrors)
+  ) {
+    return undefined
+  }
+
+  const state = createEmptyBrokerState()
+  state.connections = cloneUnknownValue(raw.connections as Record<string, Record<string, BrokerConnectionState>>)
+  state.active = cloneUnknownValue(active as BrokerActiveState)
+  state.terminalMetadata = isRecord(raw.terminalMetadata)
+    ? cloneUnknownValue(raw.terminalMetadata as Record<string, BrokerTerminalMetadata>)
+    : {}
+  state.retainedOccupancy = isRecord(raw.retainedOccupancy)
+    ? cloneUnknownValue(raw.retainedOccupancy as Record<string, BrokerRetainedOccupancy>)
+    : {}
+  state.commandLedger = isRecord(raw.commandLedger)
+    ? cloneUnknownValue(raw.commandLedger as Record<string, BrokerCommandRecord>)
+    : {}
+  state.controlLedger = isRecord(raw.controlLedger)
+    ? cloneUnknownValue(raw.controlLedger as Record<string, BrokerControlRecord>)
+    : {}
+  state.fullSync = {
+    stagedByControlId: {},
+    ...(isRecord(raw.fullSync) && isNonEmptyString(raw.fullSync.lastCompletedControlId)
+      ? { lastCompletedControlId: raw.fullSync.lastCompletedControlId }
+      : {}),
+    ...(isRecord(raw.fullSync) && isSafeInteger(raw.fullSync.lastCompletedEventSeq)
+      ? { lastCompletedEventSeq: raw.fullSync.lastCompletedEventSeq }
+      : {}),
+    ...(isRecord(raw.fullSync) && isNonEmptyString(raw.fullSync.lastCompletedInstanceIncarnation)
+      ? { lastCompletedInstanceIncarnation: raw.fullSync.lastCompletedInstanceIncarnation }
+      : {}),
+  }
+  return rememberBrokerState(state)
+}
+
+async function writeBrokerStateStoreSnapshot(state: BrokerState): Promise<void> {
+  const filePath = brokerStateStorePath()
+  await mkdir(path.dirname(filePath), { recursive: true })
+  await writeFile(filePath, JSON.stringify(state, null, 2), "utf8")
+}
+
+export async function readBrokerStateSchemaMarker(): Promise<BrokerStateSchemaMarker | undefined> {
+  const raw = await readJsonFile(brokerStateSchemaPath())
+  if (!isRecord(raw) || !isSafeInteger(raw.protocolVersion) || !isNonEmptyString(raw.stateGeneration) || !isSafeInteger(raw.updatedAt)) {
+    return undefined
+  }
+
+  return {
+    kind: isNonEmptyString(raw.kind) ? raw.kind : BROKER_STATE_SCHEMA_MARKER_KIND,
+    protocolVersion: raw.protocolVersion,
+    stateGeneration: raw.stateGeneration,
+    updatedAt: raw.updatedAt,
+    ...(isNonEmptyString(raw.upgradeCloseReason) ? { upgradeCloseReason: raw.upgradeCloseReason } : {}),
+    ...(normalizeHandleClosures(raw.legacyHandleClosures).length > 0
+      ? { legacyHandleClosures: normalizeHandleClosures(raw.legacyHandleClosures) }
+      : {}),
+  }
+}
+
+export async function writeBrokerStateSchemaMarker(input: BrokerStateSchemaMarker): Promise<BrokerStateSchemaMarker> {
+  assertNonNegativeInteger(input.protocolVersion, "protocolVersion")
+  if (!isNonEmptyString(input.stateGeneration)) {
+    throw new Error("invalid stateGeneration")
+  }
+  assertNonNegativeInteger(input.updatedAt, "updatedAt")
+
+  const marker: BrokerStateSchemaMarker = {
+    kind: BROKER_STATE_SCHEMA_MARKER_KIND,
+    protocolVersion: input.protocolVersion,
+    stateGeneration: input.stateGeneration,
+    updatedAt: input.updatedAt,
+    ...(isNonEmptyString(input.upgradeCloseReason) ? { upgradeCloseReason: input.upgradeCloseReason } : {}),
+    ...(normalizeHandleClosures(input.legacyHandleClosures).length > 0
+      ? { legacyHandleClosures: normalizeHandleClosures(input.legacyHandleClosures) }
+      : {}),
+  }
+
+  const filePath = brokerStateSchemaPath()
+  await mkdir(path.dirname(filePath), { recursive: true })
+  await writeFile(filePath, JSON.stringify(marker, null, 2), "utf8")
+  return marker
+}
+
+export async function prepareBrokerStateStoreForStartup(
+  input: PrepareBrokerStateStoreForStartupInput,
+): Promise<PrepareBrokerStateStoreForStartupResult> {
+  assertNonNegativeInteger(input.protocolVersion, "protocolVersion")
+  if (!isNonEmptyString(input.stateGeneration)) {
+    throw new Error("invalid stateGeneration")
+  }
+
+  const now = input.now ?? Date.now
+  const marker = await readBrokerStateSchemaMarker()
+  const rawState = await readJsonFile(brokerStateStorePath())
+  const markerMatches = marker?.protocolVersion === input.protocolVersion && marker?.stateGeneration === input.stateGeneration
+  const hasPersistedState = marker !== undefined || rawState !== undefined
+
+  let recoveredFromLegacyState = false
+  let legacyHandleClosures = markerMatches ? normalizeHandleClosures(marker?.legacyHandleClosures) : []
+  let state = markerMatches ? (restorePersistedBrokerState(rawState) ?? createEmptyBrokerState()) : createEmptyBrokerState()
+
+  if (!markerMatches && hasPersistedState) {
+    recoveredFromLegacyState = true
+    legacyHandleClosures = await collectLegacyHandleClosures()
+    state = createEmptyBrokerState()
+  }
+
+  await writeBrokerStateStoreSnapshot(state)
+  const persistedMarker = await writeBrokerStateSchemaMarker({
+    protocolVersion: input.protocolVersion,
+    stateGeneration: input.stateGeneration,
+    updatedAt: now(),
+    ...(legacyHandleClosures.length > 0
+      ? {
+          upgradeCloseReason: marker?.upgradeCloseReason ?? LEGACY_STATE_RESET_UPGRADE_CLOSE_REASON,
+          legacyHandleClosures,
+        }
+      : {}),
+  })
+
+  return {
+    state,
+    recoveredFromLegacyState,
+    legacyHandleClosures: normalizeHandleClosures(persistedMarker.legacyHandleClosures),
+  }
+}
+
+export async function readBrokerStateUpgradeCloseReason(handle: string): Promise<string | undefined> {
+  if (!isNonEmptyString(handle)) {
+    return undefined
+  }
+
+  const marker = await readBrokerStateSchemaMarker()
+  if (!marker?.upgradeCloseReason) {
+    return undefined
+  }
+
+  const closures = normalizeHandleClosures(marker.legacyHandleClosures)
+  if (!closures.includes(handle)) {
+    return undefined
+  }
+
+  if (marker.upgradeCloseReason === LEGACY_STATE_RESET_UPGRADE_CLOSE_REASON) {
+    return `该句柄来自旧状态代际，broker 正在升级恢复，请等待实例重连并完成 full sync 后再试：${handle}`
+  }
+
+  return `该句柄暂时不可用：${handle}`
+}
+
+function normalizeActionString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined
+  }
+  const normalized = value.trim().replace(/\s+/g, " ")
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function normalizeAnswerMatrix(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  const normalized: string[] = []
+  for (const group of value) {
+    if (Array.isArray(group)) {
+      normalized.push(...group.map((item) => normalizeActionString(item)).filter((item): item is string => item !== undefined))
+      continue
+    }
+    const next = normalizeActionString(group)
+    if (next) {
+      normalized.push(next)
+    }
+  }
+
+  return normalized.sort((left, right) => left.localeCompare(right))
+}
+
+function createBrokerCommandActionKey(input: BrokerCommandActionInput): string {
+  const instanceID = normalizeActionString(input.target.instanceID) ?? ""
+
+  if (input.type === "replyQuestion") {
+    const requestID = normalizeActionString(input.target.requestID)
+      ?? normalizeActionString(isRecord(input.payload) ? input.payload.requestID : undefined)
+      ?? ""
+    const answers = normalizeAnswerMatrix(isRecord(input.payload) ? input.payload.answers : undefined)
+    return JSON.stringify({
+      type: input.type,
+      target: { instanceID, requestID },
+      payload: { answers },
+    })
+  }
+
+  if (input.type === "replyPermission") {
+    const requestID = normalizeActionString(input.target.requestID)
+      ?? normalizeActionString(isRecord(input.payload) ? input.payload.requestID : undefined)
+      ?? ""
+    const reply = normalizeActionString(isRecord(input.payload) ? input.payload.reply : undefined) ?? ""
+    const message = normalizeActionString(isRecord(input.payload) ? input.payload.message : undefined) ?? ""
+    return JSON.stringify({
+      type: input.type,
+      target: { instanceID, requestID },
+      payload: { reply, message },
+    })
+  }
+
+  const sessionID = normalizeActionString(input.target.sessionID)
+    ?? normalizeActionString(isRecord(input.payload) ? input.payload.sessionID : undefined)
+    ?? ""
+  const text = normalizeActionString(isRecord(input.payload) ? input.payload.text : undefined) ?? ""
+  return JSON.stringify({
+    type: input.type,
+    target: { instanceID, sessionID },
+    payload: { text },
+  })
+}
+
+function cloneConnectionMap(value: Record<string, Record<string, BrokerConnectionState>>) {
+  return Object.fromEntries(
+    Object.entries(value).map(([instanceID, incarnations]) => [
+      instanceID,
+      Object.fromEntries(Object.entries(incarnations).map(([incarnation, item]) => [incarnation, { ...item }])),
+    ]),
+  )
+}
+
+function cloneActiveState(state: BrokerActiveState): BrokerActiveState {
+  return {
+    instances: cloneRecordMap(state.instances),
+    sessions: cloneRecordMap(state.sessions),
+    questions: cloneRecordMap(state.questions),
+    permissions: cloneRecordMap(state.permissions),
+    naturalStops: cloneRecordMap(state.naturalStops),
+    retryErrors: cloneRecordMap(state.retryErrors),
+  }
+}
+
+function getConnectionGroup(state: BrokerState, instanceID: string) {
+  const current = state.connections[instanceID]
+  if (current) {
+    return current
+  }
+
+  const created: Record<string, BrokerConnectionState> = {}
+  state.connections[instanceID] = created
+  return created
+}
+
+function getStringField(record: UnknownRecord, fieldName: string): string | undefined {
+  const value = record[fieldName]
+  return isNonEmptyString(value) ? value : undefined
+}
+
+function getNumberField(record: UnknownRecord, fieldName: string): number | undefined {
+  const value = record[fieldName]
+  return isSafeInteger(value) ? value : undefined
+}
+
+function ensureConnection(
+  state: BrokerState,
+  instanceID: string,
+  instanceIncarnation: string,
+): BrokerConnectionState {
+  const current = getConnectionGroup(state, instanceID)[instanceIncarnation]
+  if (current) {
+    return current
+  }
+
+  const created: BrokerConnectionState = {
+    instanceID,
+    instanceIncarnation,
+    online: false,
+    lastEventSeq: 0,
+    lastAckedEventSeq: 0,
+    lastSentBrokerSeq: 0,
+  }
+  getConnectionGroup(state, instanceID)[instanceIncarnation] = created
+  return created
+}
+
+function resolveInstanceID(payload: UnknownRecord, context?: ApplyBridgeEventContext): string | undefined {
+  if (isNonEmptyString(context?.instanceID)) {
+    return context.instanceID
+  }
+  return getStringField(payload, "instanceID")
+}
+
+function updateConnectionEventWatermark(
+  state: BrokerState,
+  event: BridgeToBrokerEvent,
+  payload: UnknownRecord,
+  context?: ApplyBridgeEventContext,
+) {
+  const instanceID = resolveInstanceID(payload, context)
+  if (!instanceID) {
+    return undefined
+  }
+
+  const connection = ensureConnection(state, instanceID, event.instanceIncarnation)
+  connection.lastEventSeq = Math.max(connection.lastEventSeq, event.eventSeq)
+  return connection
+}
+
+function requireCommand(state: BrokerState, commandId: string): BrokerCommandRecord {
+  const current = state.commandLedger[commandId]
+  if (!current) {
+    throw new Error("unknown broker command")
+  }
+  return current
+}
+
+export function createEmptyBrokerState(): BrokerState {
+  return rememberBrokerState({
+    connections: {},
+    active: createEmptyActiveState(),
+    terminalMetadata: {},
+    retainedOccupancy: {},
+    commandLedger: {},
+    controlLedger: {},
+    fullSync: {
+      stagedByControlId: {},
+    },
+  })
+}
+
+export function applyBridgeEvent<TPayload = unknown>(
+  state: BrokerState,
+  event: BridgeToBrokerEvent<TPayload>,
+  context?: ApplyBridgeEventContext,
+): BrokerState {
+  rememberBrokerState(state)
+  assertNonNegativeInteger(event.eventSeq, "eventSeq")
+  if (!isNonEmptyString(event.instanceIncarnation)) {
+    throw new Error("invalid instanceIncarnation")
+  }
+  if (!isRecord(event.payload)) {
+    throw new Error("invalid bridge event payload")
+  }
+
+  const payload = event.payload
+  const connection = updateConnectionEventWatermark(state, event, payload, context)
+
+  switch (event.type) {
+    case "instanceOnline": {
+      const instanceID = resolveInstanceID(payload, context)
+      if (!instanceID) {
+        throw new Error("invalid instanceOnline payload")
+      }
+
+      const nextConnection = ensureConnection(state, instanceID, event.instanceIncarnation)
+      nextConnection.online = true
+      nextConnection.connectedAt = getNumberField(payload, "connectedAt")
+      state.active.instances[instanceID] = {
+        ...payload,
+        instanceID,
+        instanceIncarnation: event.instanceIncarnation,
+        online: true,
+      }
+      return state
+    }
+    case "instanceOffline": {
+      const instanceID = resolveInstanceID(payload, context)
+      if (!instanceID) {
+        throw new Error("invalid instanceOffline payload")
+      }
+
+      const nextConnection = ensureConnection(state, instanceID, event.instanceIncarnation)
+      nextConnection.online = false
+      nextConnection.disconnectedAt = getNumberField(payload, "disconnectedAt")
+      nextConnection.disconnectReason = getStringField(payload, "reason")
+      state.active.instances[instanceID] = {
+        ...state.active.instances[instanceID],
+        ...payload,
+        instanceID,
+        instanceIncarnation: event.instanceIncarnation,
+        online: false,
+      }
+      return state
+    }
+    case "sessionSnapshotChanged": {
+      const sessionID = getStringField(payload, "sessionID")
+      if (!sessionID) {
+        throw new Error("invalid sessionSnapshotChanged payload")
+      }
+
+      const instanceID = resolveInstanceID(payload, context)
+      state.active.sessions[sessionID] = {
+        ...payload,
+        ...(instanceID ? { instanceID } : {}),
+        instanceIncarnation: event.instanceIncarnation,
+      }
+      return state
+    }
+    case "questionOpened":
+    case "questionUpdated": {
+      const routeKey = getStringField(payload, "routeKey")
+      if (!routeKey) {
+        throw new Error("invalid question payload")
+      }
+
+      const instanceID = resolveInstanceID(payload, context)
+      state.active.questions[routeKey] = {
+        ...payload,
+        ...(instanceID ? { instanceID } : {}),
+        instanceIncarnation: event.instanceIncarnation,
+      }
+      return state
+    }
+    case "questionClosed": {
+      const routeKey = getStringField(payload, "routeKey")
+      if (!routeKey) {
+        throw new Error("invalid question payload")
+      }
+
+      delete state.active.questions[routeKey]
+      const reason = getStringField(payload, "reason")
+      if (reason) {
+        state.terminalMetadata[routeKey] = {
+          reason,
+          ...(isNonEmptyString(payload.replacementHandle) ? { replacementHandle: payload.replacementHandle } : {}),
+          ...(typeof payload.terminalResultSent === "boolean"
+            ? { terminalResultSent: payload.terminalResultSent }
+            : {}),
+          ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
+        }
+      }
+      return state
+    }
+    case "permissionOpened":
+    case "permissionUpdated": {
+      const routeKey = getStringField(payload, "routeKey")
+      if (!routeKey) {
+        throw new Error("invalid permission payload")
+      }
+
+      const instanceID = resolveInstanceID(payload, context)
+      state.active.permissions[routeKey] = {
+        ...payload,
+        ...(instanceID ? { instanceID } : {}),
+        instanceIncarnation: event.instanceIncarnation,
+      }
+      return state
+    }
+    case "permissionClosed": {
+      const routeKey = getStringField(payload, "routeKey")
+      if (!routeKey) {
+        throw new Error("invalid permission payload")
+      }
+
+      delete state.active.permissions[routeKey]
+      const reason = getStringField(payload, "reason")
+      if (reason) {
+        state.terminalMetadata[routeKey] = {
+          reason,
+          ...(isNonEmptyString(payload.replacementHandle) ? { replacementHandle: payload.replacementHandle } : {}),
+          ...(typeof payload.terminalResultSent === "boolean"
+            ? { terminalResultSent: payload.terminalResultSent }
+            : {}),
+          ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
+        }
+      }
+      return state
+    }
+    case "naturalStopOpened": {
+      const handle = getStringField(payload, "handle")
+      if (!handle) {
+        throw new Error("invalid naturalStop payload")
+      }
+
+      const instanceID = resolveInstanceID(payload, context)
+      state.active.naturalStops[handle] = {
+        ...payload,
+        ...(instanceID ? { instanceID } : {}),
+        instanceIncarnation: event.instanceIncarnation,
+      }
+      return state
+    }
+    case "naturalStopClosed": {
+      const handle = getStringField(payload, "handle")
+      if (!handle) {
+        throw new Error("invalid naturalStop payload")
+      }
+
+      delete state.active.naturalStops[handle]
+      const retainedUntil = getNumberField(payload, "retainedUntil")
+      if (retainedUntil !== undefined) {
+        state.retainedOccupancy[handle] = {
+          handle,
+          retainedUntil,
+        }
+      }
+      return state
+    }
+    case "retryErrorUpdated": {
+      const retryKey = getStringField(payload, "sessionID") ?? getStringField(payload, "instanceID") ?? `retry-${event.eventSeq}`
+      const instanceID = resolveInstanceID(payload, context)
+      state.active.retryErrors[retryKey] = {
+        ...payload,
+        ...(instanceID ? { instanceID } : {}),
+        instanceIncarnation: event.instanceIncarnation,
+      }
+      return state
+    }
+    case "commandAccepted": {
+      const commandId = getStringField(payload, "commandId")
+      if (!commandId || !connection) {
+        throw new Error("invalid commandAccepted payload")
+      }
+
+      markBrokerCommandAccepted(state, {
+        commandId,
+        instanceID: connection.instanceID,
+        instanceIncarnation: event.instanceIncarnation,
+        eventSeq: event.eventSeq,
+        acceptedAt: getNumberField(payload, "acceptedAt"),
+      })
+      return state
+    }
+    case "commandResult": {
+      const commandId = getStringField(payload, "commandId")
+      const status = payload.status
+      if (!commandId || !connection || (status !== "completed" && status !== "failed")) {
+        throw new Error("invalid commandResult payload")
+      }
+
+      markBrokerCommandResult(state, {
+        commandId,
+        instanceID: connection.instanceID,
+        instanceIncarnation: event.instanceIncarnation,
+        eventSeq: event.eventSeq,
+        status,
+        completedAt: getNumberField(payload, "completedAt"),
+        failure: isRecord(payload.failure) ? payload.failure : undefined,
+      })
+      return state
+    }
+    case "fullSyncCompleted": {
+      const controlId = event.controlId ?? getStringField(payload, "controlId")
+      if (!controlId) {
+        throw new Error("invalid fullSyncCompleted payload")
+      }
+
+      state.fullSync = {
+        ...state.fullSync,
+        lastCompletedControlId: controlId,
+        lastCompletedEventSeq: event.eventSeq,
+        lastCompletedInstanceIncarnation: event.instanceIncarnation,
+      }
+      return state
+    }
+    default:
+      return state
+  }
+}
+
+function matchesActiveScope(record: UnknownRecord, scope: BrokerConnectionScope): boolean {
+  const instanceID = getStringField(record, "instanceID")
+  if (instanceID !== scope.instanceID) {
+    return false
+  }
+
+  const instanceIncarnation = getStringField(record, "instanceIncarnation")
+  return instanceIncarnation === undefined || instanceIncarnation === scope.instanceIncarnation
+}
+
+function addScopedRecord(record: UnknownRecord, scope: BrokerConnectionScope): UnknownRecord {
+  return {
+    ...record,
+    instanceID: getStringField(record, "instanceID") ?? scope.instanceID,
+    instanceIncarnation: getStringField(record, "instanceIncarnation") ?? scope.instanceIncarnation,
+  }
+}
+
+function replaceScopedActiveRecords(
+  current: Record<string, UnknownRecord>,
+  incoming: Record<string, UnknownRecord>,
+  scope: BrokerConnectionScope,
+): Record<string, UnknownRecord> {
+  const retainedEntries = Object.entries(current).filter(([, record]) => !matchesActiveScope(record, scope))
+  const scopedEntries = Object.entries(incoming).map(([key, record]) => [key, addScopedRecord(record, scope)])
+  return Object.fromEntries([...retainedEntries, ...scopedEntries])
+}
+
+export function applyFullSyncSnapshot(
+  state: BrokerState,
+  scope: BrokerConnectionScope,
+  snapshot: BrokerFullSyncSnapshot,
+): BrokerState {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(scope.instanceID) || !isNonEmptyString(scope.instanceIncarnation)) {
+    throw new Error("invalid full sync scope")
+  }
+  if (!isRecord(snapshot) || !isRecord(snapshot.active)) {
+    throw new Error("invalid full sync snapshot")
+  }
+
+  if (snapshot.connections?.[scope.instanceID]?.[scope.instanceIncarnation]) {
+    const incomingConnection = snapshot.connections[scope.instanceID][scope.instanceIncarnation]
+    getConnectionGroup(state, scope.instanceID)[scope.instanceIncarnation] = { ...incomingConnection }
+  }
+
+  // Full sync only replaces the targeted instance/incarnation live domains.
+  state.active = {
+    instances: replaceScopedActiveRecords(state.active.instances, snapshot.active.instances, scope),
+    sessions: replaceScopedActiveRecords(state.active.sessions, snapshot.active.sessions, scope),
+    questions: replaceScopedActiveRecords(state.active.questions, snapshot.active.questions, scope),
+    permissions: replaceScopedActiveRecords(state.active.permissions, snapshot.active.permissions, scope),
+    naturalStops: replaceScopedActiveRecords(state.active.naturalStops, snapshot.active.naturalStops, scope),
+    retryErrors: replaceScopedActiveRecords(state.active.retryErrors, snapshot.active.retryErrors, scope),
+  }
+  return state
+}
+
+export function upsertBrokerCommand(
+  state: BrokerState,
+  input: UpsertBrokerCommandInput,
+): BrokerCommandRecord {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.commandId)) {
+    throw new Error("invalid commandId")
+  }
+  assertNonNegativeInteger(input.brokerSeq, "brokerSeq")
+  assertCommandType(input.type)
+  if (input.status !== "queued" && input.status !== "delivered") {
+    throw new Error("invalid broker command status")
+  }
+  if (!isRecord(input.target)) {
+    throw new Error("invalid broker command target")
+  }
+
+  const current = state.commandLedger[input.commandId]
+  const next: BrokerCommandRecord = {
+    commandId: input.commandId,
+    brokerSeq: input.brokerSeq,
+    type: input.type,
+    target: { ...input.target },
+    ...(input.payload !== undefined
+      ? { payload: cloneUnknownValue(input.payload) }
+      : current?.payload !== undefined
+        ? { payload: cloneUnknownValue(current.payload) }
+        : {}),
+    status: input.status,
+    ...(current?.acceptedAt !== undefined ? { acceptedAt: current.acceptedAt } : {}),
+    ...(current?.completedAt !== undefined ? { completedAt: current.completedAt } : {}),
+    ...(current?.failure ? { failure: { ...current.failure } } : {}),
+    ...(input.instanceID !== undefined
+      ? { instanceID: input.instanceID }
+      : current?.instanceID
+        ? { instanceID: current.instanceID }
+        : {}),
+    ...(input.instanceIncarnation !== undefined
+      ? { instanceIncarnation: input.instanceIncarnation }
+      : current?.instanceIncarnation
+        ? { instanceIncarnation: current.instanceIncarnation }
+        : {}),
+    ...(current?.acceptedEventSeq !== undefined ? { acceptedEventSeq: current.acceptedEventSeq } : {}),
+    ...(current?.resultEventSeq !== undefined ? { resultEventSeq: current.resultEventSeq } : {}),
+  }
+  state.commandLedger[input.commandId] = next
+  return next
+}
+
+function requireControlRecord(state: BrokerState, controlId: string): BrokerControlRecord {
+  const current = state.controlLedger[controlId]
+  if (!current) {
+    throw new Error("unknown broker control")
+  }
+  return current
+}
+
+export function readBrokerControlRecord(state: BrokerState, controlId: string): BrokerControlRecord | undefined {
+  return state.controlLedger[controlId]
+}
+
+export function readBrokerAuthoritativeView(state?: BrokerState): BrokerAuthoritativeView {
+  const resolved = resolveBrokerState(state)
+  if (!resolved) {
+    return {
+      connections: {},
+      active: createEmptyActiveState(),
+      terminalMetadata: {},
+      retainedOccupancy: {},
+    }
+  }
+
+  return {
+    connections: cloneConnectionMap(resolved.connections),
+    active: cloneActiveState(resolved.active),
+    terminalMetadata: cloneTerminalMetadataMap(resolved.terminalMetadata),
+    retainedOccupancy: cloneRetainedOccupancyMap(resolved.retainedOccupancy),
+  }
+}
+
+export function readBrokerCommandStateByAction(
+  input: BrokerCommandActionInput,
+  state?: BrokerState,
+): BrokerCommandRecord | undefined {
+  const resolved = resolveBrokerState(state)
+  if (!resolved) {
+    return undefined
+  }
+
+  const expectedActionKey = createBrokerCommandActionKey(input)
+  const matched = Object.values(resolved.commandLedger)
+    .filter((record) => createBrokerCommandActionKey({
+      type: record.type,
+      target: record.target,
+      payload: record.payload,
+    }) === expectedActionKey)
+    .sort((left, right) => right.brokerSeq - left.brokerSeq)[0]
+
+  return matched ? cloneCommandRecord(matched) : undefined
+}
+
+export function readBrokerFullSyncStage(state: BrokerState, controlId: string): BrokerState | undefined {
+  return state.fullSync.stagedByControlId[controlId]?.state
+}
+
+export function requestBrokerReplay(
+  state: BrokerState,
+  input: RequestBrokerReplayInput,
+): BrokerControlRecord {
+  rememberBrokerState(state)
+  if (
+    !isNonEmptyString(input.controlId)
+    || !isNonEmptyString(input.instanceID)
+    || !isNonEmptyString(input.instanceIncarnation)
+  ) {
+    throw new Error("invalid broker replay request")
+  }
+  assertNonNegativeInteger(input.brokerSeq, "brokerSeq")
+  assertNonNegativeInteger(input.fromEventSeq, "fromEventSeq")
+  assertNonNegativeInteger(input.toEventSeq, "toEventSeq")
+
+  const next: BrokerControlRecord = {
+    controlId: input.controlId,
+    brokerSeq: input.brokerSeq,
+    type: "requestReplay",
+    status: "inFlight",
+    instanceID: input.instanceID,
+    instanceIncarnation: input.instanceIncarnation,
+    fromEventSeq: input.fromEventSeq,
+    toEventSeq: input.toEventSeq,
+  }
+
+  state.controlLedger[input.controlId] = next
+  markConnectionSentBrokerSeq(state, {
+    instanceID: input.instanceID,
+    instanceIncarnation: input.instanceIncarnation,
+    brokerSeq: input.brokerSeq,
+  })
+  return next
+}
+
+export function markBrokerReplayCompleted(
+  state: BrokerState,
+  input: MarkBrokerReplayCompletedInput,
+): BrokerControlRecord {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.controlId)) {
+    throw new Error("invalid replay completion")
+  }
+  assertNonNegativeInteger(input.completedEventSeq, "completedEventSeq")
+
+  const current = requireControlRecord(state, input.controlId)
+  assertControlType(current.type)
+  if (current.type !== "requestReplay") {
+    throw new Error("broker control is not a replay request")
+  }
+
+  const next: BrokerControlRecord = {
+    ...current,
+    status: "completed",
+    completedEventSeq: Math.max(current.completedEventSeq ?? 0, input.completedEventSeq),
+  }
+  state.controlLedger[input.controlId] = next
+  return next
+}
+
+export function requestBrokerFullSync(
+  state: BrokerState,
+  input: RequestBrokerFullSyncInput,
+): BrokerControlRecord {
+  rememberBrokerState(state)
+  if (
+    !isNonEmptyString(input.controlId)
+    || !isNonEmptyString(input.instanceID)
+    || !isNonEmptyString(input.instanceIncarnation)
+    || !isNonEmptyString(input.reason)
+  ) {
+    throw new Error("invalid broker full sync request")
+  }
+  assertNonNegativeInteger(input.brokerSeq, "brokerSeq")
+
+  const next: BrokerControlRecord = {
+    controlId: input.controlId,
+    brokerSeq: input.brokerSeq,
+    type: "requestFullSync",
+    status: "inFlight",
+    instanceID: input.instanceID,
+    instanceIncarnation: input.instanceIncarnation,
+    reason: input.reason,
+  }
+
+  state.controlLedger[input.controlId] = next
+  state.fullSync.stagedByControlId[input.controlId] = {
+    controlId: input.controlId,
+    instanceID: input.instanceID,
+    instanceIncarnation: input.instanceIncarnation,
+    state: createEmptyBrokerState(),
+  }
+  markConnectionSentBrokerSeq(state, {
+    instanceID: input.instanceID,
+    instanceIncarnation: input.instanceIncarnation,
+    brokerSeq: input.brokerSeq,
+  })
+  return next
+}
+
+export function stageBrokerFullSyncEvent(
+  state: BrokerState,
+  input: StageBrokerFullSyncEventInput,
+): BrokerState {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.controlId)) {
+    throw new Error("invalid full sync stage controlId")
+  }
+
+  const current = requireControlRecord(state, input.controlId)
+  assertControlType(current.type)
+  if (current.type !== "requestFullSync") {
+    throw new Error("broker control is not a full sync request")
+  }
+  if (input.event.type === "fullSyncCompleted") {
+    throw new Error("fullSyncCompleted must commit instead of staging")
+  }
+
+  const stage = state.fullSync.stagedByControlId[input.controlId]
+  if (!stage) {
+    throw new Error("missing full sync stage")
+  }
+
+  applyBridgeEvent(stage.state, input.event, input.context)
+  return stage.state
+}
+
+export function markBrokerFullSyncCompleted(
+  state: BrokerState,
+  input: MarkBrokerFullSyncCompletedInput,
+): BrokerControlRecord {
+  rememberBrokerState(state)
+  if (
+    !isNonEmptyString(input.controlId)
+    || !isNonEmptyString(input.instanceID)
+    || !isNonEmptyString(input.instanceIncarnation)
+  ) {
+    throw new Error("invalid full sync completion")
+  }
+  assertNonNegativeInteger(input.eventSeq, "eventSeq")
+
+  const current = requireControlRecord(state, input.controlId)
+  assertControlType(current.type)
+  if (current.type !== "requestFullSync") {
+    throw new Error("broker control is not a full sync request")
+  }
+
+  const stage = state.fullSync.stagedByControlId[input.controlId]
+  if (!stage) {
+    throw new Error("missing full sync stage")
+  }
+
+  applyFullSyncSnapshot(
+    state,
+    {
+      instanceID: input.instanceID,
+      instanceIncarnation: input.instanceIncarnation,
+    },
+    {
+      connections: stage.state.connections,
+      active: cloneActiveState(stage.state.active),
+    },
+  )
+
+  delete state.fullSync.stagedByControlId[input.controlId]
+  state.fullSync = {
+    ...state.fullSync,
+    lastCompletedControlId: input.controlId,
+    lastCompletedEventSeq: input.eventSeq,
+    lastCompletedInstanceIncarnation: input.instanceIncarnation,
+  }
+
+  const next: BrokerControlRecord = {
+    ...current,
+    status: "completed",
+    completedEventSeq: Math.max(current.completedEventSeq ?? 0, input.eventSeq),
+  }
+  state.controlLedger[input.controlId] = next
+  return next
+}
+
+export function markBrokerCommandAccepted(
+  state: BrokerState,
+  input: MarkBrokerCommandAcceptedInput,
+): BrokerCommandRecord {
+  rememberBrokerState(state)
+  if (
+    !isNonEmptyString(input.commandId)
+    || !isNonEmptyString(input.instanceID)
+    || !isNonEmptyString(input.instanceIncarnation)
+  ) {
+    throw new Error("invalid command acceptance")
+  }
+  assertNonNegativeInteger(input.eventSeq, "eventSeq")
+  if (input.acceptedAt !== undefined) {
+    assertNonNegativeInteger(input.acceptedAt, "acceptedAt")
+  }
+
+  const current = requireCommand(state, input.commandId)
+  if (current.status === "completed" || current.status === "failed") {
+    return current
+  }
+
+  const next: BrokerCommandRecord = {
+    ...current,
+    status: "accepted",
+    instanceID: input.instanceID,
+    instanceIncarnation: input.instanceIncarnation,
+    acceptedEventSeq: input.eventSeq,
+    ...(input.acceptedAt !== undefined
+      ? { acceptedAt: input.acceptedAt }
+      : current.acceptedAt !== undefined
+        ? { acceptedAt: current.acceptedAt }
+        : {}),
+  }
+  state.commandLedger[input.commandId] = next
+  return next
+}
+
+export function markBrokerCommandResult(
+  state: BrokerState,
+  input: MarkBrokerCommandResultInput,
+): BrokerCommandRecord {
+  rememberBrokerState(state)
+  if (
+    !isNonEmptyString(input.commandId)
+    || !isNonEmptyString(input.instanceID)
+    || !isNonEmptyString(input.instanceIncarnation)
+  ) {
+    throw new Error("invalid command result")
+  }
+  assertNonNegativeInteger(input.eventSeq, "eventSeq")
+  if (input.completedAt !== undefined) {
+    assertNonNegativeInteger(input.completedAt, "completedAt")
+  }
+  if (input.status !== "completed" && input.status !== "failed") {
+    throw new Error("invalid broker command result status")
+  }
+
+  const current = requireCommand(state, input.commandId)
+  if (current.status !== "accepted" && current.status !== "completed" && current.status !== "failed") {
+    throw new Error("command result requires accepted command")
+  }
+
+  const next: BrokerCommandRecord = {
+    ...current,
+    status: input.status,
+    instanceID: input.instanceID,
+    instanceIncarnation: input.instanceIncarnation,
+    resultEventSeq: input.eventSeq,
+    ...(input.completedAt !== undefined
+      ? { completedAt: input.completedAt }
+      : current.completedAt !== undefined
+        ? { completedAt: current.completedAt }
+        : {}),
+    ...(input.status === "failed" && input.failure ? { failure: { ...input.failure } } : {}),
+  }
+  state.commandLedger[input.commandId] = next
+  return next
+}
+
+export function markConnectionAckedEventSeq(
+  state: BrokerState,
+  input: MarkConnectionAckedEventSeqInput,
+): BrokerConnectionState {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.instanceID) || !isNonEmptyString(input.instanceIncarnation)) {
+    throw new Error("invalid broker ack input")
+  }
+  assertNonNegativeInteger(input.ackedEventSeq, "ackedEventSeq")
+
+  const connection = ensureConnection(state, input.instanceID, input.instanceIncarnation)
+  connection.lastAckedEventSeq = Math.max(connection.lastAckedEventSeq, input.ackedEventSeq)
+  return connection
+}
+
+export function markConnectionSentBrokerSeq(
+  state: BrokerState,
+  input: MarkConnectionSentBrokerSeqInput,
+): BrokerConnectionState {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.instanceID) || !isNonEmptyString(input.instanceIncarnation)) {
+    throw new Error("invalid broker sent seq input")
+  }
+  assertNonNegativeInteger(input.brokerSeq, "brokerSeq")
+
+  const connection = ensureConnection(state, input.instanceID, input.instanceIncarnation)
+  connection.lastSentBrokerSeq = Math.max(connection.lastSentBrokerSeq, input.brokerSeq)
+  return connection
+}

@@ -5,12 +5,26 @@ import { appendFile, chmod, mkdir, readFile, readdir, rm, stat, writeFile } from
 import { createBrokerSocket, isTcpBrokerEndpoint, listenOnBrokerEndpoint } from "./broker-endpoint.js"
 import { registerConnection, revokeSessionToken, validateSessionToken } from "./ipc-auth.js"
 import {
+  createBrokerAckEnvelope,
+  createBrokerCommandEnvelope,
+  createBrokerControlEnvelope,
+  createBridgeEventEnvelope,
   createErrorEnvelope,
+  createHelloRegisterEnvelope,
+  createRegisterAckEnvelope,
   parseEnvelopeLine,
   serializeEnvelope,
+  type BrokerAckEnvelope,
+  type BrokerToBridgeCommand,
+  type BrokerToBridgeCommandType,
+  type BrokerToBridgeControl,
   type BrokerEnvelope,
   type BrokerMessageType,
+  type BridgeToBrokerEvent,
+  type BridgeToBrokerEventType,
   type CollectStatusPayload,
+  type HelloRegisterPayload,
+  type RegisterAckEnvelope,
   type ReplyNaturalStopPayload,
   type ReplyMutationResult,
   type ReplyPermissionPayload,
@@ -21,6 +35,21 @@ import {
   type StatusSnapshotPayload,
   type WechatNotificationCandidate,
 } from "./protocol.js"
+import {
+  applyBridgeEvent as applyBrokerStateEvent,
+  createEmptyBrokerState,
+  markBrokerFullSyncCompleted,
+  markBrokerReplayCompleted,
+  markConnectionAckedEventSeq as markBrokerStateAckedEventSeq,
+  markConnectionSentBrokerSeq as markBrokerStateSentBrokerSeq,
+  readBrokerControlRecord,
+  requestBrokerFullSync,
+  requestBrokerReplay,
+  stageBrokerFullSyncEvent,
+  upsertBrokerCommand as upsertBrokerStateCommand,
+  type BrokerCommandRecord,
+  type BrokerState,
+} from "./broker-state-store.js"
 import {
   createBrokerMutationQueue,
   executeFallbackToastMutation,
@@ -85,10 +114,282 @@ type BrokerServerTestHooks = {
   beforeFinalizeOpenRequest?: (input: { request: RequestRecord }) => Promise<void> | void
 }
 
+export const WECHAT_BROKER_WS_PROTOCOL_VERSION = 2
+export const WECHAT_BROKER_WS_STATE_GENERATION = "wechat-ws-v1"
+
+export type BrokerWsRegisterResult = {
+  accepted: boolean
+  ack: RegisterAckEnvelope
+  control?: BrokerToBridgeControl
+  pendingCommands: BrokerToBridgeCommand[]
+}
+
+export type BrokerWsHandleBridgeEventResult = {
+  ack: BrokerAckEnvelope
+}
+
+export type BrokerWsCommandDispatchInput = {
+  instanceID: string
+  instanceIncarnation: string
+  commandId: string
+  type: BrokerToBridgeCommandType
+  payload?: unknown
+  target: Record<string, unknown>
+}
+
+export type BrokerWsCoordinator = {
+  getState: () => BrokerState
+  registerBridge: (hello: HelloRegisterPayload) => BrokerWsRegisterResult
+  handleBridgeEvent: (
+    event: BridgeToBrokerEvent,
+    context: { instanceID: string; controlId?: string },
+  ) => BrokerWsHandleBridgeEventResult
+  dispatchCommand: (input: BrokerWsCommandDispatchInput) => BrokerToBridgeCommand | null
+}
+
 let brokerServerTestHooks: BrokerServerTestHooks | undefined
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0
+}
+
+function cloneWsValue<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return [...value] as T
+  }
+  if (typeof value === "object" && value !== null) {
+    return { ...(value as Record<string, unknown>) } as T
+  }
+  return value
+}
+
+function readRecordInstanceID(record: BrokerCommandRecord): string | undefined {
+  if (isNonEmptyString(record.instanceID)) {
+    return record.instanceID
+  }
+
+  const value = record.target.instanceID
+  return isNonEmptyString(value) ? value : undefined
+}
+
+function getStateMaxBrokerSeq(state: BrokerState): number {
+  let maxBrokerSeq = 0
+
+  for (const incarnations of Object.values(state.connections)) {
+    for (const connection of Object.values(incarnations)) {
+      maxBrokerSeq = Math.max(maxBrokerSeq, connection.lastSentBrokerSeq)
+    }
+  }
+
+  for (const command of Object.values(state.commandLedger)) {
+    maxBrokerSeq = Math.max(maxBrokerSeq, command.brokerSeq)
+  }
+
+  for (const control of Object.values(state.controlLedger)) {
+    maxBrokerSeq = Math.max(maxBrokerSeq, control.brokerSeq)
+  }
+
+  return maxBrokerSeq
+}
+
+function toBrokerWsCommand(record: BrokerCommandRecord): BrokerToBridgeCommand {
+  return createBrokerCommandEnvelope({
+    brokerSeq: record.brokerSeq,
+    commandId: record.commandId,
+    type: record.type,
+    payload: cloneWsValue(record.payload ?? {}),
+  })
+}
+
+export function createBrokerWsCoordinator(input: {
+  protocolVersion?: number
+  stateGeneration?: string
+  state?: BrokerState
+} = {}): BrokerWsCoordinator {
+  const protocolVersion = input.protocolVersion ?? WECHAT_BROKER_WS_PROTOCOL_VERSION
+  const stateGeneration = input.stateGeneration ?? WECHAT_BROKER_WS_STATE_GENERATION
+  const state = input.state ?? createEmptyBrokerState()
+  let nextBrokerSeq = getStateMaxBrokerSeq(state)
+
+  function allocateBrokerSeq(): number {
+    nextBrokerSeq += 1
+    return nextBrokerSeq
+  }
+
+  function registerBridge(hello: HelloRegisterPayload): BrokerWsRegisterResult {
+    const accepted = hello.protocolVersion === protocolVersion && hello.stateGeneration === stateGeneration
+    const connection = state.connections[hello.instanceID]?.[hello.instanceIncarnation]
+    const lastAckedEventSeq = connection?.lastAckedEventSeq ?? 0
+    const lastSentEventSeq = hello.lastSentEventSeq ?? 0
+    let control: BrokerToBridgeControl | undefined
+    let needReplay = false
+    let needFullSync = false
+
+    if (!accepted || !connection) {
+      needFullSync = true
+      const brokerSeq = allocateBrokerSeq()
+      const controlId = `ctl-full-sync-${brokerSeq}`
+      requestBrokerFullSync(state, {
+        controlId,
+        brokerSeq,
+        instanceID: hello.instanceID,
+        instanceIncarnation: hello.instanceIncarnation,
+        reason: accepted ? "state-missing" : "protocol-mismatch",
+      })
+      control = createBrokerControlEnvelope({
+        brokerSeq,
+        controlId,
+        type: "requestFullSync",
+        payload: {
+          instanceID: hello.instanceID,
+          instanceIncarnation: hello.instanceIncarnation,
+          reason: accepted ? "state-missing" : "protocol-mismatch",
+        },
+      })
+    } else if (lastSentEventSeq > lastAckedEventSeq) {
+      needReplay = true
+      const brokerSeq = allocateBrokerSeq()
+      const controlId = `ctl-replay-${brokerSeq}`
+      requestBrokerReplay(state, {
+        controlId,
+        brokerSeq,
+        instanceID: hello.instanceID,
+        instanceIncarnation: hello.instanceIncarnation,
+        fromEventSeq: lastAckedEventSeq + 1,
+        toEventSeq: lastSentEventSeq,
+      })
+      control = createBrokerControlEnvelope({
+        brokerSeq,
+        controlId,
+        type: "requestReplay",
+        payload: {
+          instanceID: hello.instanceID,
+          instanceIncarnation: hello.instanceIncarnation,
+          fromEventSeq: lastAckedEventSeq + 1,
+          toEventSeq: lastSentEventSeq,
+        },
+      })
+    }
+
+    const pendingCommands = accepted
+      ? Object.values(state.commandLedger)
+          .filter((record) => {
+            const recordInstanceID = readRecordInstanceID(record)
+            if (recordInstanceID !== hello.instanceID) {
+              return false
+            }
+            if (record.instanceIncarnation && record.instanceIncarnation !== hello.instanceIncarnation) {
+              return false
+            }
+            return record.status === "queued" || record.status === "delivered"
+          })
+          .sort((left, right) => left.brokerSeq - right.brokerSeq)
+          .map(toBrokerWsCommand)
+      : []
+
+    return {
+      accepted,
+      ack: createRegisterAckEnvelope({
+        protocolVersion,
+        stateGeneration,
+        instanceIncarnation: hello.instanceIncarnation,
+        brokerSeq: nextBrokerSeq,
+        needReplay,
+        needFullSync,
+      }),
+      ...(control ? { control } : {}),
+      pendingCommands,
+    }
+  }
+
+  function handleBridgeEvent(
+    event: BridgeToBrokerEvent,
+    context: { instanceID: string; controlId?: string },
+  ): BrokerWsHandleBridgeEventResult {
+    const controlRecord = context.controlId ? readBrokerControlRecord(state, context.controlId) : undefined
+
+    if (controlRecord?.type === "requestFullSync" && controlRecord.status === "inFlight") {
+      if (event.type === "fullSyncCompleted") {
+        markBrokerFullSyncCompleted(state, {
+          controlId: controlRecord.controlId,
+          instanceID: context.instanceID,
+          instanceIncarnation: event.instanceIncarnation,
+          eventSeq: event.eventSeq,
+        })
+      } else {
+        stageBrokerFullSyncEvent(state, {
+          controlId: controlRecord.controlId,
+          event,
+          context: {
+            instanceID: context.instanceID,
+          },
+        })
+      }
+    } else {
+      applyBrokerStateEvent(state, event, {
+        instanceID: context.instanceID,
+      })
+
+      if (
+        controlRecord?.type === "requestReplay"
+        && controlRecord.status === "inFlight"
+        && event.eventSeq >= (controlRecord.toEventSeq ?? event.eventSeq)
+      ) {
+        markBrokerReplayCompleted(state, {
+          controlId: controlRecord.controlId,
+          completedEventSeq: event.eventSeq,
+        })
+      }
+    }
+
+    const ack = createBrokerAckEnvelope({
+      ackedEventSeq: event.eventSeq,
+      instanceIncarnation: event.instanceIncarnation,
+    })
+    markBrokerStateAckedEventSeq(state, {
+      instanceID: context.instanceID,
+      ...ack.payload,
+    })
+    return { ack }
+  }
+
+  function dispatchCommand(input: BrokerWsCommandDispatchInput): BrokerToBridgeCommand | null {
+    const current = state.commandLedger[input.commandId]
+    if (current && current.status !== "queued" && current.status !== "delivered") {
+      return null
+    }
+
+    const brokerSeq = current?.brokerSeq ?? allocateBrokerSeq()
+    upsertBrokerStateCommand(state, {
+      commandId: input.commandId,
+      brokerSeq,
+      type: input.type,
+      status: "delivered",
+      target: { ...input.target },
+      payload: cloneWsValue(input.payload ?? {}),
+      instanceID: input.instanceID,
+      instanceIncarnation: input.instanceIncarnation,
+    })
+    markBrokerStateSentBrokerSeq(state, {
+      instanceID: input.instanceID,
+      instanceIncarnation: input.instanceIncarnation,
+      brokerSeq,
+    })
+
+    return createBrokerCommandEnvelope({
+      brokerSeq,
+      commandId: input.commandId,
+      type: input.type,
+      payload: cloneWsValue(input.payload ?? {}),
+    })
+  }
+
+  return {
+    getState: () => state,
+    registerBridge,
+    handleBridgeEvent,
+    dispatchCommand,
+  }
 }
 
 function getRequestId(envelope: BrokerEnvelope): string {
@@ -183,14 +484,42 @@ type PendingReplyMutation = {
   timer: NodeJS.Timeout
 }
 
+type LiveBridgeRegistration = {
+  instanceID: string
+  instanceIncarnation: string
+  socket: net.Socket
+}
+
 const registrationByInstanceID = new Map<string, RegistrationRecord>()
 const instanceIDsBySocket = new Map<net.Socket, Set<string>>()
+const liveBridgeByInstanceID = new Map<string, LiveBridgeRegistration>()
+const liveBridgeBySocket = new Map<net.Socket, LiveBridgeRegistration>()
 const snapshotByInstanceID = new Map<string, InstanceSnapshot>()
 const snapshotPersistQueueByInstanceID = new Map<string, Promise<void>>()
 const pendingCollectStatusByRequestId = new Map<string, PendingCollectStatus>()
 const pendingReplyMutationsByRequestId = new Map<string, PendingReplyMutation>()
+const pendingWsReplyMutationsByCommandId = new Map<string, PendingReplyMutation>()
 let syncWechatNotificationsChain: Promise<void> = Promise.resolve()
 let brokerMutationQueue = createBrokerMutationQueue()
+let liveWsCoordinator = createBrokerWsCoordinator()
+
+const LIVE_BRIDGE_EVENT_TYPES = new Set<BridgeToBrokerEventType>([
+  "instanceOnline",
+  "instanceOffline",
+  "sessionSnapshotChanged",
+  "questionOpened",
+  "questionUpdated",
+  "questionClosed",
+  "permissionOpened",
+  "permissionUpdated",
+  "permissionClosed",
+  "naturalStopOpened",
+  "naturalStopClosed",
+  "retryErrorUpdated",
+  "commandAccepted",
+  "commandResult",
+  "fullSyncCompleted",
+])
 
 function queueBrokerMutation<T>(mutationType: string, task: () => Promise<T>): Promise<T> {
   return brokerMutationQueue.enqueue(mutationType, task)
@@ -247,11 +576,22 @@ function clearRuntimeState() {
   }
   registrationByInstanceID.clear()
   instanceIDsBySocket.clear()
+  liveBridgeByInstanceID.clear()
+  liveBridgeBySocket.clear()
   snapshotByInstanceID.clear()
   snapshotPersistQueueByInstanceID.clear()
   pendingCollectStatusByRequestId.clear()
+  for (const pending of pendingReplyMutationsByRequestId.values()) {
+    clearTimeout(pending.timer)
+  }
+  pendingReplyMutationsByRequestId.clear()
+  for (const pending of pendingWsReplyMutationsByCommandId.values()) {
+    clearTimeout(pending.timer)
+  }
+  pendingWsReplyMutationsByCommandId.clear()
   syncWechatNotificationsChain = Promise.resolve()
   brokerMutationQueue = createBrokerMutationQueue()
+  liveWsCoordinator = createBrokerWsCoordinator()
 }
 
 function toPositiveNumber(rawValue: string | undefined, fallback: number): number {
@@ -796,6 +1136,15 @@ function cleanupSocketRegistrations(socket: net.Socket) {
     }
   }
   instanceIDsBySocket.delete(socket)
+
+  const live = liveBridgeBySocket.get(socket)
+  if (live?.socket === socket) {
+    const current = liveBridgeByInstanceID.get(live.instanceID)
+    if (current?.socket === socket) {
+      liveBridgeByInstanceID.delete(live.instanceID)
+    }
+    liveBridgeBySocket.delete(socket)
+  }
 }
 
 function finalizePendingCollectStatus(requestId: string) {
@@ -840,6 +1189,32 @@ function queueSyncWechatNotifications(task: () => Promise<void>): Promise<void> 
   return next
 }
 
+function hasLiveBridgeEventType(type: BrokerMessageType): type is BridgeToBrokerEventType {
+  return LIVE_BRIDGE_EVENT_TYPES.has(type as BridgeToBrokerEventType)
+}
+
+function isLiveBridgeCommandPayload(value: unknown): value is BrokerToBridgeCommand {
+  const record = asObject(value)
+  return isNonEmptyString(record.commandId)
+    && isFiniteNumber(record.brokerSeq)
+    && isNonEmptyString(record.type)
+    && "payload" in record
+}
+
+function toReplyMutationResultFromEventPayload(payload: Record<string, unknown>, mutationId: string): ReplyMutationResult {
+  const status = payload.status
+  const failure = asObject(payload.failure)
+  if (status === "completed") {
+    return { mutationId, ok: true }
+  }
+
+  return {
+    mutationId,
+    ok: false,
+    ...(isNonEmptyString(failure.message) ? { errorMessage: failure.message } : { errorMessage: "command failed" }),
+  }
+}
+
 async function handleMessage(envelope: BrokerEnvelope, socket: net.Socket): Promise<void> {
   const requestId = getRequestId(envelope)
 
@@ -848,6 +1223,100 @@ async function handleMessage(envelope: BrokerEnvelope, socket: net.Socket): Prom
       id: `pong-${requestId}`,
       type: "pong",
       payload: { message: "pong" },
+    })
+    return
+  }
+
+  if (envelope.type === "hello/register") {
+    let hello: HelloRegisterPayload
+    try {
+      hello = createHelloRegisterEnvelope(envelope.payload as HelloRegisterPayload).payload
+    } catch {
+      writeError(socket, "invalidMessage", "hello/register payload is invalid", requestId)
+      return
+    }
+
+    if (!isSafeInstanceID(hello.instanceID)) {
+      writeError(socket, "invalidMessage", "instanceID is required", requestId)
+      return
+    }
+
+    const registerResult = await queueBrokerMutation("hello/register", async () => {
+      const current = liveBridgeByInstanceID.get(hello.instanceID)
+      const nextRegistration: LiveBridgeRegistration = {
+        instanceID: hello.instanceID,
+        instanceIncarnation: hello.instanceIncarnation,
+        socket,
+      }
+
+      liveBridgeByInstanceID.set(hello.instanceID, nextRegistration)
+      liveBridgeBySocket.set(socket, nextRegistration)
+      if (current && current.socket !== socket) {
+        liveBridgeBySocket.delete(current.socket)
+      }
+
+      return liveWsCoordinator.registerBridge(hello)
+    })
+
+    writeEnvelope(socket, {
+      id: `registerAck-${requestId}`,
+      type: "registerAck",
+      instanceID: hello.instanceID,
+      payload: {
+        ...registerResult.ack.payload,
+        ...(registerResult.control ? { control: registerResult.control } : {}),
+        pendingCommands: registerResult.pendingCommands,
+      },
+    })
+    return
+  }
+
+  if (hasLiveBridgeEventType(envelope.type)) {
+    const instanceID = envelope.instanceID
+    const liveRegistration = liveBridgeBySocket.get(socket)
+    if (!isNonEmptyString(instanceID) || !liveRegistration || liveRegistration.instanceID !== instanceID) {
+      writeError(socket, "unauthorized", "live bridge is not registered", requestId)
+      return
+    }
+
+    let event: BridgeToBrokerEvent
+    try {
+      event = createBridgeEventEnvelope(envelope.payload as BridgeToBrokerEvent)
+    } catch {
+      writeError(socket, "invalidMessage", `${envelope.type} payload is invalid`, requestId)
+      return
+    }
+
+    if (event.type !== envelope.type) {
+      writeError(socket, "invalidMessage", `${envelope.type} payload type mismatch`, requestId)
+      return
+    }
+
+    const result = await queueBrokerMutation(`bridgeEvent:${event.type}`, async () => {
+      return liveWsCoordinator.handleBridgeEvent(event, {
+        instanceID,
+        controlId: event.controlId,
+      })
+    })
+
+    if (event.type === "commandResult") {
+      const payload = asObject(event.payload)
+      const commandId = isNonEmptyString(payload.commandId) ? payload.commandId : undefined
+      if (commandId) {
+        const pending = pendingWsReplyMutationsByCommandId.get(commandId)
+        if (pending) {
+          pendingWsReplyMutationsByCommandId.delete(commandId)
+          clearTimeout(pending.timer)
+          pending.resolve(toReplyMutationResultFromEventPayload(payload, pending.mutationId))
+        }
+      }
+    }
+
+    writeEnvelope(socket, {
+      id: `ack-${requestId}`,
+      type: "ack",
+      instanceID,
+      payload: result.ack.payload,
     })
     return
   }
@@ -1289,6 +1758,7 @@ export type BrokerServerHandle = {
 
 export async function startBrokerServer(endpoint: string): Promise<BrokerServerHandle> {
   await prepareEndpoint(endpoint)
+  liveWsCoordinator = createBrokerWsCoordinator()
 
   const heartbeatTimeoutMs = toPositiveNumber(
     process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS,
@@ -1514,6 +1984,50 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     requestID: string
     answers: unknown[]
   }): Promise<ReplyMutationResult> => {
+    const liveRegistration = liveBridgeByInstanceID.get(input.instanceID)
+    if (liveRegistration && !liveRegistration.socket.destroyed) {
+      const command = await queueBrokerMutation("dispatchWsReplyQuestion", async () => {
+        return liveWsCoordinator.dispatchCommand({
+          instanceID: input.instanceID,
+          instanceIncarnation: liveRegistration.instanceIncarnation,
+          commandId: input.mutationId,
+          type: "replyQuestion",
+          payload: {
+            mutationId: input.mutationId,
+            requestID: input.requestID,
+            answers: input.answers,
+          },
+          target: {
+            instanceID: input.instanceID,
+            requestID: input.requestID,
+          },
+        })
+      })
+      if (!command) {
+        return { mutationId: input.mutationId, ok: false, errorMessage: `replyQuestion unavailable: ${input.mutationId}` }
+      }
+
+      return new Promise<ReplyMutationResult>((resolve) => {
+        const timer = setTimeout(() => {
+          pendingWsReplyMutationsByCommandId.delete(command.commandId)
+          resolve({ mutationId: input.mutationId, ok: false, errorMessage: `replyQuestion timeout: ${input.mutationId}` })
+        }, 10_000)
+
+        pendingWsReplyMutationsByCommandId.set(command.commandId, {
+          mutationId: input.mutationId,
+          resolve,
+          timer,
+        })
+
+        writeEnvelope(liveRegistration.socket, {
+          id: command.commandId,
+          type: command.type,
+          instanceID: input.instanceID,
+          payload: command,
+        })
+      })
+    }
+
     const registration = registrationByInstanceID.get(input.instanceID)
     if (!registration) {
       return { mutationId: input.mutationId, ok: false, errorMessage: `bridge unavailable: ${input.instanceID}` }
@@ -1553,6 +2067,51 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     reply: "once" | "always" | "reject"
     message?: string
   }): Promise<ReplyMutationResult> => {
+    const liveRegistration = liveBridgeByInstanceID.get(input.instanceID)
+    if (liveRegistration && !liveRegistration.socket.destroyed) {
+      const command = await queueBrokerMutation("dispatchWsReplyPermission", async () => {
+        return liveWsCoordinator.dispatchCommand({
+          instanceID: input.instanceID,
+          instanceIncarnation: liveRegistration.instanceIncarnation,
+          commandId: input.mutationId,
+          type: "replyPermission",
+          payload: {
+            mutationId: input.mutationId,
+            requestID: input.requestID,
+            reply: input.reply,
+            ...(input.message ? { message: input.message } : {}),
+          },
+          target: {
+            instanceID: input.instanceID,
+            requestID: input.requestID,
+          },
+        })
+      })
+      if (!command) {
+        return { mutationId: input.mutationId, ok: false, errorMessage: `replyPermission unavailable: ${input.mutationId}` }
+      }
+
+      return new Promise<ReplyMutationResult>((resolve) => {
+        const timer = setTimeout(() => {
+          pendingWsReplyMutationsByCommandId.delete(command.commandId)
+          resolve({ mutationId: input.mutationId, ok: false, errorMessage: `replyPermission timeout: ${input.mutationId}` })
+        }, 10_000)
+
+        pendingWsReplyMutationsByCommandId.set(command.commandId, {
+          mutationId: input.mutationId,
+          resolve,
+          timer,
+        })
+
+        writeEnvelope(liveRegistration.socket, {
+          id: command.commandId,
+          type: command.type,
+          instanceID: input.instanceID,
+          payload: command,
+        })
+      })
+    }
+
     const registration = registrationByInstanceID.get(input.instanceID)
     if (!registration) {
       return { mutationId: input.mutationId, ok: false, errorMessage: `bridge unavailable: ${input.instanceID}` }
@@ -1592,6 +2151,50 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     sessionID: string
     text: string
   }): Promise<ReplyMutationResult> => {
+    const liveRegistration = liveBridgeByInstanceID.get(input.instanceID)
+    if (liveRegistration && !liveRegistration.socket.destroyed) {
+      const command = await queueBrokerMutation("dispatchWsReplyNaturalStop", async () => {
+        return liveWsCoordinator.dispatchCommand({
+          instanceID: input.instanceID,
+          instanceIncarnation: liveRegistration.instanceIncarnation,
+          commandId: input.mutationId,
+          type: "replyNaturalStop",
+          payload: {
+            mutationId: input.mutationId,
+            sessionID: input.sessionID,
+            text: input.text,
+          },
+          target: {
+            instanceID: input.instanceID,
+            sessionID: input.sessionID,
+          },
+        })
+      })
+      if (!command) {
+        return { mutationId: input.mutationId, ok: false, errorMessage: `replyNaturalStop unavailable: ${input.mutationId}` }
+      }
+
+      return new Promise<ReplyMutationResult>((resolve) => {
+        const timer = setTimeout(() => {
+          pendingWsReplyMutationsByCommandId.delete(command.commandId)
+          resolve({ mutationId: input.mutationId, ok: false, errorMessage: `replyNaturalStop timeout: ${input.mutationId}` })
+        }, 10_000)
+
+        pendingWsReplyMutationsByCommandId.set(command.commandId, {
+          mutationId: input.mutationId,
+          resolve,
+          timer,
+        })
+
+        writeEnvelope(liveRegistration.socket, {
+          id: command.commandId,
+          type: command.type,
+          instanceID: input.instanceID,
+          payload: command,
+        })
+      })
+    }
+
     const registration = registrationByInstanceID.get(input.instanceID)
     if (!registration) {
       return { mutationId: input.mutationId, ok: false, errorMessage: `bridge unavailable: ${input.instanceID}` }
@@ -1643,6 +2246,11 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
         record.socket.destroy()
       }
     }
+    for (const record of liveBridgeByInstanceID.values()) {
+      if (!record.socket.destroyed) {
+        record.socket.destroy()
+      }
+    }
 
     await new Promise<void>((resolve) => {
       server.close(() => resolve())
@@ -1657,6 +2265,11 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
 
   const hasBlockingActivity = async () => {
     for (const record of registrationByInstanceID.values()) {
+      if (!record.socket.destroyed) {
+        return true
+      }
+    }
+    for (const record of liveBridgeByInstanceID.values()) {
       if (!record.socket.destroyed) {
         return true
       }

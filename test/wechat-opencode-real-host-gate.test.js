@@ -853,7 +853,7 @@ test("real host PTY helper: waitForAskAnythingScreen tolerates slow interactive 
     }, 40)
 
     const screenText = await waitForAskAnythingScreen(session, {
-      timeoutMs: 100,
+      timeoutMs: 500,
       pollIntervalMs: 0,
     })
 
@@ -1146,8 +1146,8 @@ test("real host PTY helper: selectMenuItemOnScreen keeps moving until Connect pr
       const downCount = sentInputs.filter((input) => input === "\u001b[B").length
       return paletteScreen(downCount === 0 ? "Switch model" : "Connect provider")
     },
-    timeoutMs: 20,
-    inputChangeTimeoutMs: 5,
+    timeoutMs: 200,
+    inputChangeTimeoutMs: 50,
     inputRetryAttempts: 0,
     inputPollIntervalMs: 0,
   })

@@ -214,6 +214,10 @@ serialTest("plugin-hooks 不再把实例初始化当作第二条 eager broker �
   const client = createBridgeCapableClient()
   let launcherCalls = 0
   const connectedEndpoints = []
+  let registerHelloCalls = 0
+  const registerHelloPayloads = []
+  let pingCalls = 0
+  let liveHandlers = null
 
   buildPluginHooksRaw({
     auth: {
@@ -235,8 +239,34 @@ serialTest("plugin-hooks 不再把实例初始化当作第二条 eager broker �
       connectImpl: async (endpoint) => {
         connectedEndpoints.push(endpoint)
         return {
-          registerInstance: async () => ({ sessionToken: "token", registeredAt: Date.now(), brokerPid: process.pid }),
-          heartbeat: async () => ({}),
+          setLiveHandlers: (handlers) => {
+            liveHandlers = handlers
+          },
+          registerHello: async (payload) => {
+            registerHelloCalls += 1
+            registerHelloPayloads.push(payload)
+            return {
+              ack: {
+                protocolVersion: payload.protocolVersion,
+                stateGeneration: payload.stateGeneration,
+                instanceIncarnation: payload.instanceIncarnation,
+                brokerSeq: 0,
+                needReplay: false,
+                needFullSync: false,
+              },
+              pendingCommands: [],
+            }
+          },
+          registerInstance: async () => ({
+            sessionToken: "plugin-live-session",
+            registeredAt: 1_700_000_100_000,
+            registrationEpoch: "plugin-live-epoch",
+            brokerPid: process.pid,
+          }),
+          ping: async () => {
+            pingCalls += 1
+            return {}
+          },
           close: async () => {},
         }
       },
@@ -251,6 +281,14 @@ serialTest("plugin-hooks 不再把实例初始化当作第二条 eager broker �
 
   assert.equal(launcherCalls, 0)
   assert.deepEqual(connectedEndpoints, ["fake-endpoint-from-plugin"])
+  assert.equal(registerHelloCalls, 1)
+  assert.equal(typeof registerHelloPayloads[0]?.instanceID, "string")
+  assert.equal(typeof registerHelloPayloads[0]?.instanceIncarnation, "string")
+  assert.equal(typeof registerHelloPayloads[0]?.protocolVersion, "number")
+  assert.equal(typeof registerHelloPayloads[0]?.stateGeneration, "string")
+  assert.equal(pingCalls, 0)
+  assert.equal(typeof liveHandlers?.onBrokerControl, "function")
+  assert.equal(typeof liveHandlers?.onBrokerCommand, "function")
 })
 
 serialTest("plugin-hooks 在非 bridge-capable 输入下不会额外 eager ensure broker 或显示启动提示", async () => {
@@ -591,17 +629,18 @@ serialTest("plugin-hooks 旧 lifecycle 仍在初始化中时切 key，旧 promis
   assert.equal(active.size, 1)
 })
 
-serialTest("bridge lifecycle register 失败时会回收已建立 brokerClient", async () => {
+serialTest("bridge lifecycle registerHello 失败时会回收已建立 brokerClient", async () => {
   const { createWechatBridgeLifecycle } = await importBridgeModule()
   let closed = 0
 
   const deps = {
     connectOrSpawnBrokerImpl: async () => ({ endpoint: "fake-endpoint" }),
     connectImpl: async () => ({
-      registerInstance: async () => {
+      setLiveHandlers: () => {},
+      registerHello: async () => {
         throw new Error("register failed")
       },
-      heartbeat: async () => ({}),
+      ping: async () => ({ type: "pong", payload: {} }),
       close: async () => {
         closed += 1
       },
@@ -631,18 +670,35 @@ serialTest("bridge lifecycle register 失败时会回收已建立 brokerClient",
   assert.equal(closed, 1)
 })
 
-serialTest("bridge lifecycle 生成的 instanceID 应按进程唯一，而不是目录派生", async () => {
+serialTest("bridge lifecycle registerHello 生成的 instanceID 应按进程唯一，而不是目录派生", async () => {
   const { createWechatBridgeLifecycle } = await importBridgeModule()
   let registeredInstanceID = ""
 
   const deps = {
     connectOrSpawnBrokerImpl: async () => ({ endpoint: "fake-endpoint" }),
     connectImpl: async () => ({
-      registerInstance: async (meta) => {
+      setLiveHandlers: () => {},
+      registerHello: async (meta) => {
         registeredInstanceID = meta.instanceID
-        return { sessionToken: "token", registeredAt: Date.now(), brokerPid: process.pid }
+        return {
+          ack: {
+            protocolVersion: 2,
+            stateGeneration: "wechat-ws-v1",
+            instanceIncarnation: meta.instanceIncarnation,
+            brokerSeq: 1,
+            needReplay: false,
+            needFullSync: false,
+          },
+          pendingCommands: [],
+        }
       },
-      heartbeat: async () => ({}),
+      registerInstance: async () => ({
+        sessionToken: "bridge-instance-id-session",
+        registeredAt: 1_700_000_100_000,
+        registrationEpoch: "bridge-instance-id-epoch",
+        brokerPid: process.pid,
+      }),
+      ping: async () => ({ type: "pong", payload: {} }),
       close: async () => {},
     }),
     setIntervalImpl: () => ({ id: Symbol("timer") }),
@@ -670,9 +726,9 @@ serialTest("bridge lifecycle 生成的 instanceID 应按进程唯一，而不是
   await lifecycle.close()
 })
 
-serialTest("bridge lifecycle heartbeat 与 close 边界：仅定时心跳，close 清理且幂等", async () => {
+serialTest("bridge lifecycle steady keepalive 使用 ping，close 清理且幂等", async () => {
   const { createWechatBridgeLifecycle } = await importBridgeModule()
-  let heartbeatCalls = 0
+  let pingCalls = 0
   let closeCalls = 0
   let timerCallback = null
   const activeTimers = new Set()
@@ -680,10 +736,27 @@ serialTest("bridge lifecycle heartbeat 与 close 边界：仅定时心跳，clos
   const deps = {
     connectOrSpawnBrokerImpl: async () => ({ endpoint: "fake-endpoint" }),
     connectImpl: async () => ({
-      registerInstance: async () => ({ sessionToken: "token", registeredAt: Date.now(), brokerPid: process.pid }),
-      heartbeat: async () => {
-        heartbeatCalls += 1
-        return {}
+      setLiveHandlers: () => {},
+      registerHello: async (meta) => ({
+        ack: {
+          protocolVersion: 2,
+          stateGeneration: "wechat-ws-v1",
+          instanceIncarnation: meta.instanceIncarnation,
+          brokerSeq: 1,
+          needReplay: false,
+          needFullSync: false,
+        },
+        pendingCommands: [],
+      }),
+      registerInstance: async () => ({
+        sessionToken: "steady-keepalive-session",
+        registeredAt: 1_700_000_100_000,
+        registrationEpoch: "steady-keepalive-epoch",
+        brokerPid: process.pid,
+      }),
+      ping: async () => {
+        pingCalls += 1
+        return { type: "pong", payload: {} }
       },
       close: async () => {
         closeCalls += 1
@@ -720,7 +793,7 @@ serialTest("bridge lifecycle heartbeat 与 close 边界：仅定时心跳，clos
   assert.equal(activeTimers.size, 1)
 
   await timerCallback()
-  assert.equal(heartbeatCalls, 1)
+  assert.equal(pingCalls, 1)
 
   await lifecycle.close()
   assert.equal(activeTimers.size, 0)
@@ -730,7 +803,7 @@ serialTest("bridge lifecycle heartbeat 与 close 边界：仅定时心跳，clos
   assert.equal(closeCalls, 1)
 })
 
-serialTest("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次 full sync", async () => {
+serialTest("bridge lifecycle ping 失败后会重连 broker，但不会假定 full sync churn", async () => {
   const { createWechatBridgeLifecycle } = await importBridgeModule()
   let connectOrSpawnCalls = 0
   let connectCalls = 0
@@ -740,6 +813,7 @@ serialTest("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次
   const brokerEndpoint = "fake-endpoint-reused"
 
   const liveReadCalls = []
+  const registerHelloCalls = []
   const client = {
     session: {
       list: async () => {
@@ -783,15 +857,33 @@ serialTest("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次
       connectCalls += 1
       const currentConnect = connectCalls
       return {
-        registerInstance: async () => {
+        setLiveHandlers: () => {},
+        registerHello: async (payload) => {
           registerCalls += 1
-          return { sessionToken: `token-${currentConnect}`, registeredAt: Date.now(), brokerPid: process.pid }
+          registerHelloCalls.push(payload)
+          return {
+            ack: {
+              protocolVersion: 2,
+              stateGeneration: "wechat-ws-v1",
+              instanceIncarnation: payload.instanceIncarnation,
+              brokerSeq: currentConnect,
+              needReplay: false,
+              needFullSync: false,
+            },
+            pendingCommands: [],
+          }
         },
-        heartbeat: async () => {
+        registerInstance: async () => ({
+          sessionToken: `reconnect-session-${currentConnect}`,
+          registeredAt: 1_700_000_100_000 + currentConnect,
+          registrationEpoch: `reconnect-epoch-${currentConnect}`,
+          brokerPid: process.pid,
+        }),
+        ping: async () => {
           if (currentConnect === 1) {
             throw new Error("broker connection closed")
           }
-          return {}
+          return { type: "pong", payload: {} }
         },
         close: async () => {
           closeCalls += 1
@@ -825,7 +917,10 @@ serialTest("bridge lifecycle heartbeat 失败后会重连 broker 并触发一次
   assert.equal(connectCalls, 2)
   assert.equal(registerCalls, 2)
   assert.equal(closeCalls >= 1, true)
-  assert.deepEqual(liveReadCalls, ["session.list", "session.status", "question.list", "permission.list"])
+  assert.equal(registerHelloCalls.length, 2)
+  assert.equal(typeof registerHelloCalls[1]?.lastSeenBrokerSeq, "number")
+  assert.equal(typeof registerHelloCalls[1]?.lastSentEventSeq, "number")
+  assert.deepEqual(liveReadCalls, [])
 
   await lifecycle.close()
 })

@@ -19,6 +19,14 @@ export function brokerStatePath() {
   return path.join(wechatStateRoot(), "broker.json")
 }
 
+export function brokerStateStorePath() {
+  return path.join(wechatStateRoot(), "broker-state-store.json")
+}
+
+export function brokerStateSchemaPath() {
+  return path.join(wechatStateRoot(), "broker-state-store.schema.json")
+}
+
 export function wechatStatusRuntimeDiagnosticsPath(stateRoot: string = wechatStateRoot()) {
   return path.join(stateRoot, "wechat-status-runtime.diagnostics.jsonl")
 }
