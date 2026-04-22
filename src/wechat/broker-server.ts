@@ -42,6 +42,7 @@ import {
   markBrokerReplayCompleted,
   markConnectionAckedEventSeq as markBrokerStateAckedEventSeq,
   markConnectionSentBrokerSeq as markBrokerStateSentBrokerSeq,
+  persistBrokerStateStoreSnapshot,
   readBrokerControlRecord,
   requestBrokerFullSync,
   requestBrokerReplay,
@@ -1255,7 +1256,9 @@ async function handleMessage(envelope: BrokerEnvelope, socket: net.Socket): Prom
         liveBridgeBySocket.delete(current.socket)
       }
 
-      return liveWsCoordinator.registerBridge(hello)
+      const registerResult = liveWsCoordinator.registerBridge(hello)
+      await persistBrokerStateStoreSnapshot(liveWsCoordinator.getState())
+      return registerResult
     })
 
     writeEnvelope(socket, {
@@ -1293,10 +1296,12 @@ async function handleMessage(envelope: BrokerEnvelope, socket: net.Socket): Prom
     }
 
     const result = await queueBrokerMutation(`bridgeEvent:${event.type}`, async () => {
-      return liveWsCoordinator.handleBridgeEvent(event, {
+      const next = liveWsCoordinator.handleBridgeEvent(event, {
         instanceID,
         controlId: event.controlId,
       })
+      await persistBrokerStateStoreSnapshot(liveWsCoordinator.getState())
+      return next
     })
 
     if (event.type === "commandResult") {
@@ -1987,7 +1992,7 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     const liveRegistration = liveBridgeByInstanceID.get(input.instanceID)
     if (liveRegistration && !liveRegistration.socket.destroyed) {
       const command = await queueBrokerMutation("dispatchWsReplyQuestion", async () => {
-        return liveWsCoordinator.dispatchCommand({
+        const next = liveWsCoordinator.dispatchCommand({
           instanceID: input.instanceID,
           instanceIncarnation: liveRegistration.instanceIncarnation,
           commandId: input.mutationId,
@@ -2002,6 +2007,8 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
             requestID: input.requestID,
           },
         })
+        await persistBrokerStateStoreSnapshot(liveWsCoordinator.getState())
+        return next
       })
       if (!command) {
         return { mutationId: input.mutationId, ok: false, errorMessage: `replyQuestion unavailable: ${input.mutationId}` }
@@ -2070,7 +2077,7 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     const liveRegistration = liveBridgeByInstanceID.get(input.instanceID)
     if (liveRegistration && !liveRegistration.socket.destroyed) {
       const command = await queueBrokerMutation("dispatchWsReplyPermission", async () => {
-        return liveWsCoordinator.dispatchCommand({
+        const next = liveWsCoordinator.dispatchCommand({
           instanceID: input.instanceID,
           instanceIncarnation: liveRegistration.instanceIncarnation,
           commandId: input.mutationId,
@@ -2086,6 +2093,8 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
             requestID: input.requestID,
           },
         })
+        await persistBrokerStateStoreSnapshot(liveWsCoordinator.getState())
+        return next
       })
       if (!command) {
         return { mutationId: input.mutationId, ok: false, errorMessage: `replyPermission unavailable: ${input.mutationId}` }
@@ -2154,7 +2163,7 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     const liveRegistration = liveBridgeByInstanceID.get(input.instanceID)
     if (liveRegistration && !liveRegistration.socket.destroyed) {
       const command = await queueBrokerMutation("dispatchWsReplyNaturalStop", async () => {
-        return liveWsCoordinator.dispatchCommand({
+        const next = liveWsCoordinator.dispatchCommand({
           instanceID: input.instanceID,
           instanceIncarnation: liveRegistration.instanceIncarnation,
           commandId: input.mutationId,
@@ -2169,6 +2178,8 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
             sessionID: input.sessionID,
           },
         })
+        await persistBrokerStateStoreSnapshot(liveWsCoordinator.getState())
+        return next
       })
       if (!command) {
         return { mutationId: input.mutationId, ok: false, errorMessage: `replyNaturalStop unavailable: ${input.mutationId}` }

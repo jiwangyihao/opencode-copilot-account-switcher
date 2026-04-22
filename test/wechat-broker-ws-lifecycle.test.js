@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { writeFile } from "node:fs/promises"
+import { readFile, writeFile } from "node:fs/promises"
 import net from "node:net"
 import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
@@ -46,6 +46,23 @@ function closeServer(server) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForAsync(predicate, timeoutMs = 4000, intervalMs = 20) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      if (await predicate()) {
+        return
+      }
+    } catch {
+      // keep polling
+    }
+    await delay(intervalMs)
+  }
+  if (!await predicate()) {
+    throw new Error("waitForAsync timeout")
+  }
 }
 
 test("ws lifecycle: broker client 不再让并发 request 共用单 pending 槽", async () => {
@@ -379,6 +396,82 @@ test("ws lifecycle live path: startBrokerServer + broker-client registerHello �
   } finally {
     await client.close().catch(() => {})
     await server.close()
+  }
+})
+
+test("ws lifecycle live path: live register 与 bridge event 会持久化 broker 权威状态快照", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-persist-state-")
+  const serverModule = await importServer("live-persist-state")
+  const brokerClient = await importClient("live-persist-state")
+  const statePaths = await importStatePaths("live-persist-state")
+
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+  const client = await brokerClient.connect(server.endpoint)
+
+  try {
+    const registerResult = await client.registerHello({
+      protocolVersion: serverModule.WECHAT_BROKER_WS_PROTOCOL_VERSION,
+      stateGeneration: serverModule.WECHAT_BROKER_WS_STATE_GENERATION,
+      instanceID: "inst-persist-1",
+      instanceIncarnation: "inc-persist-1",
+      lastSeenBrokerSeq: 0,
+      lastSentEventSeq: 0,
+    })
+
+    assert.equal(registerResult.control?.type, "requestFullSync")
+
+    await client.sendBridgeEvent({
+      type: "instanceOnline",
+      eventSeq: 1,
+      instanceIncarnation: "inc-persist-1",
+      payload: {
+        instanceID: "inst-persist-1",
+        connectedAt: 1_700_001_000_000,
+      },
+    }, {
+      instanceID: "inst-persist-1",
+      controlId: registerResult.control?.controlId,
+    })
+
+    await client.sendBridgeEvent({
+      type: "questionOpened",
+      eventSeq: 2,
+      instanceIncarnation: "inc-persist-1",
+      payload: {
+        instanceID: "inst-persist-1",
+        requestID: "q-persist-1",
+        routeKey: "route-persist-1",
+        handle: "q-persist-1",
+        updatedAt: 1_700_001_000_100,
+      },
+    }, {
+      instanceID: "inst-persist-1",
+      controlId: registerResult.control?.controlId,
+    })
+
+    await client.sendBridgeEvent({
+      type: "fullSyncCompleted",
+      eventSeq: 3,
+      instanceIncarnation: "inc-persist-1",
+      controlId: registerResult.control?.controlId,
+      payload: {
+        controlId: registerResult.control?.controlId,
+      },
+    }, {
+      instanceID: "inst-persist-1",
+      controlId: registerResult.control?.controlId,
+    })
+
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return raw.connections?.["inst-persist-1"]?.["inc-persist-1"]?.lastAckedEventSeq === 3
+        && raw.active?.instances?.["inst-persist-1"]?.instanceIncarnation === "inc-persist-1"
+        && raw.active?.questions?.["route-persist-1"]?.handle === "q-persist-1"
+    })
+  } finally {
+    await client.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedStateRoot.restore()
   }
 })
 

@@ -462,6 +462,10 @@ async function writeBrokerStateStoreSnapshot(state: BrokerState): Promise<void> 
   await writeFile(filePath, JSON.stringify(state, null, 2), "utf8")
 }
 
+export async function persistBrokerStateStoreSnapshot(state: BrokerState): Promise<void> {
+  await writeBrokerStateStoreSnapshot(state)
+}
+
 export async function readBrokerStateSchemaMarker(): Promise<BrokerStateSchemaMarker | undefined> {
   const raw = await readJsonFile(brokerStateSchemaPath())
   if (!isRecord(raw) || !isSafeInteger(raw.protocolVersion) || !isNonEmptyString(raw.stateGeneration) || !isSafeInteger(raw.updatedAt)) {
