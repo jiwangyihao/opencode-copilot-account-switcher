@@ -599,17 +599,98 @@ test("ws lifecycle live path: createWechatBridgeLifecycle steady keepalive 不�
   )
 
   try {
-    await delay(120)
+    await delay(40)
+    const initialCalls = {
+      sessionListCalls,
+      sessionStatusCalls,
+      questionListCalls,
+      permissionListCalls,
+    }
+
+    await delay(80)
+
+    assert.equal(sessionListCalls, initialCalls.sessionListCalls)
+    assert.equal(sessionStatusCalls, initialCalls.sessionStatusCalls)
+    assert.equal(questionListCalls, initialCalls.questionListCalls)
+    assert.equal(permissionListCalls, initialCalls.permissionListCalls)
   } finally {
     await lifecycle.close().catch(() => {})
     await server.close().catch(() => {})
     await isolatedStateRoot.restore()
   }
+})
 
-  assert.ok(sessionListCalls <= 1, `expected session.list <= 1 call, got ${sessionListCalls}`)
-  assert.ok(sessionStatusCalls <= 1, `expected session.status <= 1 call, got ${sessionStatusCalls}`)
-  assert.ok(questionListCalls <= 1, `expected question.list <= 1 call, got ${questionListCalls}`)
-  assert.ok(permissionListCalls <= 1, `expected permission.list <= 1 call, got ${permissionListCalls}`)
+test("ws lifecycle live path: requestFullSync 会把 session 与 question 写进 broker 权威视图", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-fullsync-active-view-")
+  const serverModule = await importServer("live-fullsync-active-view")
+  const bridgeModule = await importBridge("live-fullsync-active-view")
+  const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-live-fullsync-active-view`)
+  const statePaths = await importStatePaths("live-fullsync-active-view")
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-live-fullsync-view",
+    userId: "u-live-fullsync-view",
+    boundAt: Date.now(),
+  })
+
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+
+  const lifecycle = await bridgeModule.createWechatBridgeLifecycle(
+    {
+      statusCollectionEnabled: true,
+      initialBrokerPromise: Promise.resolve({ endpoint: server.endpoint }),
+      directory: "/workspace/live-fullsync-active-view",
+      client: {
+        session: {
+          list: async () => [{
+            id: "session-live-1",
+            title: "Live Session 1",
+            directory: "/workspace/live-fullsync-active-view",
+            time: { updated: 1_700_001_200_000 },
+          }],
+          status: async () => ({
+            "session-live-1": { type: "idle" },
+          }),
+          todo: async () => [],
+          messages: async () => [],
+        },
+        question: {
+          list: async () => [{
+            id: "question-live-1",
+            sessionID: "session-live-1",
+            questions: [{
+              header: "Question header",
+              question: "Question body",
+            }],
+          }],
+        },
+        permission: {
+          list: async () => [],
+        },
+      },
+    },
+    {
+      heartbeatIntervalMs: 60_000,
+    },
+  )
+
+  try {
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return raw.active?.instances?.["wechat-status-runtime"] !== undefined
+        || raw.active?.instances?.[Object.keys(raw.active?.instances ?? {})[0]] !== undefined
+    }, 10_000)
+
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return raw.active?.sessions?.["session-live-1"]?.title === "Live Session 1"
+        && Object.keys(raw.active?.questions ?? {}).length >= 1
+    }, 10_000)
+  } finally {
+    await lifecycle.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedStateRoot.restore()
+  }
 })
 
 test("ws lifecycle: broker ack 后 bridge replay buffer 会裁剪已确认事件", async () => {

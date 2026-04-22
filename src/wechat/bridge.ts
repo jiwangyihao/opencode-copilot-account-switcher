@@ -1039,12 +1039,31 @@ export async function createWechatBridgeLifecycle(
   }
 
   async function handleFullSyncControl(control: BrokerToBridgeControl) {
+    const snapshot = await bridge.collectStatusSnapshot()
+
     await sendSequencedEvent(createSequencedEvent("instanceOnline", {
       connectedAt: Date.now(),
       pid: process.pid,
       displayName: toInstanceName(projectName, directory),
       projectDir: directory,
     }, { controlId: control.controlId }))
+
+    for (const session of snapshot.sessions) {
+      await sendSequencedEvent(createSequencedEvent("sessionSnapshotChanged", {
+        sessionID: session.sessionID,
+        title: session.title,
+        directory: session.directory,
+        updatedAt: session.updatedAt,
+        status: session.status,
+        pendingQuestionCount: session.pendingQuestionCount,
+        pendingPermissionCount: session.pendingPermissionCount,
+        todoSummary: session.todoSummary,
+        highlights: session.highlights,
+        ...(session.unavailable ? { unavailable: session.unavailable } : {}),
+        ...(session.todoItems ? { todoItems: session.todoItems } : {}),
+        ...(session.questionHighlights ? { questionHighlights: session.questionHighlights } : {}),
+      }, { controlId: control.controlId }))
+    }
 
     const candidates = stagedRegisterFullSyncCandidates ?? await bridge.collectNotificationCandidates()
     stagedRegisterFullSyncCandidates = null

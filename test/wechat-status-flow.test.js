@@ -143,6 +143,7 @@ function createFallbackQuestion(requestID) {
   return [
     {
       id: requestID,
+      sessionID: "session-fallback",
       questions: [
         {
           header: "Fallback Question",
