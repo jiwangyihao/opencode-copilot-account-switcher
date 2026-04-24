@@ -73,6 +73,14 @@ type RuntimeDrainOutboundMessagesInput = {
   sendMessage: (input: RuntimeSendMessageInput) => Promise<void>
 }
 
+type InitializedRuntimeState = {
+  helpers: PublicHelpersForRuntime
+  accountId: string
+  baseUrl: string
+  token: string
+  getUpdatesBuf: string
+}
+
 export type WechatStatusRuntimeDiagnosticEvent =
   | LoadPublicHelpersRuntimeErrorDiagnostic
   | ReachedGetUpdatesRuntimeErrorDiagnostic
@@ -281,7 +289,10 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
   let closed = false
   let stopController: AbortController | null = null
   let pollingTask: Promise<void> | null = null
+  let outboundDrainTask: Promise<void> | null = null
   let helperFailureState: HelperFailureState | null = null
+  let activeRuntimeState: InitializedRuntimeState | null = null
+  let inFlightDrain: Promise<void> | null = null
 
   const retainedHelperFailureObjects = new Set<object>()
 
@@ -318,6 +329,72 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
       return
     }
     replaceHelperFailureState(null)
+  }
+
+  const drainOutboundWithState = async (initialized: InitializedRuntimeState, signal: AbortSignal) => {
+    if (!drainOutboundMessages) {
+      return
+    }
+    await withAbort(
+      drainOutboundMessages({
+        sendMessage: async (message) => {
+          await initialized.helpers.sendMessageWeixin({
+            to: message.to,
+            text: message.text,
+            opts: {
+              baseUrl: initialized.baseUrl,
+              token: initialized.token,
+              ...(typeof message.contextToken === "string" && message.contextToken.trim().length > 0
+                ? { contextToken: message.contextToken }
+                : {}),
+            },
+          })
+        },
+      }),
+      signal,
+    )
+  }
+
+  const drainCurrentOutboundMessages = async (signal: AbortSignal) => {
+    if (!drainOutboundMessages || !activeRuntimeState) {
+      return
+    }
+    if (inFlightDrain) {
+      return inFlightDrain
+    }
+    const currentState = activeRuntimeState
+    const currentDrain = drainOutboundWithState(currentState, signal)
+      .catch((error) => {
+        if (isAbortError(error)) {
+          return
+        }
+        emitRuntimeErrorDiagnostic("drainOutboundMessages", error)
+        onRuntimeError(error)
+      })
+      .finally(() => {
+        if (inFlightDrain === currentDrain) {
+          inFlightDrain = null
+        }
+      })
+    inFlightDrain = currentDrain
+    return currentDrain
+  }
+
+  const pollOutboundMessages = async (signal: AbortSignal) => {
+    if (!drainOutboundMessages) {
+      return
+    }
+    while (!signal.aborted) {
+      await drainCurrentOutboundMessages(signal)
+      try {
+        await sleepImpl(retryDelayMs, signal)
+      } catch (error) {
+        if (isAbortError(error)) {
+          return
+        }
+        onRuntimeError(error)
+      }
+    }
   }
 
   const noteLoadPublicHelpersFailure = (): HelperFailureState => {
@@ -369,13 +446,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
   }
 
   const poll = async (signal: AbortSignal) => {
-    let initialized: {
-      helpers: PublicHelpersForRuntime
-      accountId: string
-      baseUrl: string
-      token: string
-      getUpdatesBuf: string
-    } | null = null
+    let initialized: InitializedRuntimeState | null = null
 
     while (!signal.aborted) {
       let nextRetryDelayMs = retryDelayMs
@@ -395,6 +466,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
               token: latestAccountState.token,
               getUpdatesBuf: typeof latestAccountState.getUpdatesBuf === "string" ? latestAccountState.getUpdatesBuf : "",
             }
+            activeRuntimeState = initialized
             clearHelperFailureState()
             justInitialized = true
           } catch (error) {
@@ -419,6 +491,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
           getUpdatesBuf: initialized.getUpdatesBuf,
         })) {
           initialized = null
+          activeRuntimeState = null
           continue
         }
 
@@ -466,35 +539,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
 
         const messages = Array.isArray(response.msgs) ? response.msgs : []
 
-        if (drainOutboundMessages && initialized) {
-          const runtimeState = initialized
-          try {
-            await withAbort(
-              drainOutboundMessages({
-                sendMessage: async (message) => {
-                  await runtimeState.helpers.sendMessageWeixin({
-                    to: message.to,
-                    text: message.text,
-                    opts: {
-                      baseUrl: runtimeState.baseUrl,
-                      token: runtimeState.token,
-                      ...(typeof message.contextToken === "string" && message.contextToken.trim().length > 0
-                        ? { contextToken: message.contextToken }
-                        : {}),
-                    },
-                  })
-                },
-              }),
-              signal,
-            )
-          } catch (error) {
-            if (isAbortError(error)) {
-              return
-            }
-            emitRuntimeErrorDiagnostic("drainOutboundMessages", error)
-            onRuntimeError(error)
-          }
-        }
+        await drainCurrentOutboundMessages(signal)
 
         for (const message of messages) {
           if (signal.aborted) {
@@ -618,6 +663,7 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
       const controller = new AbortController()
       stopController = controller
       pollingTask = poll(controller.signal)
+      outboundDrainTask = pollOutboundMessages(controller.signal)
     },
     close: async () => {
       if (!started) {
@@ -633,9 +679,16 @@ export function createWechatStatusRuntime(input: CreateWechatStatusRuntimeInput 
 
       const task = pollingTask
       pollingTask = null
+      const drainTask = outboundDrainTask
+      outboundDrainTask = null
       if (task) {
         await task.catch(() => {})
       }
+      if (drainTask) {
+        await drainTask.catch(() => {})
+      }
+      activeRuntimeState = null
+      inFlightDrain = null
       clearHelperFailureState()
     },
     getDebugFailureStateForTest: () => {

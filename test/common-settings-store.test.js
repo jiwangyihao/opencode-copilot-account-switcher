@@ -27,6 +27,26 @@ test("common settings store path uses account-switcher settings.json", async () 
   assert.match(normalized, /\/opencode\/account-switcher\/settings\.json$/)
 })
 
+test("common settings store path follows late XDG_CONFIG_HOME override", async () => {
+  const { commonSettingsPath } = await loadCommonSettingsStoreOrFail()
+  const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
+  const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "common-settings-store-late-xdg-"))
+
+  try {
+    process.env.XDG_CONFIG_HOME = sandboxConfigHome
+    const normalized = commonSettingsPath().replace(/\\/g, "/")
+    const expectedPrefix = sandboxConfigHome.replace(/\\/g, "/")
+
+    assert.match(normalized, new RegExp(`^${expectedPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/opencode/account-switcher/settings\\.json$`))
+  } finally {
+    if (previousXdgConfigHome === undefined) {
+      delete process.env.XDG_CONFIG_HOME
+    } else {
+      process.env.XDG_CONFIG_HOME = previousXdgConfigHome
+    }
+  }
+})
+
 test("common settings store migrates legacy copilot flags into dedicated settings file", async () => {
   const { readCommonSettingsStore, writeCommonSettingsStore } = await loadCommonSettingsStoreOrFail()
   const dir = await mkdtemp(path.join(os.tmpdir(), "common-settings-store-legacy-"))

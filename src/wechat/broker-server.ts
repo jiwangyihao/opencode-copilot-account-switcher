@@ -27,9 +27,9 @@ import {
 import {
   applyBridgeEvent as applyBrokerStateEvent,
   clearBrokerActiveScope,
-  cleanupBrokerRuntimeTerminalRequests,
-  closeBrokerNaturalStopsForScope,
-  createEmptyBrokerState,
+    cleanupBrokerRuntimeTerminalRequests,
+    closeBrokerNaturalStopsForScope,
+    createEmptyBrokerState,
   expireBrokerIndexedRequestsForScope,
   listTimedOutBrokerConnectionScopes,
   loadBrokerStateStoreSnapshot,
@@ -37,6 +37,7 @@ import {
   markBrokerConnectionObserved,
   markBrokerConnectionOffline,
   removeBrokerConnectionScope,
+  reconcileBrokerDisconnectedScopes,
   markBrokerReplayCompleted,
   markConnectionAckedEventSeq as markBrokerStateAckedEventSeq,
   markConnectionSentBrokerSeq as markBrokerStateSentBrokerSeq,
@@ -1144,6 +1145,12 @@ export type BrokerServerHandle = {
 export async function startBrokerServer(endpoint: string): Promise<BrokerServerHandle> {
   await prepareEndpoint(endpoint)
   const persistedBrokerState = await loadBrokerStateStoreSnapshot()
+  if (persistedBrokerState) {
+    reconcileBrokerDisconnectedScopes(persistedBrokerState, {
+      disconnectedAt: Date.now(),
+    })
+    await persistBrokerStateStoreSnapshot(persistedBrokerState)
+  }
   liveWsCoordinator = createBrokerWsCoordinator({
     state: persistedBrokerState ?? createEmptyBrokerState(),
   })

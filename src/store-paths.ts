@@ -3,6 +3,10 @@ import os from "node:os"
 import { xdgConfig } from "xdg-basedir"
 
 function configBaseDir() {
+  const override = process.env.XDG_CONFIG_HOME
+  if (typeof override === "string" && override.trim().length > 0) {
+    return override.trim()
+  }
   return xdgConfig ?? path.join(os.homedir(), ".config")
 }
 

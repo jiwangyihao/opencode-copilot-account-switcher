@@ -1069,6 +1069,98 @@ test("ws lifecycle live path: socket close 后会收口该实例的 active sessi
   }
 })
 
+test("ws lifecycle live path: broker 启动时会清理无在线连接的旧 active scope", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-startup-stale-scope-cleanup-")
+  const serverModule = await importServer("startup-stale-scope-cleanup")
+  const storeModule = await importStore("startup-stale-scope-cleanup")
+  const statePaths = await importStatePaths("startup-stale-scope-cleanup")
+
+  const state = storeModule.createEmptyBrokerState()
+  state.connections["inst-startup-stale-1"] = {
+    "inc-startup-stale-1": {
+      instanceID: "inst-startup-stale-1",
+      instanceIncarnation: "inc-startup-stale-1",
+      online: false,
+      lastEventSeq: 12,
+      lastAckedEventSeq: 12,
+      lastSentBrokerSeq: 0,
+      connectedAt: 1_700_002_000_000,
+      lastObservedAt: 1_700_002_000_100,
+      disconnectedAt: 1_700_002_000_200,
+      disconnectReason: "socketClosed",
+    },
+  }
+  state.active.instances["inst-startup-stale-1"] = {
+    instanceID: "inst-startup-stale-1",
+    instanceIncarnation: "inc-startup-stale-1",
+    online: false,
+    disconnectedAt: 1_700_002_000_200,
+    disconnectReason: "socketClosed",
+  }
+  state.active.sessions["session-startup-stale-1"] = {
+    instanceID: "inst-startup-stale-1",
+    sessionID: "session-startup-stale-1",
+    title: "Startup stale session",
+  }
+  state.active.questions["question-startup-stale-route-1"] = {
+    instanceID: "inst-startup-stale-1",
+    routeKey: "question-startup-stale-route-1",
+    handle: "q1",
+    requestID: "question-startup-stale-1",
+  }
+  state.active.permissions["permission-startup-stale-route-1"] = {
+    instanceID: "inst-startup-stale-1",
+    routeKey: "permission-startup-stale-route-1",
+    handle: "p1",
+    requestID: "permission-startup-stale-1",
+  }
+  state.active.retryErrors["inst-startup-stale-1"] = {
+    instanceID: "inst-startup-stale-1",
+    action: "retry",
+    redactedSummary: "stale",
+    severityAdvice: "check",
+  }
+  storeModule.upsertBrokerIndexedRequest(state, {
+    kind: "question",
+    requestID: "question-startup-stale-1",
+    routeKey: "question-startup-stale-route-1",
+    handle: "q1",
+    scopeKey: "inst-startup-stale-1",
+    wechatAccountId: "wx-startup-stale-1",
+    userId: "u-startup-stale-1",
+    status: "open",
+    createdAt: 1_700_002_000_150,
+    prompt: {
+      title: "Startup stale question",
+      mode: "text",
+    },
+  })
+  await storeModule.persistBrokerStateStoreSnapshot(state)
+
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+
+  try {
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return raw.active?.instances?.["inst-startup-stale-1"] === undefined
+        && raw.active?.sessions?.["session-startup-stale-1"] === undefined
+        && raw.active?.questions?.["question-startup-stale-route-1"] === undefined
+        && raw.active?.permissions?.["permission-startup-stale-route-1"] === undefined
+        && raw.active?.retryErrors?.["inst-startup-stale-1"] === undefined
+    }, 10_000)
+
+    const expired = await storeModule.readBrokerIndexedRequest({
+      kind: "question",
+      routeKey: "question-startup-stale-route-1",
+    })
+    assert.equal(expired?.status, "expired")
+    assert.equal(expired?.terminalReason, "expired")
+  } finally {
+    await server.close().catch(() => {})
+    await isolatedStateRoot.restore()
+  }
+})
+
 test("ws lifecycle live path: steady-state question 关闭会从 broker 权威视图移除 active question", async () => {
   const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-steady-state-question-close-")
   const serverModule = await importServer("steady-state-question-close")

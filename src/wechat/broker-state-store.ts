@@ -1810,6 +1810,31 @@ export function removeBrokerConnectionScope(
   }
 }
 
+export function reconcileBrokerDisconnectedScopes(
+  state: BrokerState,
+  input: { disconnectedAt: number },
+): void {
+  rememberBrokerState(state)
+  assertNonNegativeInteger(input.disconnectedAt, "disconnectedAt")
+
+  for (const [instanceID, incarnations] of Object.entries(state.connections)) {
+    if (Object.values(incarnations).some((connection) => connection.online)) {
+      continue
+    }
+
+    expireBrokerIndexedRequestsForScope(state, {
+      scopeKey: instanceID,
+      expiredAt: input.disconnectedAt,
+    })
+    closeBrokerNaturalStopsForScope(state, {
+      scopeKey: instanceID,
+      terminalReason: "expired",
+    })
+    clearBrokerActiveScope(state, { scopeKey: instanceID })
+    delete state.connections[instanceID]
+  }
+}
+
 function readBrokerRequestTerminalTimestamp(record: BrokerIndexedRequestRecord): number | undefined {
   if (record.status === "answered") {
     return record.answeredAt

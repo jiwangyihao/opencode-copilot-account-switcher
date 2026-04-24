@@ -2035,6 +2035,50 @@ test("status runtime: 支持注入 drainOutboundMessages，并复用 runtime 的
   assert.equal(sendCalls[0]?.opts?.contextToken, "ctx-runtime")
 })
 
+test("status runtime: getUpdates 长轮询期间也会继续 drain outbound，避免漏掉自然结束通知", async () => {
+  const runtimeModule = await import(`${DIST_WECHAT_STATUS_RUNTIME_MODULE}?reload=${Date.now()}-runtime-outbound-while-long-poll`)
+
+  let pollCount = 0
+  let drainCalls = 0
+  const runtime = runtimeModule.createWechatStatusRuntime({
+    retryDelayMs: 10,
+    loadPublicHelpers: async () => ({
+      latestAccountState: {
+        accountId: "wx-runtime-long-poll",
+        token: "token-runtime-long-poll",
+        baseUrl: "https://wx-runtime.example.com",
+      },
+      getUpdates: async () => {
+        pollCount += 1
+        if (pollCount === 1) {
+          return {
+            get_updates_buf: "buf-runtime-long-poll-1",
+            msgs: [],
+          }
+        }
+        return new Promise(() => {})
+      },
+      sendMessageWeixin: async () => ({ messageId: "runtime-long-poll" }),
+    }),
+    drainOutboundMessages: async () => {
+      drainCalls += 1
+    },
+  })
+
+  await runtime.start()
+  try {
+    await waitFor(async () => {
+      assert.equal(pollCount >= 2, true)
+      assert.equal(drainCalls >= 1, true)
+    })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  } finally {
+    await runtime.close()
+  }
+
+  assert.equal(drainCalls >= 2, true)
+})
+
 test("broker-entry lifecycle: 创建 dispatcher 并在 runtime 注入 drainOutboundMessages", async () => {
   const brokerEntry = await import(`${DIST_BROKER_ENTRY_MODULE}?reload=${Date.now()}`)
 
