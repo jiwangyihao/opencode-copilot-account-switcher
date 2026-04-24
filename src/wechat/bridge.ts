@@ -374,6 +374,18 @@ function deriveNaturalStopSeverity(status: SessionStatus | undefined): string {
   return "已停止并等待你的回复"
 }
 
+function stableBridgeSignature(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableBridgeSignature(item)).join(",")}]`
+  }
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort()
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableBridgeSignature(record[key])}`).join(",")}}`
+}
+
 export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
   const retryEventSequenceBySessionID = new Map<string, number>()
   const retrySignatureBySessionID = new Map<string, string>()
@@ -816,6 +828,9 @@ export async function createWechatBridgeLifecycle(
   let lastAckedEventSeq = 0
   let stagedRegisterFullSyncCandidates: WechatNotificationCandidate[] | null = null
   const bridgeEventLog: BridgeToBrokerEvent[] = []
+  let lastSteadyStateSessionSignature: string | null = null
+  let lastSteadyStateCandidateSignature: string | null = null
+  let steadyStateSyncPromise: Promise<void> | null = null
 
   const supportsLiveBrokerClient = (candidate: unknown): candidate is Awaited<ReturnType<typeof connect>> => {
     if (typeof candidate !== "object" || candidate === null) {
@@ -891,7 +906,7 @@ export async function createWechatBridgeLifecycle(
 
   function toCandidateEvent(
     candidate: WechatNotificationCandidate,
-    controlId: string,
+    controlId?: string,
   ): BridgeToBrokerEvent | null {
     if (candidate.kind === "question") {
       return createSequencedEvent("questionOpened", {
@@ -985,6 +1000,8 @@ export async function createWechatBridgeLifecycle(
 
     const candidates = stagedRegisterFullSyncCandidates ?? await bridge.collectNotificationCandidates()
     stagedRegisterFullSyncCandidates = null
+    lastSteadyStateSessionSignature = stableBridgeSignature(snapshot.sessions)
+    lastSteadyStateCandidateSignature = stableBridgeSignature(candidates)
     for (const candidate of candidates) {
       const event = toCandidateEvent(candidate, control.controlId)
       if (!event) {
@@ -996,6 +1013,53 @@ export async function createWechatBridgeLifecycle(
     await sendSequencedEvent(createSequencedEvent("fullSyncCompleted", {
       controlId: control.controlId,
     }, { controlId: control.controlId }))
+  }
+
+  async function syncSteadyStateContentIfChanged() {
+    if (steadyStateSyncPromise) {
+      return steadyStateSyncPromise
+    }
+
+    steadyStateSyncPromise = (async () => {
+      const snapshot = await bridge.collectStatusSnapshot()
+      const sessionSignature = stableBridgeSignature(snapshot.sessions)
+      if (sessionSignature !== lastSteadyStateSessionSignature) {
+        for (const session of snapshot.sessions) {
+          await sendSequencedEvent(createSequencedEvent("sessionSnapshotChanged", {
+            sessionID: session.sessionID,
+            title: session.title,
+            directory: session.directory,
+            updatedAt: session.updatedAt,
+            status: session.status,
+            pendingQuestionCount: session.pendingQuestionCount,
+            pendingPermissionCount: session.pendingPermissionCount,
+            todoSummary: session.todoSummary,
+            highlights: session.highlights,
+            ...(session.unavailable ? { unavailable: session.unavailable } : {}),
+            ...(session.todoItems ? { todoItems: session.todoItems } : {}),
+            ...(session.questionHighlights ? { questionHighlights: session.questionHighlights } : {}),
+          }))
+        }
+        lastSteadyStateSessionSignature = sessionSignature
+      }
+
+      const candidates = await bridge.collectNotificationCandidates()
+      const candidateSignature = stableBridgeSignature(candidates)
+      if (candidateSignature !== lastSteadyStateCandidateSignature) {
+        for (const candidate of candidates) {
+          const event = toCandidateEvent(candidate)
+          if (!event) {
+            continue
+          }
+          await sendSequencedEvent(event)
+        }
+        lastSteadyStateCandidateSignature = candidateSignature
+      }
+    })().finally(() => {
+      steadyStateSyncPromise = null
+    })
+
+    return steadyStateSyncPromise
   }
 
   async function handleBrokerControl(control: BrokerToBridgeControl) {
@@ -1177,7 +1241,9 @@ export async function createWechatBridgeLifecycle(
       : supportsLegacyInjectedBrokerClient(currentBrokerClient)
         ? currentBrokerClient.heartbeat()
         : Promise.reject(new TypeError("broker client does not support keepalive"))
-    void heartbeatPromise.catch(() => reconnectBrokerClient().catch(() => {}))
+    void heartbeatPromise
+      .then(() => syncSteadyStateContentIfChanged())
+      .catch(() => reconnectBrokerClient().catch(() => {}))
   }, heartbeatIntervalMs)
 
   return {

@@ -678,11 +678,12 @@ test("ws lifecycle live path: startBrokerServer 对 compat syncWechatNotificatio
   }
 })
 
-test("ws lifecycle live path: createWechatBridgeLifecycle steady keepalive 不再重复走旧 candidate full sync", async () => {
+test("ws lifecycle live path: createWechatBridgeLifecycle steady keepalive 会继续采样内容变化，但不会重复触发 full sync", async () => {
   const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-live-lifecycle-")
   const serverModule = await importServer("live-bridge-lifecycle")
   const bridgeModule = await import(`../dist/wechat/bridge.js?reload=${Date.now()}-live-bridge-lifecycle`)
   const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-live-bridge-lifecycle`)
+  const statePaths = await importStatePaths("live-bridge-lifecycle")
 
   const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
   let sessionListCalls = 0
@@ -745,10 +746,13 @@ test("ws lifecycle live path: createWechatBridgeLifecycle steady keepalive 不�
 
     await delay(80)
 
-    assert.equal(sessionListCalls, initialCalls.sessionListCalls)
-    assert.equal(sessionStatusCalls, initialCalls.sessionStatusCalls)
-    assert.equal(questionListCalls, initialCalls.questionListCalls)
-    assert.equal(permissionListCalls, initialCalls.permissionListCalls)
+    assert.equal(sessionListCalls > initialCalls.sessionListCalls, true)
+    assert.equal(sessionStatusCalls > initialCalls.sessionStatusCalls, true)
+    assert.equal(questionListCalls > initialCalls.questionListCalls, true)
+    assert.equal(permissionListCalls > initialCalls.permissionListCalls, true)
+
+    const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+    assert.equal(Object.keys(raw.controlLedger ?? {}).length, 1)
   } finally {
     await lifecycle.close().catch(() => {})
     await server.close().catch(() => {})
@@ -820,6 +824,81 @@ test("ws lifecycle live path: requestFullSync 会把 session 与 question 写进
     await waitForAsync(async () => {
       const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
       return raw.active?.sessions?.["session-live-1"]?.title === "Live Session 1"
+        && Object.keys(raw.active?.questions ?? {}).length >= 1
+    }, 10_000)
+  } finally {
+    await lifecycle.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedStateRoot.restore()
+  }
+})
+
+test("ws lifecycle live path: 初始 full sync 为空时，后续新增 session 与 question 也会推进 broker 权威视图", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-steady-state-content-sync-")
+  const serverModule = await importServer("steady-state-content-sync")
+  const bridgeModule = await importBridge("steady-state-content-sync")
+  const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-steady-state-content-sync`)
+  const statePaths = await importStatePaths("steady-state-content-sync")
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-steady-state-sync",
+    userId: "u-steady-state-sync",
+    boundAt: Date.now(),
+  })
+
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+  const sessionList = []
+  const questionList = []
+
+  const lifecycle = await bridgeModule.createWechatBridgeLifecycle(
+    {
+      statusCollectionEnabled: true,
+      heartbeatIntervalMs: 20,
+      initialBrokerPromise: Promise.resolve({ endpoint: server.endpoint }),
+      directory: "/workspace/steady-state-content-sync",
+      client: {
+        session: {
+          list: async () => sessionList,
+          status: async () => Object.fromEntries(sessionList.map((session) => [session.id, { type: "idle" }])),
+          todo: async () => [],
+          messages: async () => [],
+        },
+        question: {
+          list: async () => questionList,
+        },
+        permission: {
+          list: async () => [],
+        },
+      },
+    },
+    {
+      setIntervalImpl: (handler) => setInterval(handler, 10),
+      clearIntervalImpl: (timer) => clearInterval(timer),
+    },
+  )
+
+  try {
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return Object.keys(raw.active?.sessions ?? {}).length === 0
+        && Object.keys(raw.active?.questions ?? {}).length === 0
+    }, 10_000)
+
+    sessionList.push({
+      id: "session-live-later-1",
+      title: "Later Session",
+      directory: "/workspace/steady-state-content-sync",
+      time: { updated: 1_700_001_300_000 },
+    })
+    questionList.push({
+      id: "question-live-later-1",
+      sessionID: "session-live-later-1",
+      questions: [{ header: "Later header", question: "Later question" }],
+    })
+
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return raw.active?.sessions?.["session-live-later-1"]?.title === "Later Session"
         && Object.keys(raw.active?.questions ?? {}).length >= 1
     }, 10_000)
   } finally {
