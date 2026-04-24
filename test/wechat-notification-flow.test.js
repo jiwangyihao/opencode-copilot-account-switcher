@@ -517,6 +517,95 @@ test("同一 retry 状态持续不重复新增，但新 retry 事件应生成新
   }
 })
 
+test("通知同步：live questionOpened event 会生成 pending question notification", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-live-question-opened-")
+
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-live-question-opened-server`)
+  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-live-question-opened-client`)
+  const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}-live-question-opened-settings`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-live-question-opened-notification`)
+  const operatorStore = await import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}-live-question-opened-operator`)
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-live-question-opened",
+    userId: "u-live-question-opened",
+    boundAt: Date.now(),
+  })
+  await commonSettingsStore.writeCommonSettingsStore({
+    wechat: {
+      primaryBinding: { accountId: "wx-live-question-opened", userId: "u-live-question-opened" },
+      notifications: {
+        enabled: true,
+        question: true,
+        permission: true,
+        sessionError: true,
+      },
+    },
+  })
+
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-live-question-opened-endpoint-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+
+  const server = await brokerServer.startBrokerServer(endpoint)
+  const client = await brokerClient.connect(endpoint)
+  const notificationKey = "question-live-question-opened-1"
+
+  try {
+    const register = await client.registerHello({
+      protocolVersion: 2,
+      stateGeneration: "wechat-ws-v1",
+      instanceID: "instance-live-question-opened",
+      instanceIncarnation: "inc-live-question-opened",
+      lastSeenBrokerSeq: 0,
+      lastSentEventSeq: 0,
+    })
+    assert.equal(register.control?.type, "requestFullSync")
+
+    await client.sendBridgeEvent({
+      type: "instanceOnline",
+      eventSeq: 1,
+      instanceIncarnation: "inc-live-question-opened",
+      payload: {
+        instanceID: "instance-live-question-opened",
+        connectedAt: 1_700_900_000_000,
+        pid: process.pid,
+        displayName: "Live Notification Instance",
+        projectDir: "/workspace/live-question-opened",
+      },
+    }, { instanceID: "instance-live-question-opened" })
+    await client.sendBridgeEvent({
+      type: "questionOpened",
+      eventSeq: 2,
+      instanceIncarnation: "inc-live-question-opened",
+      payload: {
+        instanceID: "instance-live-question-opened",
+        idempotencyKey: notificationKey,
+        requestID: "question-live-opened-1",
+        routeKey: "question-live-opened-route-1",
+        handle: "q1",
+        scopeKey: "instance-live-question-opened",
+        createdAt: 1_700_900_000_010,
+        updatedAt: 1_700_900_000_010,
+        wechatAccountId: "wx-live-question-opened",
+        userId: "u-live-question-opened",
+        prompt: {
+          title: "Live question title",
+          mode: "text",
+        },
+      },
+    }, { instanceID: "instance-live-question-opened" })
+
+    await waitFor(async () => {
+      const pending = await notificationStore.listPendingNotifications()
+      assert.equal(pending.some((item) => item.idempotencyKey === notificationKey && item.kind === "question"), true)
+    }, 10_000)
+  } finally {
+    await client.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
 test("通知候选：ordinary retry/error 不分配 handle，只带动作/摘要/严重度", async () => {
   const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-retry-summary-")
 
@@ -2844,6 +2933,53 @@ test("通知分发：permission rejected 走 terminal 链路后文案保持已�
   }
 })
 
+test("通知分发：permission handled 走 terminal 链路后文案保持已在电脑端处理", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-terminal-handled-permission-")
+
+  const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}-request-terminal-handled-settings`)
+  const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}-request-terminal-handled-dispatcher`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-request-terminal-handled-store`)
+
+  try {
+    await commonSettingsStore.writeCommonSettingsStore({
+      wechat: {
+        primaryBinding: { accountId: "wx-terminal-handled", userId: "u-terminal-handled" },
+        notifications: {
+          enabled: true,
+          question: true,
+          permission: true,
+          sessionError: true,
+        },
+      },
+    })
+
+    await notificationStore.upsertNotification({
+      idempotencyKey: "permission-terminal-handled",
+      kind: "requestTerminal",
+      wechatAccountId: "wx-terminal-handled",
+      userId: "u-terminal-handled",
+      requestKind: "permission",
+      routeKey: "bridge-route-terminal-handled-permission",
+      handle: "p1",
+      terminalReason: "handled",
+      createdAt: 1_700_620_500_000,
+    })
+
+    const sendCalls = []
+    const dispatcher = notificationDispatcher.createWechatNotificationDispatcher({
+      sendMessage: async (input) => {
+        sendCalls.push(input.text)
+      },
+    })
+    await dispatcher.drainOutboundMessages()
+
+    assert.equal(sendCalls.some((text) => /p1/.test(text) && /已在电脑端处理/.test(text) && /不再接受权限处理/.test(text)), true)
+    assert.equal(sendCalls.some((text) => /已在电脑端拒绝/.test(text)), false)
+  } finally {
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
 test("通知分发：sync terminal finalization 与并发终结竞争时不会丢掉 terminal result", async () => {
   const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-terminal-race-finalization-")
 
@@ -3347,6 +3483,68 @@ test("通知分发：旧 live token 文件不会让 authoritative stale sessionE
     assert.equal(sendCalls.length, 0)
     const record = JSON.parse(await readFile(statePaths.notificationStatePath("authoritative-session-error-token"), "utf8"))
     assert.equal(record.status, "pending")
+  } finally {
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("通知分发：authoritative state 已无 active natural-stop 时，pending natural-stop 会被 suppress", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-authoritative-natural-stop-suppress-")
+
+  const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}-authoritative-natural-stop-suppress-settings`)
+  const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}-authoritative-natural-stop-suppress-dispatcher`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-authoritative-natural-stop-suppress-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-authoritative-natural-stop-suppress-state-paths`)
+
+  try {
+    await commonSettingsStore.writeCommonSettingsStore({
+      wechat: {
+        primaryBinding: { accountId: "wx-natural-stop-suppress", userId: "u-natural-stop-suppress" },
+        notifications: {
+          enabled: true,
+          question: true,
+          permission: true,
+          sessionError: true,
+        },
+      },
+    })
+
+    await notificationStore.upsertNotification({
+      idempotencyKey: "natural-stop-authoritative-suppress",
+      kind: "naturalStop",
+      wechatAccountId: "wx-natural-stop-suppress",
+      userId: "u-natural-stop-suppress",
+      handle: "s1",
+      scopeKey: "instance-natural-stop-suppress",
+      sessionID: "session-natural-stop-suppress",
+      replyTarget: {
+        instanceID: "instance-natural-stop-suppress",
+        sessionID: "session-natural-stop-suppress",
+      },
+      redactedSummary: "自然中止已结束",
+      severityAdvice: "已停止并等待你的回复",
+      createdAt: 1_700_633_500_001,
+    })
+
+    await persistAuthoritativeBrokerState("authoritative-natural-stop-suppress-state", async (state) => {
+      state.active.instances["instance-natural-stop-suppress"] = {
+        instanceID: "instance-natural-stop-suppress",
+        online: false,
+      }
+    })
+
+    const sendCalls = []
+    const dispatcher = notificationDispatcher.createWechatNotificationDispatcher({
+      sendMessage: async (input) => {
+        sendCalls.push(input)
+      },
+    })
+
+    await dispatcher.drainOutboundMessages()
+
+    assert.equal(sendCalls.length, 0)
+    const record = JSON.parse(await readFile(statePaths.notificationStatePath("natural-stop-authoritative-suppress"), "utf8"))
+    assert.equal(record.status, "suppressed")
   } finally {
     await isolatedWechatStateRoot.restore()
   }

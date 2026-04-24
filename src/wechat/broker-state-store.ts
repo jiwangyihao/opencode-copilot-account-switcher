@@ -105,7 +105,7 @@ export type BrokerIndexedRequestRecord = {
   rejectedAt?: number
   expiredAt?: number
   cleanedAt?: number
-  terminalReason?: "answered" | "rejected" | "expired" | "replaced"
+  terminalReason?: "answered" | "handled" | "rejected" | "expired" | "replaced"
   replacementHandle?: string
   terminalResultSent?: boolean
 }
@@ -1035,15 +1035,31 @@ export function applyBridgeEvent<TPayload = unknown>(
       delete state.active.questions[routeKey]
       const reason = getStringField(payload, "reason")
       if (reason) {
+        const handle = getStringField(payload, "handle") ?? (currentQuestion ? getStringField(currentQuestion, "handle") : undefined)
+        const requestID = getStringField(payload, "requestID") ?? (currentQuestion ? getStringField(currentQuestion, "requestID") : undefined)
+        const scopeKey = getStringField(payload, "scopeKey") ?? (currentQuestion ? readBrokerScopeKey(currentQuestion) : undefined)
+        const wechatAccountId = getStringField(payload, "wechatAccountId") ?? (currentQuestion ? getStringField(currentQuestion, "wechatAccountId") : undefined)
+        const userId = getStringField(payload, "userId") ?? (currentQuestion ? getStringField(currentQuestion, "userId") : undefined)
+        const createdAt = getNumberField(payload, "createdAt") ?? (currentQuestion ? getNumberField(currentQuestion, "createdAt") : undefined)
+        const terminalAt = getNumberField(payload, "updatedAt") ?? (currentQuestion ? getNumberField(currentQuestion, "updatedAt") : undefined)
         state.terminalMetadata[routeKey] = {
           reason,
+          ...(handle ? { handle } : {}),
+          ...(requestID ? { requestID } : {}),
+          ...(scopeKey ? { scopeKey } : {}),
+          ...(currentQuestion && Object.hasOwn(currentQuestion, "prompt") ? { prompt: cloneUnknownValue(currentQuestion.prompt) } : {}),
+          ...(wechatAccountId ? { wechatAccountId } : {}),
+          ...(userId ? { userId } : {}),
+          ...(createdAt !== undefined ? { createdAt } : {}),
+          ...((reason === "answered" || reason === "handled") && terminalAt !== undefined ? { answeredAt: terminalAt } : {}),
+          ...(reason === "rejected" && terminalAt !== undefined ? { rejectedAt: terminalAt } : {}),
+          ...(reason === "expired" && terminalAt !== undefined ? { expiredAt: terminalAt } : {}),
           ...(isNonEmptyString(payload.replacementHandle) ? { replacementHandle: payload.replacementHandle } : {}),
           ...(typeof payload.terminalResultSent === "boolean"
             ? { terminalResultSent: payload.terminalResultSent }
             : {}),
           ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
         }
-        const handle = getStringField(payload, "handle") ?? (currentQuestion ? getStringField(currentQuestion, "handle") : undefined)
         if (handle) {
           writeLegacyHandleClosure(state, {
             kind: "question",
@@ -1085,15 +1101,31 @@ export function applyBridgeEvent<TPayload = unknown>(
       delete state.active.permissions[routeKey]
       const reason = getStringField(payload, "reason")
       if (reason) {
+        const handle = getStringField(payload, "handle") ?? (currentPermission ? getStringField(currentPermission, "handle") : undefined)
+        const requestID = getStringField(payload, "requestID") ?? (currentPermission ? getStringField(currentPermission, "requestID") : undefined)
+        const scopeKey = getStringField(payload, "scopeKey") ?? (currentPermission ? readBrokerScopeKey(currentPermission) : undefined)
+        const wechatAccountId = getStringField(payload, "wechatAccountId") ?? (currentPermission ? getStringField(currentPermission, "wechatAccountId") : undefined)
+        const userId = getStringField(payload, "userId") ?? (currentPermission ? getStringField(currentPermission, "userId") : undefined)
+        const createdAt = getNumberField(payload, "createdAt") ?? (currentPermission ? getNumberField(currentPermission, "createdAt") : undefined)
+        const terminalAt = getNumberField(payload, "updatedAt") ?? (currentPermission ? getNumberField(currentPermission, "updatedAt") : undefined)
         state.terminalMetadata[routeKey] = {
           reason,
+          ...(handle ? { handle } : {}),
+          ...(requestID ? { requestID } : {}),
+          ...(scopeKey ? { scopeKey } : {}),
+          ...(currentPermission && Object.hasOwn(currentPermission, "prompt") ? { prompt: cloneUnknownValue(currentPermission.prompt) } : {}),
+          ...(wechatAccountId ? { wechatAccountId } : {}),
+          ...(userId ? { userId } : {}),
+          ...(createdAt !== undefined ? { createdAt } : {}),
+          ...((reason === "answered" || reason === "handled") && terminalAt !== undefined ? { answeredAt: terminalAt } : {}),
+          ...(reason === "rejected" && terminalAt !== undefined ? { rejectedAt: terminalAt } : {}),
+          ...(reason === "expired" && terminalAt !== undefined ? { expiredAt: terminalAt } : {}),
           ...(isNonEmptyString(payload.replacementHandle) ? { replacementHandle: payload.replacementHandle } : {}),
           ...(typeof payload.terminalResultSent === "boolean"
             ? { terminalResultSent: payload.terminalResultSent }
             : {}),
           ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
         }
-        const handle = getStringField(payload, "handle") ?? (currentPermission ? getStringField(currentPermission, "handle") : undefined)
         if (handle) {
           writeLegacyHandleClosure(state, {
             kind: "permission",
@@ -1709,6 +1741,73 @@ export function closeBrokerNaturalStopsForScope(
   }
 
   return closed
+}
+
+export function clearBrokerActiveScope(
+  state: BrokerState,
+  input: { scopeKey: string },
+): void {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.scopeKey)) {
+    throw new Error("invalid broker active scope")
+  }
+
+  for (const [sessionID, rawRecord] of Object.entries(state.active.sessions)) {
+    if (!isRecord(rawRecord) || readBrokerScopeKey(rawRecord) !== input.scopeKey) {
+      continue
+    }
+    delete state.active.sessions[sessionID]
+  }
+
+  for (const [routeKey, rawRecord] of Object.entries(state.active.questions)) {
+    if (!isRecord(rawRecord) || readBrokerScopeKey(rawRecord) !== input.scopeKey) {
+      continue
+    }
+    delete state.active.questions[routeKey]
+  }
+
+  for (const [routeKey, rawRecord] of Object.entries(state.active.permissions)) {
+    if (!isRecord(rawRecord) || readBrokerScopeKey(rawRecord) !== input.scopeKey) {
+      continue
+    }
+    delete state.active.permissions[routeKey]
+  }
+
+  for (const [handle, rawRecord] of Object.entries(state.active.naturalStops)) {
+    if (!isRecord(rawRecord) || readBrokerScopeKey(rawRecord) !== input.scopeKey) {
+      continue
+    }
+    delete state.active.naturalStops[handle]
+  }
+
+  for (const [retryKey, rawRecord] of Object.entries(state.active.retryErrors)) {
+    if (!isRecord(rawRecord) || readBrokerScopeKey(rawRecord) !== input.scopeKey) {
+      continue
+    }
+    delete state.active.retryErrors[retryKey]
+  }
+
+  delete state.active.instances[input.scopeKey]
+}
+
+export function removeBrokerConnectionScope(
+  state: BrokerState,
+  input: BrokerConnectionScope,
+): void {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.instanceID) || !isNonEmptyString(input.instanceIncarnation)) {
+    throw new Error("invalid broker connection scope")
+  }
+
+  const group = state.connections[input.instanceID]
+  if (!group) {
+    return
+  }
+
+  delete group[input.instanceIncarnation]
+  if (Object.keys(group).length === 0) {
+    delete state.connections[input.instanceID]
+  }
 }
 
 function readBrokerRequestTerminalTimestamp(record: BrokerIndexedRequestRecord): number | undefined {

@@ -26,6 +26,7 @@ import {
 } from "./protocol.js"
 import {
   applyBridgeEvent as applyBrokerStateEvent,
+  clearBrokerActiveScope,
   cleanupBrokerRuntimeTerminalRequests,
   closeBrokerNaturalStopsForScope,
   createEmptyBrokerState,
@@ -35,6 +36,7 @@ import {
   markBrokerFullSyncCompleted,
   markBrokerConnectionObserved,
   markBrokerConnectionOffline,
+  removeBrokerConnectionScope,
   markBrokerReplayCompleted,
   markConnectionAckedEventSeq as markBrokerStateAckedEventSeq,
   markConnectionSentBrokerSeq as markBrokerStateSentBrokerSeq,
@@ -541,6 +543,161 @@ async function appendBrokerDiagnostic(event: WechatBrokerDiagnosticEvent) {
   }
 }
 
+function toIdempotencyPart(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "unknown"
+}
+
+function readNotificationEventTimestamp(payload: Record<string, unknown>): number {
+  return readFiniteNumber(payload.createdAt)
+    ?? readFiniteNumber(payload.updatedAt)
+    ?? Date.now()
+}
+
+function buildNotificationIdempotencyKeyFromEvent(event: BridgeToBrokerEvent, instanceID: string): string | undefined {
+  const payload = asObject(event.payload)
+  if (isNonEmptyString(payload.idempotencyKey)) {
+    return payload.idempotencyKey
+  }
+  if ((event.type === "questionOpened" || event.type === "questionUpdated") && isNonEmptyString(payload.requestID)) {
+    return `question-${toIdempotencyPart(instanceID)}-${toIdempotencyPart(payload.requestID)}`
+  }
+  if ((event.type === "permissionOpened" || event.type === "permissionUpdated") && isNonEmptyString(payload.requestID)) {
+    return `permission-${toIdempotencyPart(instanceID)}-${toIdempotencyPart(payload.requestID)}`
+  }
+  if (event.type === "naturalStopOpened" && isNonEmptyString(payload.sessionID)) {
+    return `natural-stop-${toIdempotencyPart(instanceID)}-${toIdempotencyPart(payload.sessionID)}`
+  }
+  if (event.type === "retryErrorUpdated") {
+    const retryIdentity = readNonEmptyString(payload.sessionID) ?? instanceID
+    return `session-error-${toIdempotencyPart(instanceID)}-${toIdempotencyPart(retryIdentity)}`
+  }
+  if ((event.type === "questionClosed" || event.type === "permissionClosed") && isNonEmptyString(payload.routeKey)) {
+    const requestKind = event.type === "questionClosed" ? "question" : "permission"
+    return `request-terminal-${requestKind}-${toIdempotencyPart(payload.routeKey)}`
+  }
+  return undefined
+}
+
+async function projectNotificationFromLiveBridgeEvent(event: BridgeToBrokerEvent, instanceID: string): Promise<void> {
+  const binding = await readOperatorBinding().catch(() => undefined)
+  if (!binding) {
+    return
+  }
+
+  const payload = asObject(event.payload)
+  const idempotencyKey = buildNotificationIdempotencyKeyFromEvent(event, instanceID)
+  if (!idempotencyKey) {
+    return
+  }
+
+  if (event.type === "questionOpened" || event.type === "questionUpdated") {
+    const routeKey = readNonEmptyString(payload.routeKey)
+    const handle = readNonEmptyString(payload.handle)
+    if (!routeKey || !handle) {
+      return
+    }
+    await upsertNotification({
+      idempotencyKey,
+      kind: "question",
+      wechatAccountId: binding.wechatAccountId,
+      userId: binding.userId,
+      routeKey,
+      handle,
+      ...(readNonEmptyString(payload.scopeKey) ? { scopeKey: readNonEmptyString(payload.scopeKey) } : { scopeKey: instanceID }),
+      ...(payload.prompt !== undefined && payload.prompt !== null ? { prompt: payload.prompt as Record<string, unknown> } : {}),
+      createdAt: readNotificationEventTimestamp(payload),
+    })
+    return
+  }
+
+  if (event.type === "permissionOpened" || event.type === "permissionUpdated") {
+    const routeKey = readNonEmptyString(payload.routeKey)
+    const handle = readNonEmptyString(payload.handle)
+    if (!routeKey || !handle) {
+      return
+    }
+    await upsertNotification({
+      idempotencyKey,
+      kind: "permission",
+      wechatAccountId: binding.wechatAccountId,
+      userId: binding.userId,
+      routeKey,
+      handle,
+      ...(readNonEmptyString(payload.scopeKey) ? { scopeKey: readNonEmptyString(payload.scopeKey) } : { scopeKey: instanceID }),
+      ...(payload.prompt !== undefined && payload.prompt !== null ? { prompt: payload.prompt as Record<string, unknown> } : {}),
+      createdAt: readNotificationEventTimestamp(payload),
+    })
+    return
+  }
+
+  if (event.type === "naturalStopOpened") {
+    if (!isNonEmptyString(payload.handle) || !isNonEmptyString(payload.sessionID) || payload.replyTarget === null || typeof payload.replyTarget !== "object") {
+      return
+    }
+    const replyTarget = payload.replyTarget as { instanceID?: unknown; sessionID?: unknown }
+    if (!isNonEmptyString(replyTarget.instanceID) || !isNonEmptyString(replyTarget.sessionID)) {
+      return
+    }
+    await upsertNotification({
+      idempotencyKey,
+      kind: "naturalStop",
+      wechatAccountId: binding.wechatAccountId,
+      userId: binding.userId,
+      handle: payload.handle,
+      scopeKey: replyTarget.instanceID,
+      sessionID: payload.sessionID,
+      replyTarget: {
+        instanceID: replyTarget.instanceID,
+        sessionID: replyTarget.sessionID,
+      },
+      redactedSummary: readNonEmptyString(payload.redactedSummary) ?? "任务已停止",
+      severityAdvice: readNonEmptyString(payload.severityAdvice) ?? "已停止并等待你的回复",
+      createdAt: readNotificationEventTimestamp(payload),
+    })
+    return
+  }
+
+  if (event.type === "retryErrorUpdated") {
+    await upsertNotification({
+      idempotencyKey,
+      kind: "sessionError",
+      wechatAccountId: binding.wechatAccountId,
+      userId: binding.userId,
+      ...(readNonEmptyString(payload.sessionID) ? { sessionID: readNonEmptyString(payload.sessionID) } : {}),
+      ...(readNonEmptyString(payload.action) ? { action: readNonEmptyString(payload.action) } : {}),
+      redactedSummary: readNonEmptyString(payload.redactedSummary) ?? DELIVERY_FAILURE_SUMMARY,
+      severityAdvice: readNonEmptyString(payload.severityAdvice) ?? DELIVERY_FAILURE_SEVERITY,
+      createdAt: readNotificationEventTimestamp(payload),
+    })
+    return
+  }
+
+  if (event.type === "questionClosed" || event.type === "permissionClosed") {
+    const routeKey = readNonEmptyString(payload.routeKey)
+    const handle = readNonEmptyString(payload.handle)
+    const reason = readNonEmptyString(payload.reason)
+    const requestTerminalReason = reason === "answered" || reason === "handled" || reason === "rejected" || reason === "expired" || reason === "replaced"
+      ? reason
+      : undefined
+    if (!routeKey || !handle || !requestTerminalReason) {
+      return
+    }
+    await upsertNotification({
+      idempotencyKey,
+      kind: "requestTerminal",
+      wechatAccountId: binding.wechatAccountId,
+      userId: binding.userId,
+      requestKind: event.type === "questionClosed" ? "question" : "permission",
+      routeKey,
+      handle,
+      ...(readNonEmptyString(payload.scopeKey) ? { scopeKey: readNonEmptyString(payload.scopeKey) } : { scopeKey: instanceID }),
+      terminalReason: requestTerminalReason,
+      ...(readNonEmptyString(payload.replacementHandle) ? { replacementHandle: readNonEmptyString(payload.replacementHandle) } : {}),
+      createdAt: readNotificationEventTimestamp(payload),
+    })
+  }
+}
+
 function clearRuntimeState() {
   liveBridgeByInstanceID.clear()
   liveBridgeBySocket.clear()
@@ -616,6 +773,14 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value)
 }
 
+function readNonEmptyString(value: unknown): string | undefined {
+  return isNonEmptyString(value) ? value.trim() : undefined
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return isFiniteNumber(value) ? value : undefined
+}
+
 export function setBrokerServerTestHooks(hooks: BrokerServerTestHooks | undefined): void {
   brokerServerTestHooks = hooks
 }
@@ -680,18 +845,27 @@ async function cleanupDeadLetters(now: number, retentionMs: number): Promise<voi
 async function cleanupSocketRegistrations(socket: net.Socket, reason: string) {
   const live = liveBridgeBySocket.get(socket)
   if (live?.socket === socket) {
-    markBrokerConnectionOffline(liveWsCoordinator.getState(), {
-      instanceID: live.instanceID,
-      instanceIncarnation: live.instanceIncarnation,
-      disconnectedAt: Date.now(),
-      reason,
-    })
-    await persistBrokerStateStoreSnapshot(liveWsCoordinator.getState())
+    const state = liveWsCoordinator.getState()
     const current = liveBridgeByInstanceID.get(live.instanceID)
     if (current?.socket === socket) {
+      clearBrokerActiveScope(state, {
+        scopeKey: live.instanceID,
+      })
       liveBridgeByInstanceID.delete(live.instanceID)
+    } else {
+      markBrokerConnectionOffline(state, {
+        instanceID: live.instanceID,
+        instanceIncarnation: live.instanceIncarnation,
+        disconnectedAt: Date.now(),
+        reason,
+      })
     }
+    removeBrokerConnectionScope(state, {
+      instanceID: live.instanceID,
+      instanceIncarnation: live.instanceIncarnation,
+    })
     liveBridgeBySocket.delete(socket)
+    await persistBrokerStateStoreSnapshot(state)
   }
 }
 
@@ -832,6 +1006,7 @@ async function handleMessage(envelope: IncomingBrokerEnvelope, socket: net.Socke
           observedAt: Date.now(),
         })
       }
+      await projectNotificationFromLiveBridgeEvent(event, instanceID)
       await persistBrokerStateStoreSnapshot(liveWsCoordinator.getState())
       return next
     })

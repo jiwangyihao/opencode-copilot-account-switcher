@@ -9,7 +9,7 @@ import {
 import { formatWechatNotificationText } from "./notification-format.js"
 import type { NotificationKind } from "./notification-types.js"
 import type { NotificationRecord } from "./notification-types.js"
-import { readBrokerDeliveryToken, readBrokerIndexedRequest } from "./broker-state-store.js"
+import { loadBrokerStateStoreSnapshot, readBrokerDeliveryToken, readBrokerIndexedRequest } from "./broker-state-store.js"
 
 export type WechatNotificationSendInput = {
   to: string
@@ -114,6 +114,8 @@ async function shouldSuppressPendingNotification(record: {
   wechatAccountId: string
   userId: string
   routeKey?: string
+  handle?: string
+  scopeKey?: string
 }): Promise<boolean> {
   if (record.kind === "sessionError") {
     const tokenState = await readBrokerDeliveryToken({
@@ -126,6 +128,22 @@ async function shouldSuppressPendingNotification(record: {
     return false
   }
   if (record.kind === "naturalStop") {
+    if (typeof record.handle !== "string" || record.handle.trim().length === 0) {
+      return false
+    }
+    const snapshot = await loadBrokerStateStoreSnapshot().catch(() => undefined)
+    if (!snapshot) {
+      return false
+    }
+    const active = snapshot?.active?.naturalStops?.[record.handle]
+    if (!active || typeof active !== "object") {
+      return true
+    }
+    if (typeof record.scopeKey === "string" && record.scopeKey.trim().length > 0) {
+      const activeScopeKey = (active as { scopeKey?: unknown; instanceID?: unknown }).scopeKey
+        ?? (active as { scopeKey?: unknown; instanceID?: unknown }).instanceID
+      return activeScopeKey !== record.scopeKey
+    }
     return false
   }
   if (typeof record.routeKey !== "string" || record.routeKey.trim().length === 0) {

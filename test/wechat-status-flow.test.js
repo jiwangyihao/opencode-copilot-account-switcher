@@ -399,13 +399,17 @@ async function seedPendingQuestionNotification({
   idempotencyKey,
 }) {
   const createdAt = Date.now()
-  const routeKey = `question-${instanceID}-${requestID}`
+  const existingNotification = await notificationStore.listPendingNotifications()
+    .then((records) => records.find((record) => record.idempotencyKey === idempotencyKey))
+    .catch(() => undefined)
+  const routeKey = existingNotification?.routeKey ?? `question-${instanceID}-${requestID}`
+  const handle = existingNotification?.handle ?? "q1"
 
   const request = await requestStore.upsertRequest({
     kind: "question",
     requestID,
     routeKey,
-    handle: "q1",
+    handle,
     scopeKey: instanceID,
     wechatAccountId,
     userId,
@@ -921,17 +925,6 @@ test("broker 通知发送失败在 bridge 重连后不再依赖旧 registrationE
     })
     firstBridgeLifecycle = firstBridge.bridgeLifecycle
     assert.equal(firstBridge.registerHelloPayload?.instanceID, firstBridge.bridgeInstanceID)
-    const expectedNotificationKey = `question-${toIdempotencyPart(firstBridge.bridgeInstanceID)}-${toIdempotencyPart(requestID)}`
-
-    await seedPendingQuestionNotification({
-      requestStore,
-      notificationStore,
-      instanceID: firstBridge.bridgeInstanceID,
-      requestID,
-      wechatAccountId,
-      userId,
-      idempotencyKey: expectedNotificationKey,
-    })
 
     await firstBridgeLifecycle.close()
     firstBridgeLifecycle = null
@@ -948,6 +941,17 @@ test("broker 通知发送失败在 bridge 重连后不再依赖旧 registrationE
     })
     secondBridgeLifecycle = secondBridge.bridgeLifecycle
     assert.equal(secondBridge.registerHelloPayload?.instanceID, secondBridge.bridgeInstanceID)
+    const expectedNotificationKey = `question-${toIdempotencyPart(secondBridge.bridgeInstanceID)}-${toIdempotencyPart(requestID)}`
+
+    await seedPendingQuestionNotification({
+      requestStore,
+      notificationStore,
+      instanceID: secondBridge.bridgeInstanceID,
+      requestID,
+      wechatAccountId,
+      userId,
+      idempotencyKey: expectedNotificationKey,
+    })
 
     const failingRuntime = createFailingNotificationRuntimeLifecycle({
       brokerEntry,

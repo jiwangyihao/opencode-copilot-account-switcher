@@ -49,6 +49,7 @@ function formatPermissionReplySemantics() {
 
 function formatTerminalReasonLabel(reason: RequestTerminalReason | undefined): string {
   if (reason === "answered") return "已在电脑端回复"
+  if (reason === "handled") return "已在电脑端处理"
   if (reason === "rejected") return "已在电脑端拒绝"
   if (reason === "expired") return "已过期"
   if (reason === "replaced") return "已被新入口替代"
@@ -67,7 +68,7 @@ function formatNaturalStopTerminalReasonLabel(reason: NaturalStopTerminalReason 
 }
 
 function toRequestTerminalReason(reason: string | undefined): RequestTerminalReason | undefined {
-  if (reason === "answered" || reason === "rejected" || reason === "expired" || reason === "replaced") {
+  if (reason === "answered" || reason === "handled" || reason === "rejected" || reason === "expired" || reason === "replaced") {
     return reason
   }
   return undefined

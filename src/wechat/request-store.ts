@@ -18,7 +18,7 @@ import { normalizeRequestPromptSummary, type RequestPromptSummary } from "./ques
 
 export type RequestStatus = "open" | "answered" | "rejected" | "expired" | "cleaned"
 
-export type RequestTerminalReason = "answered" | "rejected" | "expired" | "replaced"
+export type RequestTerminalReason = "answered" | "handled" | "rejected" | "expired" | "replaced"
 
 export type RequestRecord = {
   kind: WechatRequestKind
@@ -42,13 +42,14 @@ export type RequestRecord = {
 
 const TERMINAL_REASON_PRIORITY: Record<RequestTerminalReason, number> = {
   expired: 1,
-  rejected: 2,
-  answered: 3,
-  replaced: 4,
+  handled: 2,
+  rejected: 3,
+  answered: 4,
+  replaced: 5,
 }
 
 function isRequestTerminalReason(value: unknown): value is RequestTerminalReason {
-  return ["answered", "rejected", "expired", "replaced"].includes(value as RequestTerminalReason)
+  return ["answered", "handled", "rejected", "expired", "replaced"].includes(value as RequestTerminalReason)
 }
 
 function deriveTerminalReason(record: Pick<
@@ -61,6 +62,9 @@ function deriveTerminalReason(record: Pick<
 
   if (record.terminalReason === "replaced" && isNonEmptyString(record.replacementHandle)) {
     return "replaced"
+  }
+  if (record.terminalReason === "handled") {
+    return "handled"
   }
   if (record.terminalReason === "answered" || record.status === "answered" || typeof record.answeredAt === "number") {
     return "answered"

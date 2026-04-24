@@ -38,6 +38,35 @@ import { extractPermissionPromptSummary, extractQuestionPromptSummary } from "./
 
 type SessionMessages = Array<{ info: Message; parts: Part[] }>
 
+type RequestNotificationCandidate = Extract<WechatNotificationCandidate, { kind: "question" | "permission" }>
+type NaturalStopNotificationCandidate = Extract<WechatNotificationCandidate, { kind: "naturalStop" }>
+type NotificationCandidateSnapshot = {
+  candidates: WechatNotificationCandidate[]
+  authoritative: boolean
+}
+
+function indexRequestCandidates(candidates: WechatNotificationCandidate[], kind: "question" | "permission") {
+  const indexed = new Map<string, RequestNotificationCandidate>()
+  for (const candidate of candidates) {
+    if (candidate.kind !== kind) {
+      continue
+    }
+    indexed.set(candidate.routeKey, candidate)
+  }
+  return indexed
+}
+
+function indexNaturalStopCandidates(candidates: WechatNotificationCandidate[]) {
+  const indexed = new Map<string, NaturalStopNotificationCandidate>()
+  for (const candidate of candidates) {
+    if (candidate.kind !== "naturalStop") {
+      continue
+    }
+    indexed.set(candidate.handle, candidate)
+  }
+  return indexed
+}
+
 type SessionLite = Pick<Session, "id" | "title" | "directory" | "time">
 
 type SdkFieldsResult<T> = {
@@ -104,6 +133,7 @@ export type WechatBridgeInput = {
 export type WechatBridge = {
   collectStatusSnapshot: () => Promise<WechatInstanceStatusSnapshot>
   collectNotificationCandidates: () => Promise<WechatNotificationCandidate[]>
+  collectNotificationCandidateSnapshot?: () => Promise<NotificationCandidateSnapshot>
   resyncBrokerState?: (input?: { reason?: "brokerReconnect" | "manual" }) => Promise<WechatInstanceStatusSnapshot>
   handleBrokerEnvelope?: (envelope: BrokerEnvelope) => Promise<ReplyMutationResult | null>
 }
@@ -568,15 +598,21 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
     return snapshot
   }
 
-  const collectNotificationCandidates = async (): Promise<WechatNotificationCandidate[]> => {
+  const collectNotificationCandidateSnapshot = async (): Promise<NotificationCandidateSnapshot> => {
     const binding = await readOperatorBinding().catch(() => undefined)
     if (!binding) {
-      return []
+      return {
+        candidates: [],
+        authoritative: false,
+      }
     }
 
     const { questionResult, permissionResult, statusResult } = await collectLiveRead()
     const candidates: WechatNotificationCandidate[] = []
     const existingHandles = new Set<string>()
+    const authoritative = questionResult.status === "fulfilled"
+      && permissionResult.status === "fulfilled"
+      && statusResult.status === "fulfilled"
 
     if (questionResult.status === "fulfilled") {
       for (const question of questionResult.value) {
@@ -594,6 +630,9 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
           createdAt: Date.now(),
           routeKey,
           handle,
+          scopeKey: input.instanceID,
+          wechatAccountId: binding.wechatAccountId,
+          userId: binding.userId,
           prompt: extractQuestionPromptSummary(question),
         })
       }
@@ -615,6 +654,9 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
           createdAt: Date.now(),
           routeKey,
           handle,
+          scopeKey: input.instanceID,
+          wechatAccountId: binding.wechatAccountId,
+          userId: binding.userId,
           prompt: extractPermissionPromptSummary(permission),
         })
       }
@@ -705,7 +747,15 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
       }
     }
 
-    return candidates
+    return {
+      candidates,
+      authoritative,
+    }
+  }
+
+  const collectNotificationCandidates = async (): Promise<WechatNotificationCandidate[]> => {
+    const snapshot = await collectNotificationCandidateSnapshot()
+    return snapshot.candidates
   }
 
   const resyncBrokerState = async (
@@ -785,6 +835,7 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
   return {
     collectStatusSnapshot,
     collectNotificationCandidates,
+    collectNotificationCandidateSnapshot,
     resyncBrokerState,
     handleBrokerEnvelope,
   }
@@ -826,10 +877,13 @@ export async function createWechatBridgeLifecycle(
   let nextEventSeq = 0
   let lastSentEventSeq = 0
   let lastAckedEventSeq = 0
-  let stagedRegisterFullSyncCandidates: WechatNotificationCandidate[] | null = null
+  let stagedRegisterFullSyncCandidates: NotificationCandidateSnapshot | null = null
   const bridgeEventLog: BridgeToBrokerEvent[] = []
   let lastSteadyStateSessionSignature: string | null = null
   let lastSteadyStateCandidateSignature: string | null = null
+  let lastQuestionCandidates = new Map<string, RequestNotificationCandidate>()
+  let lastPermissionCandidates = new Map<string, RequestNotificationCandidate>()
+  let lastNaturalStopCandidates = new Map<string, NaturalStopNotificationCandidate>()
   let steadyStateSyncPromise: Promise<void> | null = null
 
   const supportsLiveBrokerClient = (candidate: unknown): candidate is Awaited<ReturnType<typeof connect>> => {
@@ -910,38 +964,54 @@ export async function createWechatBridgeLifecycle(
   ): BridgeToBrokerEvent | null {
     if (candidate.kind === "question") {
       return createSequencedEvent("questionOpened", {
+        idempotencyKey: candidate.idempotencyKey,
         requestID: candidate.requestID,
         routeKey: candidate.routeKey,
         handle: candidate.handle,
+        ...(candidate.scopeKey ? { scopeKey: candidate.scopeKey } : {}),
+        ...(candidate.wechatAccountId ? { wechatAccountId: candidate.wechatAccountId } : {}),
+        ...(candidate.userId ? { userId: candidate.userId } : {}),
+        createdAt: candidate.createdAt,
         updatedAt: candidate.createdAt,
+        ...(candidate.prompt ? { prompt: candidate.prompt } : {}),
       }, { controlId })
     }
 
     if (candidate.kind === "permission") {
       return createSequencedEvent("permissionOpened", {
+        idempotencyKey: candidate.idempotencyKey,
         requestID: candidate.requestID,
         routeKey: candidate.routeKey,
         handle: candidate.handle,
+        ...(candidate.scopeKey ? { scopeKey: candidate.scopeKey } : {}),
+        ...(candidate.wechatAccountId ? { wechatAccountId: candidate.wechatAccountId } : {}),
+        ...(candidate.userId ? { userId: candidate.userId } : {}),
+        createdAt: candidate.createdAt,
         updatedAt: candidate.createdAt,
+        ...(candidate.prompt ? { prompt: candidate.prompt } : {}),
       }, { controlId })
     }
 
     if (candidate.kind === "naturalStop") {
       return createSequencedEvent("naturalStopOpened", {
+        idempotencyKey: candidate.idempotencyKey,
         handle: candidate.handle,
         replyTarget: candidate.replyTarget,
         redactedSummary: candidate.redactedSummary,
         severityAdvice: candidate.severityAdvice,
+        createdAt: candidate.createdAt,
         updatedAt: candidate.createdAt,
       }, { controlId })
     }
 
     if (candidate.kind === "sessionError") {
       return createSequencedEvent("retryErrorUpdated", {
+        idempotencyKey: candidate.idempotencyKey,
         sessionID: candidate.sessionID,
         action: candidate.action,
         redactedSummary: candidate.redactedSummary,
         severityAdvice: candidate.severityAdvice,
+        createdAt: candidate.createdAt,
         updatedAt: candidate.createdAt,
       }, { controlId })
     }
@@ -998,16 +1068,28 @@ export async function createWechatBridgeLifecycle(
       }, { controlId: control.controlId }))
     }
 
-    const candidates = stagedRegisterFullSyncCandidates ?? await bridge.collectNotificationCandidates()
+    const candidateSnapshot = stagedRegisterFullSyncCandidates
+      ?? await (bridge.collectNotificationCandidateSnapshot
+        ? bridge.collectNotificationCandidateSnapshot()
+        : Promise.resolve({
+            candidates: await bridge.collectNotificationCandidates(),
+            authoritative: true,
+          }))
+    const candidates = candidateSnapshot.candidates
     stagedRegisterFullSyncCandidates = null
     lastSteadyStateSessionSignature = stableBridgeSignature(snapshot.sessions)
-    lastSteadyStateCandidateSignature = stableBridgeSignature(candidates)
-    for (const candidate of candidates) {
-      const event = toCandidateEvent(candidate, control.controlId)
-      if (!event) {
-        continue
+    if (candidateSnapshot.authoritative) {
+      lastSteadyStateCandidateSignature = stableBridgeSignature(candidates)
+      lastQuestionCandidates = indexRequestCandidates(candidates, "question")
+      lastPermissionCandidates = indexRequestCandidates(candidates, "permission")
+      lastNaturalStopCandidates = indexNaturalStopCandidates(candidates)
+      for (const candidate of candidates) {
+        const event = toCandidateEvent(candidate, control.controlId)
+        if (!event) {
+          continue
+        }
+        await sendSequencedEvent(event)
       }
-      await sendSequencedEvent(event)
     }
 
     await sendSequencedEvent(createSequencedEvent("fullSyncCompleted", {
@@ -1043,9 +1125,54 @@ export async function createWechatBridgeLifecycle(
         lastSteadyStateSessionSignature = sessionSignature
       }
 
-      const candidates = await bridge.collectNotificationCandidates()
+      const candidateSnapshot = await (bridge.collectNotificationCandidateSnapshot
+        ? bridge.collectNotificationCandidateSnapshot()
+        : Promise.resolve({
+            candidates: await bridge.collectNotificationCandidates(),
+            authoritative: true,
+          }))
+      if (!candidateSnapshot.authoritative) {
+        return
+      }
+      const candidates = candidateSnapshot.candidates
       const candidateSignature = stableBridgeSignature(candidates)
       if (candidateSignature !== lastSteadyStateCandidateSignature) {
+        const nextQuestionCandidates = indexRequestCandidates(candidates, "question")
+        for (const [routeKey, candidate] of lastQuestionCandidates) {
+          if (nextQuestionCandidates.has(routeKey)) {
+            continue
+          }
+          await sendSequencedEvent(createSequencedEvent("questionClosed", {
+            routeKey,
+            handle: candidate.handle,
+            reason: "answered",
+          }))
+        }
+
+        const nextPermissionCandidates = indexRequestCandidates(candidates, "permission")
+        for (const [routeKey, candidate] of lastPermissionCandidates) {
+          if (nextPermissionCandidates.has(routeKey)) {
+            continue
+          }
+          await sendSequencedEvent(createSequencedEvent("permissionClosed", {
+            routeKey,
+            handle: candidate.handle,
+            reason: "handled",
+          }))
+        }
+
+        const nextNaturalStopCandidates = indexNaturalStopCandidates(candidates)
+        for (const [handle, candidate] of lastNaturalStopCandidates) {
+          if (nextNaturalStopCandidates.has(handle)) {
+            continue
+          }
+          await sendSequencedEvent(createSequencedEvent("naturalStopClosed", {
+            handle,
+            sessionID: candidate.sessionID,
+            reason: "continued",
+          }))
+        }
+
         for (const candidate of candidates) {
           const event = toCandidateEvent(candidate)
           if (!event) {
@@ -1053,6 +1180,9 @@ export async function createWechatBridgeLifecycle(
           }
           await sendSequencedEvent(event)
         }
+        lastQuestionCandidates = nextQuestionCandidates
+        lastPermissionCandidates = nextPermissionCandidates
+        lastNaturalStopCandidates = nextNaturalStopCandidates
         lastSteadyStateCandidateSignature = candidateSignature
       }
     })().finally(() => {
@@ -1155,7 +1285,12 @@ export async function createWechatBridgeLifecycle(
           lastSentEventSeq,
         })
         stagedRegisterFullSyncCandidates = registerResult.control?.type === "requestFullSync"
-          ? await bridge.collectNotificationCandidates()
+          ? await (bridge.collectNotificationCandidateSnapshot
+            ? bridge.collectNotificationCandidateSnapshot()
+            : Promise.resolve({
+                candidates: await bridge.collectNotificationCandidates(),
+                authoritative: true,
+              }))
           : null
         await processRegisterResult(registerResult)
         return

@@ -980,6 +980,399 @@ test("ws lifecycle live path: 初始 full sync 为空时，后续新增 session 
   }
 })
 
+test("ws lifecycle live path: socket close 后会收口该实例的 active session 与 question", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-socket-close-scope-cleanup-")
+  const serverModule = await importServer("socket-close-scope-cleanup")
+  const clientModule = await importClient("socket-close-scope-cleanup")
+  const statePaths = await importStatePaths("socket-close-scope-cleanup")
+
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+  const client = await clientModule.connect(server.endpoint)
+
+  try {
+    const register = await client.registerHello({
+      protocolVersion: 2,
+      stateGeneration: "wechat-ws-v1",
+      instanceID: "inst-socket-close-1",
+      instanceIncarnation: "inc-socket-close-1",
+      lastSeenBrokerSeq: 0,
+      lastSentEventSeq: 0,
+    })
+    assert.equal(register.control?.type, "requestFullSync")
+
+    await client.sendBridgeEvent({
+      type: "instanceOnline",
+      eventSeq: 1,
+      instanceIncarnation: "inc-socket-close-1",
+      payload: {
+        instanceID: "inst-socket-close-1",
+        connectedAt: 1_700_001_500_000,
+        pid: process.pid,
+        displayName: "Socket Close Instance",
+        projectDir: "/workspace/socket-close-scope-cleanup",
+      },
+    }, { instanceID: "inst-socket-close-1" })
+    await client.sendBridgeEvent({
+      type: "sessionSnapshotChanged",
+      eventSeq: 2,
+      instanceIncarnation: "inc-socket-close-1",
+      payload: {
+        instanceID: "inst-socket-close-1",
+        sessionID: "session-socket-close-1",
+        title: "Socket Close Session",
+        directory: "/workspace/socket-close-scope-cleanup",
+        updatedAt: 1_700_001_500_001,
+        status: { type: "idle" },
+        pendingQuestionCount: 1,
+        pendingPermissionCount: 0,
+        todoSummary: { total: 0, inProgress: 0, completed: 0 },
+        highlights: [],
+      },
+    }, { instanceID: "inst-socket-close-1" })
+    await client.sendBridgeEvent({
+      type: "questionOpened",
+      eventSeq: 3,
+      instanceIncarnation: "inc-socket-close-1",
+      payload: {
+        instanceID: "inst-socket-close-1",
+        requestID: "question-socket-close-1",
+        routeKey: "question-socket-close-route-1",
+        handle: "q1",
+        updatedAt: 1_700_001_500_002,
+        prompt: {
+          title: "Socket close question",
+          mode: "text",
+        },
+        wechatAccountId: "wx-socket-close",
+        userId: "u-socket-close",
+        createdAt: 1_700_001_500_002,
+      },
+    }, { instanceID: "inst-socket-close-1" })
+
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return raw.active?.sessions?.["session-socket-close-1"] && raw.active?.questions?.["question-socket-close-route-1"]
+    }, 10_000)
+
+    await client.close()
+
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return raw.active?.sessions?.["session-socket-close-1"] === undefined
+        && raw.active?.questions?.["question-socket-close-route-1"] === undefined
+        && raw.active?.instances?.["inst-socket-close-1"] === undefined
+    }, 30_000)
+  } finally {
+    await client.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedStateRoot.restore()
+  }
+})
+
+test("ws lifecycle live path: steady-state question 关闭会从 broker 权威视图移除 active question", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-steady-state-question-close-")
+  const serverModule = await importServer("steady-state-question-close")
+  const bridgeModule = await importBridge("steady-state-question-close")
+  const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-steady-state-question-close`)
+  const statePaths = await importStatePaths("steady-state-question-close")
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-steady-state-question-close",
+    userId: "u-steady-state-question-close",
+    boundAt: Date.now(),
+  })
+
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+  const sessionList = [{
+    id: "session-close-1",
+    title: "Closable Session",
+    directory: "/workspace/steady-state-question-close",
+    time: { updated: 1_700_001_600_000 },
+  }]
+  const questionList = [{
+    id: "question-close-1",
+    sessionID: "session-close-1",
+    questions: [{ header: "Close header", question: "Close body" }],
+  }]
+
+  const lifecycle = await bridgeModule.createWechatBridgeLifecycle(
+    {
+      statusCollectionEnabled: true,
+      heartbeatIntervalMs: 20,
+      initialBrokerPromise: Promise.resolve({ endpoint: server.endpoint }),
+      directory: "/workspace/steady-state-question-close",
+      client: {
+        session: {
+          list: async () => sessionList,
+          status: async () => ({ "session-close-1": { type: "idle" } }),
+          todo: async () => [],
+          messages: async () => [],
+        },
+        question: {
+          list: async () => questionList,
+        },
+        permission: {
+          list: async () => [],
+        },
+      },
+    },
+    {
+      setIntervalImpl: (handler) => setInterval(handler, 10),
+      clearIntervalImpl: (timer) => clearInterval(timer),
+    },
+  )
+
+  try {
+    let openedRouteKey = ""
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      const keys = Object.keys(raw.active?.questions ?? {})
+      if (keys.length !== 1) {
+        return false
+      }
+      openedRouteKey = keys[0]
+      return true
+    }, 10_000)
+
+    questionList.length = 0
+
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return openedRouteKey.length > 0 && raw.active?.questions?.[openedRouteKey] === undefined
+    }, 10_000)
+  } finally {
+    await lifecycle.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedStateRoot.restore()
+  }
+})
+
+test("ws lifecycle live path: transient live read 失败不会把 candidate 缺失误判成关闭", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-steady-state-read-failure-")
+  const serverModule = await importServer("steady-state-read-failure")
+  const bridgeModule = await importBridge("steady-state-read-failure")
+  const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-steady-state-read-failure`)
+  const statePaths = await importStatePaths("steady-state-read-failure")
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-steady-state-read-failure",
+    userId: "u-steady-state-read-failure",
+    boundAt: Date.now(),
+  })
+
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+  const sessionList = [{
+    id: "session-read-failure-1",
+    title: "Read Failure Session",
+    directory: "/workspace/steady-state-read-failure",
+    time: { updated: 1_700_001_650_000 },
+  }]
+  const questionList = [{
+    id: "question-read-failure-1",
+    sessionID: "session-read-failure-1",
+    questions: [{ header: "Read failure header", question: "Read failure body" }],
+  }]
+  const permissionList = [{
+    id: "permission-read-failure-1",
+    sessionID: "session-read-failure-1",
+    tool: "bash",
+    command: "pwd",
+  }]
+
+  let questionListCalls = 0
+  let permissionListCalls = 0
+  let statusCalls = 0
+  let failQuestionList = false
+  let failPermissionList = false
+  let failStatus = false
+
+  const lifecycle = await bridgeModule.createWechatBridgeLifecycle(
+    {
+      statusCollectionEnabled: true,
+      heartbeatIntervalMs: 20,
+      initialBrokerPromise: Promise.resolve({ endpoint: server.endpoint }),
+      directory: "/workspace/steady-state-read-failure",
+      client: {
+        session: {
+          list: async () => sessionList,
+          status: async () => {
+            statusCalls += 1
+            if (failStatus) {
+              throw new Error("session.status transient failure")
+            }
+            return {
+              "session-read-failure-1": {
+                type: "natural-stop",
+                redactedSummary: "需要补充说明",
+                severityAdvice: "已停止并等待你的回复",
+              },
+            }
+          },
+          todo: async () => [],
+          messages: async () => [],
+        },
+        question: {
+          list: async () => {
+            questionListCalls += 1
+            if (failQuestionList) {
+              throw new Error("question.list transient failure")
+            }
+            return questionList
+          },
+        },
+        permission: {
+          list: async () => {
+            permissionListCalls += 1
+            if (failPermissionList) {
+              throw new Error("permission.list transient failure")
+            }
+            return permissionList
+          },
+        },
+      },
+    },
+    {
+      setIntervalImpl: (handler) => setInterval(handler, 10),
+      clearIntervalImpl: (timer) => clearInterval(timer),
+    },
+  )
+
+  try {
+    let openedQuestionRouteKey = ""
+    let openedPermissionRouteKey = ""
+    let openedNaturalStopHandle = ""
+
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      const questionKeys = Object.keys(raw.active?.questions ?? {})
+      const permissionKeys = Object.keys(raw.active?.permissions ?? {})
+      const naturalStopKeys = Object.keys(raw.active?.naturalStops ?? {})
+      if (questionKeys.length !== 1 || permissionKeys.length !== 1 || naturalStopKeys.length !== 1) {
+        return false
+      }
+      openedQuestionRouteKey = questionKeys[0]
+      openedPermissionRouteKey = permissionKeys[0]
+      openedNaturalStopHandle = naturalStopKeys[0]
+      return true
+    }, 10_000)
+
+    const baselineQuestionListCalls = questionListCalls
+    const baselinePermissionListCalls = permissionListCalls
+    const baselineStatusCalls = statusCalls
+    failQuestionList = true
+    failPermissionList = true
+    failStatus = true
+
+    await waitForAsync(async () => {
+      return questionListCalls > baselineQuestionListCalls
+        && permissionListCalls > baselinePermissionListCalls
+        && statusCalls > baselineStatusCalls
+    }, 10_000)
+
+    const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+    assert.ok(raw.active?.questions?.[openedQuestionRouteKey])
+    assert.ok(raw.active?.permissions?.[openedPermissionRouteKey])
+    assert.ok(raw.active?.naturalStops?.[openedNaturalStopHandle])
+    assert.equal(raw.terminalMetadata?.[openedQuestionRouteKey], undefined)
+    assert.equal(raw.terminalMetadata?.[openedPermissionRouteKey], undefined)
+  } finally {
+    await lifecycle.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedStateRoot.restore()
+  }
+})
+
+test("ws lifecycle live path: steady-state permission 关闭会写入 handled 终结原因", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-steady-state-permission-handled-")
+  const serverModule = await importServer("steady-state-permission-handled")
+  const bridgeModule = await importBridge("steady-state-permission-handled")
+  const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-steady-state-permission-handled`)
+  const requestStore = await import(`../dist/wechat/request-store.js?reload=${Date.now()}-steady-state-permission-handled`)
+  const statePaths = await importStatePaths("steady-state-permission-handled")
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-steady-state-permission-handled",
+    userId: "u-steady-state-permission-handled",
+    boundAt: Date.now(),
+  })
+
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+  const sessionList = [{
+    id: "session-permission-handled-1",
+    title: "Permission Handled Session",
+    directory: "/workspace/steady-state-permission-handled",
+    time: { updated: 1_700_001_700_000 },
+  }]
+  const permissionList = [{
+    id: "permission-handled-1",
+    sessionID: "session-permission-handled-1",
+    tool: "bash",
+    command: "ls",
+  }]
+
+  const lifecycle = await bridgeModule.createWechatBridgeLifecycle(
+    {
+      statusCollectionEnabled: true,
+      heartbeatIntervalMs: 20,
+      initialBrokerPromise: Promise.resolve({ endpoint: server.endpoint }),
+      directory: "/workspace/steady-state-permission-handled",
+      client: {
+        session: {
+          list: async () => sessionList,
+          status: async () => ({ "session-permission-handled-1": { type: "idle" } }),
+          todo: async () => [],
+          messages: async () => [],
+        },
+        question: {
+          list: async () => [],
+        },
+        permission: {
+          list: async () => permissionList,
+        },
+      },
+    },
+    {
+      setIntervalImpl: (handler) => setInterval(handler, 10),
+      clearIntervalImpl: (timer) => clearInterval(timer),
+    },
+  )
+
+  try {
+    let openedRouteKey = ""
+    let openedHandle = ""
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      const keys = Object.keys(raw.active?.permissions ?? {})
+      if (keys.length !== 1) {
+        return false
+      }
+      openedRouteKey = keys[0]
+      openedHandle = raw.active.permissions[openedRouteKey]?.handle ?? ""
+      return openedHandle.length > 0
+    }, 10_000)
+
+    permissionList.length = 0
+
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return raw.active?.permissions?.[openedRouteKey] === undefined
+        && raw.terminalMetadata?.[openedRouteKey]?.reason === "handled"
+        && raw.legacyHandleClosures?.[openedHandle]?.reason === "handled"
+    }, 10_000)
+
+    const terminal = await requestStore.findRequestByRouteKey({
+      kind: "permission",
+      routeKey: openedRouteKey,
+    })
+    assert.equal(terminal?.terminalReason, "handled")
+    assert.equal(terminal?.handle, openedHandle)
+  } finally {
+    await lifecycle.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedStateRoot.restore()
+  }
+})
+
 test("ws lifecycle: broker ack 后 bridge replay buffer 会裁剪已确认事件", async () => {
   const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-ack-trim-")
   const bridgeModule = await import(`../dist/wechat/bridge.js?reload=${Date.now()}-ack-trim`)

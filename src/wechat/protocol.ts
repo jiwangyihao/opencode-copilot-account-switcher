@@ -160,6 +160,9 @@ export type WechatNotificationCandidate =
       createdAt: number
       routeKey: string
       handle: string
+      scopeKey?: string
+      wechatAccountId?: string
+      userId?: string
       prompt?: RequestPromptSummary
     }
   | {

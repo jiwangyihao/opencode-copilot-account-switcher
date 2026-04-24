@@ -40,7 +40,7 @@ function isRequestNotificationKind(value: unknown): value is "question" | "permi
 }
 
 function isRequestTerminalReason(value: unknown): value is RequestTerminalReason {
-  return value === "answered" || value === "rejected" || value === "expired" || value === "replaced"
+  return value === "answered" || value === "handled" || value === "rejected" || value === "expired" || value === "replaced"
 }
 
 function isNaturalStopTerminalReason(value: unknown): value is NaturalStopTerminalReason {
