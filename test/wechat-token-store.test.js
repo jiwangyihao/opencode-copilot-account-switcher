@@ -64,6 +64,99 @@ test("staleReason 只打标，不删除文件", async () => {
   assert.equal(fromDisk?.staleReason, "operator-reset")
 })
 
+test("live token 不再反向重激活 failed notification", async () => {
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-token-no-reactivate-failed-notification`)
+
+  await notificationStore.upsertNotification({
+    idempotencyKey: "token-reactivation-should-not-happen",
+    kind: "question",
+    routeKey: "route-token-reactivation-should-not-happen",
+    handle: "qtoken1",
+    wechatAccountId: "wx-token-reactivation",
+    userId: "u-token-reactivation",
+    createdAt: 1_700_000_310_000,
+  })
+  await notificationStore.markNotificationFailed({
+    idempotencyKey: "token-reactivation-should-not-happen",
+    failedAt: 1_700_000_310_100,
+    reason: "wechat send failed",
+  })
+  await tokenStore.upsertInboundToken({
+    wechatAccountId: "wx-token-reactivation",
+    userId: "u-token-reactivation",
+    contextToken: "token-still-live",
+    updatedAt: 1_700_000_310_200,
+    source: "question",
+    sourceRef: "qtoken1",
+  })
+
+  const current = await notificationStore.upsertNotification({
+    idempotencyKey: "token-reactivation-should-not-happen",
+    kind: "question",
+    routeKey: "route-token-reactivation-should-not-happen",
+    handle: "qtoken1",
+    wechatAccountId: "wx-token-reactivation",
+    userId: "u-token-reactivation",
+    createdAt: 1_700_000_310_300,
+  })
+
+  assert.equal(current.status, "failed")
+  const fromDisk = JSON.parse(await readFile(statePaths.notificationStatePath("token-reactivation-should-not-happen"), "utf8"))
+  assert.equal(fromDisk.status, "failed")
+  assert.equal(fromDisk.failureReason, "wechat send failed")
+})
+
+test("readTokenState() 优先 broker-state-store authoritative deliveryTokens，而不是旧 token 文件", async () => {
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-token-authoritative-read-store`)
+  const filePath = statePaths.tokenStatePath("wx-authoritative-read", "u-authoritative-read")
+  await mkdir(path.dirname(filePath), { recursive: true })
+
+  await writeFile(
+    filePath,
+    JSON.stringify({
+      contextToken: "legacy-stale-token",
+      updatedAt: 1_700_000_311_000,
+      source: "message",
+      sourceRef: "/status",
+      staleReason: "notification-delivery-failed",
+    }),
+  )
+
+  const state = brokerStateStore.createEmptyBrokerState()
+  state.deliveryTokens = {
+    "wx-authoritative-read:u-authoritative-read": {
+      wechatAccountId: "wx-authoritative-read",
+      userId: "u-authoritative-read",
+      contextToken: "authoritative-live-token",
+      updatedAt: 1_700_000_311_100,
+      source: "message",
+      sourceRef: "/status",
+    },
+  }
+  await brokerStateStore.persistBrokerStateStoreSnapshot(state)
+
+  const read = await tokenStore.readTokenState("wx-authoritative-read", "u-authoritative-read")
+  assert.equal(read?.contextToken, "authoritative-live-token")
+  assert.equal(read?.staleReason, undefined)
+})
+
+test("readTokenState() 在缺少 authoritative deliveryToken 时不会回退读取旧 live token 文件", async () => {
+  const filePath = statePaths.tokenStatePath("wx-legacy-token-only", "u-legacy-token-only")
+  await mkdir(path.dirname(filePath), { recursive: true })
+  await writeFile(
+    filePath,
+    JSON.stringify({
+      contextToken: "legacy-live-token",
+      updatedAt: 1_700_000_311_200,
+      source: "message",
+      sourceRef: "/status",
+    }),
+  )
+
+  const read = await tokenStore.readTokenState("wx-legacy-token-only", "u-legacy-token-only")
+  assert.equal(read, undefined)
+})
+
 test("不存在固定 TTL 自动失效", async () => {
   await tokenStore.upsertInboundToken({
     wechatAccountId: "wx-c",

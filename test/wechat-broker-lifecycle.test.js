@@ -26,6 +26,9 @@ const FUTURE_TYPES = [
   "showFallbackToast",
 ]
 
+const LIVE_PROTOCOL_VERSION = 2
+const LIVE_STATE_GENERATION = "wechat-ws-v1"
+
 function countChar(text, target) {
   let count = 0
   for (const char of text) {
@@ -56,6 +59,18 @@ function createBrokerEndpoint(tempDir) {
     return `\\\\.\\pipe\\wechat-broker-${process.pid}-${suffix}`
   }
   return path.join(tempDir, `wechat-broker-${suffix}.sock`)
+}
+
+function wechatStateRootForSandbox(sandboxConfigHome) {
+  return path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
+}
+
+function brokerStateStorePathForSandbox(sandboxConfigHome) {
+  return path.join(wechatStateRootForSandbox(sandboxConfigHome), "broker-state-store.json")
+}
+
+function brokerStateSchemaPathForSandbox(sandboxConfigHome) {
+  return path.join(wechatStateRootForSandbox(sandboxConfigHome), "broker-state-store.schema.json")
 }
 
 function delay(ms) {
@@ -163,6 +178,112 @@ async function waitForFileText(filePath, predicate, timeoutMs = 5000) {
     await delay(50)
   }
   throw new Error(`timeout waiting for file text: ${filePath}`)
+}
+
+async function waitForBrokerStateSnapshot(sandboxConfigHome, predicate, timeoutMs = 5000) {
+  return waitForJsonFile(brokerStateStorePathForSandbox(sandboxConfigHome), predicate, timeoutMs)
+}
+
+async function writeBrokerStateFixture(sandboxConfigHome, state, schema = {}) {
+  const stateRoot = wechatStateRootForSandbox(sandboxConfigHome)
+  mkdirSync(stateRoot, { recursive: true })
+  await writeFile(brokerStateStorePathForSandbox(sandboxConfigHome), JSON.stringify(state, null, 2), "utf8")
+  await writeFile(
+    brokerStateSchemaPathForSandbox(sandboxConfigHome),
+    JSON.stringify({
+      kind: "wechat-broker-state-store",
+      protocolVersion: LIVE_PROTOCOL_VERSION,
+      stateGeneration: LIVE_STATE_GENERATION,
+      updatedAt: Date.now(),
+      ...schema,
+    }, null, 2),
+    "utf8",
+  )
+}
+
+async function connectLiveBridgeClient(endpoint, options) {
+  const clientModule = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-${options.instanceID}`)
+  const client = await clientModule.connect(endpoint)
+  const instanceIncarnation = options.instanceIncarnation ?? `inc-${Math.random().toString(16).slice(2)}`
+  const registerResult = await client.registerHello({
+    protocolVersion: LIVE_PROTOCOL_VERSION,
+    stateGeneration: LIVE_STATE_GENERATION,
+    instanceID: options.instanceID,
+    instanceIncarnation,
+    ...(options.lastSeenBrokerSeq !== undefined ? { lastSeenBrokerSeq: options.lastSeenBrokerSeq } : {}),
+    ...(options.lastSentEventSeq !== undefined ? { lastSentEventSeq: options.lastSentEventSeq } : {}),
+  })
+
+  let nextEventSeq = 0
+  if (registerResult.control?.type === "requestFullSync") {
+    for (const event of options.fullSyncEvents ?? []) {
+      nextEventSeq += 1
+      await client.sendBridgeEvent({
+        ...event,
+        eventSeq: nextEventSeq,
+        instanceIncarnation,
+        controlId: registerResult.control.controlId,
+      }, {
+        instanceID: options.instanceID,
+        controlId: registerResult.control.controlId,
+      })
+    }
+
+    nextEventSeq += 1
+    await client.sendBridgeEvent({
+      type: "fullSyncCompleted",
+      eventSeq: nextEventSeq,
+      instanceIncarnation,
+      controlId: registerResult.control.controlId,
+      payload: { controlId: registerResult.control.controlId },
+    }, {
+      instanceID: options.instanceID,
+      controlId: registerResult.control.controlId,
+    })
+  }
+
+  return { client, registerResult, instanceIncarnation, nextEventSeq }
+}
+
+async function sendLiveBridgeEvent(bridgeClient, options) {
+  const eventSeq = options.nextEventSeq + 1
+  await bridgeClient.client.sendBridgeEvent({
+    type: options.type,
+    eventSeq,
+    instanceIncarnation: bridgeClient.instanceIncarnation,
+    payload: options.payload,
+  }, {
+    instanceID: options.instanceID,
+  })
+  return eventSeq
+}
+
+async function createQuestionBridgeLifecycle(endpoint, questionList, label) {
+  const bridgeModule = await import(`../dist/wechat/bridge.js?reload=${Date.now()}-${label}`)
+  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-${label}`)
+
+  return bridgeModule.createWechatBridgeLifecycle({
+    statusCollectionEnabled: true,
+    heartbeatIntervalMs: 60_000,
+    directory: "/repo/wechat-broker-lifecycle",
+    client: {
+      session: {
+        list: async () => [],
+        status: async () => ({}),
+        todo: async () => [],
+        messages: async () => [],
+      },
+      question: {
+        list: questionList,
+      },
+      permission: {
+        list: async () => [],
+      },
+    },
+  }, {
+    connectOrSpawnBrokerImpl: async () => ({ endpoint }),
+    connectImpl: async (brokerEndpoint) => brokerClient.connect(brokerEndpoint),
+  })
 }
 
 async function waitForNotificationRecords(notificationDir, fileNamePredicate, predicate, timeoutMs = 5000) {
@@ -433,9 +554,7 @@ test("NDJSON 单行一帧：serialize 输出单行并以换行结尾，裸换行
   const protocol = await import(DIST_PROTOCOL_MODULE)
   const envelope = {
     id: "req-1",
-    type: "heartbeat",
-    instanceID: "wx-1",
-    sessionToken: "token-1",
+    type: "ping",
     payload: { message: "line-1\nline-2" },
   }
 
@@ -465,12 +584,12 @@ test("envelope 固定字段：必须含 id/type/payload，可选 instanceID/sess
   const parsed = protocol.parseEnvelopeLine(
     protocol.serializeEnvelope({
       id: "msg-1",
-      type: "registerInstance",
+      type: "ping",
       payload: { hello: "world" },
     }),
   )
   assert.equal(parsed.id, "msg-1")
-  assert.equal(parsed.type, "registerInstance")
+  assert.equal(parsed.type, "ping")
   assert.deepEqual(parsed.payload, { hello: "world" })
 
   assert.throws(
@@ -831,28 +950,24 @@ test("broker-entry 空闲超时后在无实例且无 open request 时自动退�
 })
 
 test("broker-entry 空闲超时期间若仍有 open request 则保持存活", async () => {
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-idle-blocked`)
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-idle-blocked-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
-  const requestDir = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "requests", "question")
   const openRouteKey = "question-idle-open"
-  await rm(requestDir, { recursive: true, force: true })
-  await mkdirSync(requestDir, { recursive: true })
-  await writeFile(
-    path.join(requestDir, `${openRouteKey}.json`),
-    JSON.stringify({
-      kind: "question",
-      requestID: "q-idle-open-1",
-      routeKey: openRouteKey,
-      handle: "qidle1",
-      scopeKey: "instance-idle-open",
-      wechatAccountId: "wx-idle-open",
-      userId: "u-idle-open",
-      status: "open",
-      createdAt: Date.now() - 1_000,
-    }, null, 2),
-    "utf8",
-  )
+  const state = brokerStateStore.createEmptyBrokerState({ track: false })
+  brokerStateStore.upsertBrokerIndexedRequest(state, {
+    kind: "question",
+    requestID: "q-idle-open-1",
+    routeKey: openRouteKey,
+    handle: "qidle1",
+    scopeKey: "instance-idle-open",
+    wechatAccountId: "wx-idle-open",
+    userId: "u-idle-open",
+    status: "open",
+    createdAt: Date.now() - 1_000,
+  })
+  await writeBrokerStateFixture(sandboxConfigHome, state)
 
   const child = spawnBrokerEntry({
     endpoint,
@@ -873,7 +988,6 @@ test("broker-entry 空闲超时期间若仍有 open request 则保持存活", as
 })
 
 test("broker-entry 空闲计时期间若实例重新注册则取消退出，断开后重新进入空闲并最终退出", async () => {
-  const protocol = await import(DIST_PROTOCOL_MODULE)
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-idle-cancel-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
@@ -892,22 +1006,25 @@ test("broker-entry 空闲计时期间若实例重新注册则取消退出，断�
     await waitForBrokerMetadata(brokerJsonPath)
     await delay(80)
 
-    const conn = await createPersistentConnection(endpoint)
-    const registerAck = await conn.send({
-      id: "register-idle-cancel",
-      type: "registerInstance",
+    const bridge = await connectLiveBridgeClient(endpoint, {
       instanceID: "instance-idle-cancel",
-      payload: {
-        pid: 9001,
-        displayName: "Idle Cancel",
-        projectDir: "/tmp/idle-cancel",
-      },
+      instanceIncarnation: "inc-idle-cancel",
+      fullSyncEvents: [{
+        type: "instanceOnline",
+        payload: {
+          instanceID: "instance-idle-cancel",
+          connectedAt: Date.now(),
+          pid: 9001,
+          displayName: "Idle Cancel",
+          projectDir: "/tmp/idle-cancel",
+        },
+      }],
     })
-    assert.equal(registerAck.type, "registerAck")
+    assert.equal(bridge.registerResult.ack.needFullSync, true)
 
     await assertProcessStaysAlive(child.pid, 220)
 
-    await conn.close()
+    await bridge.client.close()
     const exited = await waitForExit(child, 5_000)
     assert.equal(exited.code, 0)
   } finally {
@@ -921,29 +1038,35 @@ test("broker-entry 空闲计时期间若实例重新注册则取消退出，断�
 })
 
 test("broker-entry 启动时会立刻把过期 connected snapshot 标记为 stale", async () => {
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-startup-stale`)
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-startup-stale-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
-  const instanceDir = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "instances")
-  const instancePath = path.join(instanceDir, "startup-stale-a.json")
   const diagnosticsPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "wechat-broker.diagnostics.jsonl")
   const now = Date.now()
 
-  await rm(instanceDir, { recursive: true, force: true })
-  mkdirSync(instanceDir, { recursive: true })
-  await writeFile(
-    instancePath,
-    JSON.stringify({
+  const state = brokerStateStore.createEmptyBrokerState({ track: false })
+  state.connections["startup-stale-a"] = {
+    "inc-startup-stale-a": {
       instanceID: "startup-stale-a",
-      pid: 7788,
-      displayName: "Startup Stale",
-      projectDir: "/tmp/startup-stale",
+      instanceIncarnation: "inc-startup-stale-a",
+      online: true,
+      lastEventSeq: 0,
+      lastAckedEventSeq: 0,
+      lastSentBrokerSeq: 0,
       connectedAt: now - 1_000,
-      lastHeartbeatAt: now - 1_000,
-      status: "connected",
-    }, null, 2),
-    "utf8",
-  )
+      lastObservedAt: now - 1_000,
+    },
+  }
+  state.active.instances["startup-stale-a"] = {
+    instanceID: "startup-stale-a",
+    instanceIncarnation: "inc-startup-stale-a",
+    pid: 7788,
+    displayName: "Startup Stale",
+    projectDir: "/tmp/startup-stale",
+    online: true,
+  }
+  await writeBrokerStateFixture(sandboxConfigHome, state)
 
   const child = spawnBrokerEntry({
     endpoint,
@@ -956,9 +1079,13 @@ test("broker-entry 启动时会立刻把过期 connected snapshot 标记为 stal
 
   try {
     await waitForBrokerMetadata(brokerJsonPath)
-    const staleSnapshot = await waitForInstanceSnapshot(instancePath, (snapshot) => snapshot.status === "stale", 5_000)
-    assert.equal(staleSnapshot.status, "stale")
-    assert.equal(typeof staleSnapshot.staleSince, "number")
+    const staleSnapshot = await waitForBrokerStateSnapshot(
+      sandboxConfigHome,
+      (snapshot) => snapshot.connections?.["startup-stale-a"]?.["inc-startup-stale-a"]?.online === false,
+      5_000,
+    )
+    assert.equal(staleSnapshot.connections["startup-stale-a"]["inc-startup-stale-a"].disconnectReason, "instanceStale")
+    assert.equal(staleSnapshot.active.instances["startup-stale-a"].online, false)
 
     const diagnosticsRaw = await waitForFileText(
       diagnosticsPath,
@@ -973,33 +1100,30 @@ test("broker-entry 启动时会立刻把过期 connected snapshot 标记为 stal
 })
 
 test("broker-entry 启动时会立刻 purge 过期 cleaned request", async () => {
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-startup-purge`)
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-startup-purge-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
-  const requestDir = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "requests", "question")
   const diagnosticsPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "wechat-broker.diagnostics.jsonl")
   const routeKey = "startup-cleaned-old"
   const now = Date.now()
 
-  await rm(requestDir, { recursive: true, force: true })
-  mkdirSync(requestDir, { recursive: true })
-  await writeFile(
-    path.join(requestDir, `${routeKey}.json`),
-    JSON.stringify({
-      kind: "question",
-      requestID: "q-startup-cleaned-old",
-      routeKey,
-      handle: "qstartup1",
-      scopeKey: "startup-cleanup",
-      wechatAccountId: "wx-startup-cleanup",
-      userId: "u-startup-cleanup",
-      status: "cleaned",
-      createdAt: now - 10_000,
-      answeredAt: now - 9_000,
-      cleanedAt: now - 8_000,
-    }, null, 2),
-    "utf8",
-  )
+  const state = brokerStateStore.createEmptyBrokerState({ track: false })
+  brokerStateStore.upsertBrokerIndexedRequest(state, {
+    kind: "question",
+    requestID: "q-startup-cleaned-old",
+    routeKey,
+    handle: "qstartup1",
+    scopeKey: "startup-cleanup",
+    wechatAccountId: "wx-startup-cleanup",
+    userId: "u-startup-cleanup",
+    status: "cleaned",
+    createdAt: now - 10_000,
+    answeredAt: now - 9_000,
+    cleanedAt: now - 8_000,
+    terminalReason: "answered",
+  })
+  await writeBrokerStateFixture(sandboxConfigHome, state)
 
   const child = spawnBrokerEntry({
     endpoint,
@@ -1012,7 +1136,12 @@ test("broker-entry 启动时会立刻 purge 过期 cleaned request", async () =>
 
   try {
     await waitForBrokerMetadata(brokerJsonPath)
-    await waitForFileRemoved(path.join(requestDir, `${routeKey}.json`), 5_000)
+    const purgedState = await waitForBrokerStateSnapshot(
+      sandboxConfigHome,
+      (snapshot) => snapshot.requestIndex?.[`question:${routeKey}`] === undefined,
+      5_000,
+    )
+    assert.equal(purgedState.requestIndex[`question:${routeKey}`], undefined)
     const diagnosticsRaw = await waitForFileText(
       diagnosticsPath,
       (text) => text.includes('"type":"requestPurged"') && text.includes(`"routeKey":"${routeKey}"`),
@@ -1121,7 +1250,7 @@ test("dead-letter 不参与 idle 判定", async () => {
   }
 })
 
-test("broker future message 错误优先级: invalidMessage -> unauthorized -> notImplemented，heartbeat 校验 token", async () => {
+test("broker legacy/future message 错误优先级: invalidMessage -> legacy removed -> future notImplemented", async () => {
   const protocol = await import(DIST_PROTOCOL_MODULE)
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-priority-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
@@ -1137,28 +1266,28 @@ test("broker future message 错误优先级: invalidMessage -> unauthorized -> n
 
     const unauthorizedFuture = await sendFrameAndReadResponse(
       endpoint,
-      protocol.serializeEnvelope({
-        id: "future-unauthorized",
-        type: "collectStatus",
-        instanceID: "instance-priority",
-        payload: {},
-      }),
+      `${JSON.stringify({ id: "legacy-collect-status", type: "collectStatus", instanceID: "instance-priority", payload: {} })}\n`,
     )
     assert.equal(unauthorizedFuture.type, "error")
-    assert.equal(unauthorizedFuture.payload.code, "unauthorized")
+    assert.equal(unauthorizedFuture.payload.code, "notImplemented")
+    assert.match(String(unauthorizedFuture.payload.message), /legacy path removed/i)
 
     const registerAck = await sendFrameAndReadResponse(
       endpoint,
       protocol.serializeEnvelope({
-        id: "register-1",
-        type: "registerInstance",
+        id: "hello-register-1",
+        type: "hello/register",
         instanceID: "instance-priority",
-        payload: {},
+        payload: {
+          protocolVersion: LIVE_PROTOCOL_VERSION,
+          stateGeneration: LIVE_STATE_GENERATION,
+          instanceID: "instance-priority",
+          instanceIncarnation: "inc-priority-1",
+        },
       }),
     )
     assert.equal(registerAck.type, "registerAck")
-    assert.equal(typeof registerAck.payload.sessionToken, "string")
-    assert.equal(registerAck.payload.sessionToken.length > 0, true)
+    assert.equal(registerAck.payload.protocolVersion, LIVE_PROTOCOL_VERSION)
 
     const notImplemented = await sendFrameAndReadResponse(
       endpoint,
@@ -1173,18 +1302,13 @@ test("broker future message 错误优先级: invalidMessage -> unauthorized -> n
     assert.equal(notImplemented.type, "error")
     assert.equal(notImplemented.payload.code, "notImplemented")
 
-    const heartbeatUnauthorized = await sendFrameAndReadResponse(
+    const heartbeatRemoved = await sendFrameAndReadResponse(
       endpoint,
-      protocol.serializeEnvelope({
-        id: "heartbeat-unauthorized",
-        type: "heartbeat",
-        instanceID: "instance-priority",
-        sessionToken: "wrong-token",
-        payload: {},
-      }),
+      `${JSON.stringify({ id: "heartbeat-removed", type: "heartbeat", instanceID: "instance-priority", sessionToken: "wrong-token", payload: {} })}\n`,
     )
-    assert.equal(heartbeatUnauthorized.type, "error")
-    assert.equal(heartbeatUnauthorized.payload.code, "unauthorized")
+    assert.equal(heartbeatRemoved.type, "error")
+    assert.equal(heartbeatRemoved.payload.code, "notImplemented")
+    assert.match(String(heartbeatRemoved.payload.message), /legacy path removed/i)
   } finally {
     await terminateChild(child)
     childProcesses.delete(child)
@@ -1972,7 +2096,7 @@ test("真实默认 spawn + 自定义 stateRoot 时，broker.json 写入自定义
   }
 })
 
-test("client 可完成 registerInstance -> registerAck 往返并缓存会话字段", async () => {
+test("client 可完成 registerHello -> registerAck 往返并返回 live 协商字段", async () => {
   const clientModule = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}`)
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-client-register-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
@@ -1986,20 +2110,18 @@ test("client 可完成 registerInstance -> registerAck 往返并缓存会话字�
     const ping = await client.ping()
     assert.equal(ping.type, "pong")
 
-    const registerAck = await client.registerInstance({
+    const registerResult = await client.registerHello({
+      protocolVersion: LIVE_PROTOCOL_VERSION,
+      stateGeneration: LIVE_STATE_GENERATION,
       instanceID: "client-instance-a",
-      pid: process.pid,
+      instanceIncarnation: "inc-client-instance-a",
     })
-    assert.equal(typeof registerAck.sessionToken, "string")
-    assert.equal(registerAck.sessionToken.length > 0, true)
-    assert.equal(typeof registerAck.registeredAt, "number")
-    assert.equal(typeof registerAck.brokerPid, "number")
-
-    const snapshot = client.getSessionSnapshot()
-    assert.equal(snapshot.instanceID, "client-instance-a")
-    assert.equal(snapshot.sessionToken, registerAck.sessionToken)
-    assert.equal(snapshot.registeredAt, registerAck.registeredAt)
-    assert.equal(snapshot.brokerPid, registerAck.brokerPid)
+    assert.equal(registerResult.ack.protocolVersion, LIVE_PROTOCOL_VERSION)
+    assert.equal(registerResult.ack.stateGeneration, LIVE_STATE_GENERATION)
+    assert.equal(registerResult.ack.instanceIncarnation, "inc-client-instance-a")
+    assert.equal(registerResult.ack.needFullSync, true)
+    assert.equal(registerResult.control?.type, "requestFullSync")
+    assert.deepEqual(registerResult.pendingCommands, [])
 
     await client.close()
   } finally {
@@ -2032,7 +2154,7 @@ test("broker-client 收到坏帧时应失败当前等待请求，而不是抛出
   }
 })
 
-test("同连接同 instanceID 重注册会刷新 token/registrationEpoch；新连接接管后旧 token 失效；同 pid 不同 instanceID 可共存", async () => {
+test("同一 instanceID 被新 live 连接接管后，旧连接不再能发送 bridge event；不同 instanceID 可并存", async () => {
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-register-state-machine-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
@@ -2041,110 +2163,96 @@ test("同连接同 instanceID 重注册会刷新 token/registrationEpoch；新�
   try {
     await waitForBrokerMetadata(brokerJsonPath)
 
-    const connA = await createPersistentConnection(endpoint)
-    const firstAck = await connA.send({
-      id: "register-A-1",
-      type: "registerInstance",
+    const sharedA = await connectLiveBridgeClient(endpoint, {
       instanceID: "instance-shared",
-      payload: { pid: 12345 },
+      instanceIncarnation: "inc-shared-a",
+      fullSyncEvents: [{
+        type: "instanceOnline",
+        payload: {
+          instanceID: "instance-shared",
+          connectedAt: Date.now(),
+          pid: 12345,
+          displayName: "Shared A",
+          projectDir: "/tmp/shared-a",
+        },
+      }],
     })
-    const secondAck = await connA.send({
-      id: "register-A-2",
-      type: "registerInstance",
+    const sharedB = await connectLiveBridgeClient(endpoint, {
       instanceID: "instance-shared",
-      payload: { pid: 12345 },
+      instanceIncarnation: "inc-shared-b",
+      fullSyncEvents: [{
+        type: "instanceOnline",
+        payload: {
+          instanceID: "instance-shared",
+          connectedAt: Date.now(),
+          pid: 12345,
+          displayName: "Shared B",
+          projectDir: "/tmp/shared-b",
+        },
+      }],
     })
 
-     assert.equal(firstAck.type, "registerAck")
-     assert.equal(secondAck.type, "registerAck")
-     assert.notEqual(firstAck.payload.sessionToken, secondAck.payload.sessionToken)
-     assert.notEqual(firstAck.payload.registrationEpoch, secondAck.payload.registrationEpoch)
-     assert.equal(firstAck.payload.brokerPid, secondAck.payload.brokerPid)
+    await assert.rejects(
+      () => sharedA.client.sendBridgeEvent({
+        type: "instanceOnline",
+        eventSeq: sharedA.nextEventSeq + 1,
+        instanceIncarnation: sharedA.instanceIncarnation,
+        payload: {
+          instanceID: "instance-shared",
+          connectedAt: Date.now(),
+        },
+      }, { instanceID: "instance-shared" }),
+      /bridge event ack failed/i,
+    )
 
-    const connB = await createPersistentConnection(endpoint)
-    const takeoverAck = await connB.send({
-      id: "register-B-1",
-      type: "registerInstance",
-      instanceID: "instance-shared",
-      payload: { pid: 12345 },
-    })
-
-    assert.equal(takeoverAck.type, "registerAck")
-    assert.notEqual(takeoverAck.payload.sessionToken, firstAck.payload.sessionToken)
-
-    const oldHeartbeat = await connA.send({
-      id: "heartbeat-old-token",
-      type: "heartbeat",
-      instanceID: "instance-shared",
-      sessionToken: firstAck.payload.sessionToken,
-      payload: {},
-    })
-    assert.equal(oldHeartbeat.type, "error")
-    assert.equal(oldHeartbeat.payload.code, "unauthorized")
-
-    const newHeartbeat = await connB.send({
-      id: "heartbeat-new-token",
-      type: "heartbeat",
-      instanceID: "instance-shared",
-      sessionToken: takeoverAck.payload.sessionToken,
-      payload: {},
-    })
-    assert.equal(newHeartbeat.type, "pong")
-
-    const connC = await createPersistentConnection(endpoint)
-    const instanceOneAck = await connC.send({
-      id: "register-instance-1",
-      type: "registerInstance",
+    const instanceOne = await connectLiveBridgeClient(endpoint, {
       instanceID: "instance-1",
-      payload: { pid: 7777 },
+      instanceIncarnation: "inc-instance-1",
+      fullSyncEvents: [{
+        type: "instanceOnline",
+        payload: {
+          instanceID: "instance-1",
+          connectedAt: Date.now(),
+          pid: 7777,
+          displayName: "Instance One",
+          projectDir: "/tmp/instance-1",
+        },
+      }],
     })
-    const instanceTwoAck = await connC.send({
-      id: "register-instance-2",
-      type: "registerInstance",
+    const instanceTwo = await connectLiveBridgeClient(endpoint, {
       instanceID: "instance-2",
-      payload: { pid: 7777 },
+      instanceIncarnation: "inc-instance-2",
+      fullSyncEvents: [{
+        type: "instanceOnline",
+        payload: {
+          instanceID: "instance-2",
+          connectedAt: Date.now(),
+          pid: 7777,
+          displayName: "Instance Two",
+          projectDir: "/tmp/instance-2",
+        },
+      }],
     })
 
-    assert.equal(instanceOneAck.type, "registerAck")
-    assert.equal(instanceTwoAck.type, "registerAck")
-    assert.notEqual(instanceOneAck.payload.sessionToken, instanceTwoAck.payload.sessionToken)
+    assert.equal(instanceOne.registerResult.ack.instanceIncarnation, "inc-instance-1")
+    assert.equal(instanceTwo.registerResult.ack.instanceIncarnation, "inc-instance-2")
 
-    const heartbeatOne = await connC.send({
-      id: "heartbeat-instance-1",
-      type: "heartbeat",
-      instanceID: "instance-1",
-      sessionToken: instanceOneAck.payload.sessionToken,
-      payload: {},
-    })
-    const heartbeatTwo = await connC.send({
-      id: "heartbeat-instance-2",
-      type: "heartbeat",
-      instanceID: "instance-2",
-      sessionToken: instanceTwoAck.payload.sessionToken,
-      payload: {},
-    })
-    assert.equal(heartbeatOne.type, "pong")
-    assert.equal(heartbeatTwo.type, "pong")
-
-    await Promise.all([connA.close(), connB.close(), connC.close()])
+    await Promise.all([
+      sharedA.client.close(),
+      sharedB.client.close(),
+      instanceOne.client.close(),
+      instanceTwo.client.close(),
+    ])
   } finally {
     await terminateChild(child)
     childProcesses.delete(child)
   }
 })
 
-test("instances 快照：注册即落盘，超时标记 stale，后续 heartbeat 可恢复 connected", async () => {
+test("broker-state-store 连接快照：registerHello 后写入权威连接状态，stale 后可由 live event 恢复 online", async () => {
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-instance-heartbeat-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
-  const instancePath = path.join(
-    sandboxConfigHome,
-    "opencode",
-    "account-switcher",
-    "wechat",
-    "instances",
-    "instance-heartbeat-a.json",
-  )
   const child = spawnBrokerEntry({
     endpoint,
     xdgConfigHome: sandboxConfigHome,
@@ -2156,61 +2264,59 @@ test("instances 快照：注册即落盘，超时标记 stale，后续 heartbeat
 
   try {
     await waitForBrokerMetadata(brokerJsonPath)
-    const conn = await createPersistentConnection(endpoint)
-
-    const registerAck = await conn.send({
-      id: "register-heartbeat-a",
-      type: "registerInstance",
+    const bridge = await connectLiveBridgeClient(endpoint, {
       instanceID: "instance-heartbeat-a",
+      instanceIncarnation: "inc-heartbeat-a",
+      fullSyncEvents: [{
+        type: "instanceOnline",
+        payload: {
+          instanceID: "instance-heartbeat-a",
+          connectedAt: Date.now(),
+          pid: 7788,
+          displayName: "WeChat QA",
+          projectDir: "/tmp/wechat-qa",
+        },
+      }],
+    })
+
+    const connectedSnapshot = await waitForBrokerStateSnapshot(
+      sandboxConfigHome,
+      (snapshot) => snapshot.connections?.["instance-heartbeat-a"]?.["inc-heartbeat-a"]?.online === true,
+      5_000,
+    )
+    assert.equal(connectedSnapshot.connections["instance-heartbeat-a"]["inc-heartbeat-a"].online, true)
+    assert.equal(connectedSnapshot.active.instances["instance-heartbeat-a"].online, true)
+    assert.equal(connectedSnapshot.active.instances["instance-heartbeat-a"].displayName, "WeChat QA")
+
+    const staleSnapshot = await waitForBrokerStateSnapshot(
+      sandboxConfigHome,
+      (snapshot) => snapshot.connections?.["instance-heartbeat-a"]?.["inc-heartbeat-a"]?.online === false,
+      5_000,
+    )
+    assert.equal(staleSnapshot.connections["instance-heartbeat-a"]["inc-heartbeat-a"].disconnectReason, "instanceStale")
+
+    bridge.nextEventSeq = await sendLiveBridgeEvent(bridge, {
+      instanceID: "instance-heartbeat-a",
+      nextEventSeq: bridge.nextEventSeq,
+      type: "instanceOnline",
       payload: {
+        instanceID: "instance-heartbeat-a",
+        connectedAt: Date.now(),
         pid: 7788,
         displayName: "WeChat QA",
         projectDir: "/tmp/wechat-qa",
       },
     })
-    assert.equal(registerAck.type, "registerAck")
 
-    const connectedSnapshot = await waitForInstanceSnapshot(instancePath, (snapshot) => snapshot.status === "connected")
-    assert.deepEqual(Object.keys(connectedSnapshot).sort(), [
-      "connectedAt",
-      "displayName",
-      "instanceID",
-      "lastHeartbeatAt",
-      "pid",
-      "projectDir",
-      "status",
-    ])
-    assert.equal(connectedSnapshot.instanceID, "instance-heartbeat-a")
-    assert.equal(connectedSnapshot.pid, 7788)
-    assert.equal(connectedSnapshot.displayName, "WeChat QA")
-    assert.equal(connectedSnapshot.projectDir, "/tmp/wechat-qa")
-    assert.equal(typeof connectedSnapshot.connectedAt, "number")
-    assert.equal(typeof connectedSnapshot.lastHeartbeatAt, "number")
-    assert.equal(connectedSnapshot.status, "connected")
-    assert.equal("staleSince" in connectedSnapshot, false)
-
-    const staleSnapshot = await waitForInstanceSnapshot(instancePath, (snapshot) => snapshot.status === "stale")
-    assert.equal(staleSnapshot.status, "stale")
-    assert.equal(typeof staleSnapshot.staleSince, "number")
-
-    const heartbeatResponse = await conn.send({
-      id: "heartbeat-after-stale",
-      type: "heartbeat",
-      instanceID: "instance-heartbeat-a",
-      sessionToken: registerAck.payload.sessionToken,
-      payload: {},
-    })
-    assert.equal(heartbeatResponse.type, "pong")
-
-    const recoveredSnapshot = await waitForInstanceSnapshot(
-      instancePath,
-      (snapshot) => snapshot.status === "connected" && !("staleSince" in snapshot),
+    const recoveredSnapshot = await waitForBrokerStateSnapshot(
+      sandboxConfigHome,
+      (snapshot) => snapshot.connections?.["instance-heartbeat-a"]?.["inc-heartbeat-a"]?.online === true,
+      5_000,
     )
-    assert.equal(recoveredSnapshot.status, "connected")
-    assert.equal("staleSince" in recoveredSnapshot, false)
-    assert.equal(recoveredSnapshot.lastHeartbeatAt >= staleSnapshot.lastHeartbeatAt, true)
+    assert.equal(recoveredSnapshot.connections["instance-heartbeat-a"]["inc-heartbeat-a"].online, true)
+    assert.equal(recoveredSnapshot.active.instances["instance-heartbeat-a"].online, true)
 
-    await conn.close()
+    await bridge.client.close()
   } finally {
     await terminateChild(child)
     childProcesses.delete(child)
@@ -2218,14 +2324,12 @@ test("instances 快照：注册即落盘，超时标记 stale，后续 heartbeat
 })
 
 test("stale instance 会把同 scopeKey 的 open request 标记为 expired", async () => {
-  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-stale-request-expire`)
   const handle = await import(`../dist/wechat/handle.js?reload=${Date.now()}`)
 
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-stale-request-expire-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
-  const requestDir = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "requests", "question")
-  const deadLetterDir = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "dead-letter", "question")
   const diagnosticsPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "wechat-broker.diagnostics.jsonl")
   const child = spawnBrokerEntry({
     endpoint,
@@ -2240,65 +2344,48 @@ test("stale instance 会把同 scopeKey 的 open request 标记为 expired", asy
     const handleValue = `q${Date.now()}`
     const routeKey = handle.createRouteKey({ kind: "question", requestID: "q-stale-expire-1", scopeKey: "instance-stale-expire" })
 
-    await mkdirSync(requestDir, { recursive: true })
-    await writeFile(
-      path.join(requestDir, `${routeKey}.json`),
-      JSON.stringify({
-        kind: "question",
-        requestID: "q-stale-expire-1",
-        routeKey,
-        handle: handleValue,
-        scopeKey: "instance-stale-expire",
-        wechatAccountId: "wx-stale-expire",
-        userId: "u-stale-expire",
-        status: "open",
-        createdAt: Date.now(),
-      }, null, 2),
-      "utf8",
-    )
+    const state = brokerStateStore.createEmptyBrokerState({ track: false })
+    brokerStateStore.upsertBrokerIndexedRequest(state, {
+      kind: "question",
+      requestID: "q-stale-expire-1",
+      routeKey,
+      handle: handleValue,
+      scopeKey: "instance-stale-expire",
+      wechatAccountId: "wx-stale-expire",
+      userId: "u-stale-expire",
+      status: "open",
+      createdAt: Date.now(),
+    })
+    await writeBrokerStateFixture(sandboxConfigHome, state)
 
     await waitForBrokerMetadata(brokerJsonPath)
 
-    const client = await brokerClient.connect(endpoint)
-    await client.registerInstance({ instanceID: "instance-stale-expire", pid: process.pid })
+    const client = await connectLiveBridgeClient(endpoint, {
+      instanceID: "instance-stale-expire",
+      instanceIncarnation: "inc-stale-expire",
+    })
 
-    await waitForInstanceSnapshot(
-      path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "instances", "instance-stale-expire.json"),
-      (snapshot) => snapshot?.status === "stale",
+    const expired = await waitForBrokerStateSnapshot(
+      sandboxConfigHome,
+      (snapshot) => snapshot.requestIndex?.[`question:${routeKey}`]?.status === "expired",
       5_000,
     )
 
-    const expired = await waitForJsonFile(
-      path.join(requestDir, `${routeKey}.json`),
-      (record) => record?.status === "expired",
+    assert.equal(expired.requestIndex[`question:${routeKey}`].status, "expired")
+    assert.equal(typeof expired.requestIndex[`question:${routeKey}`].expiredAt, "number")
+
+    const diagnosticsRaw = await waitForFileText(
+      diagnosticsPath,
+      (text) => text.includes('"type":"instanceStale"') && text.includes('"type":"requestExpired"'),
       5_000,
     )
-
-    assert.equal(expired.status, "expired")
-    assert.equal(typeof expired.expiredAt, "number")
-
-    const deadLetter = await waitForJsonFile(
-      path.join(deadLetterDir, `${routeKey}.json`),
-      (record) => record?.reason === "instanceStale",
-      5_000,
-    )
-    assert.equal(deadLetter.routeKey, routeKey)
-    assert.equal(deadLetter.finalStatus, "expired")
-    assert.equal(deadLetter.reason, "instanceStale")
-
-  const diagnosticsRaw = await waitForFileText(
-    diagnosticsPath,
-    (text) => text.includes('"type":"instanceStale"') && text.includes('"type":"requestExpired"') && text.includes('"type":"deadLetterWritten"'),
-    5_000,
-  )
     assert.match(diagnosticsRaw, /"code":"instanceStale"/)
     assert.match(diagnosticsRaw, /"code":"requestExpired"/)
-    assert.match(diagnosticsRaw, /"code":"deadLetterWritten"/)
-  assert.match(diagnosticsRaw, /"type":"instanceStale"/)
+    assert.match(diagnosticsRaw, /"type":"instanceStale"/)
     assert.match(diagnosticsRaw, /"instanceID":"instance-stale-expire"/)
     assert.match(diagnosticsRaw, /"routeKey":"question-/)
 
-    await client.close()
+    await client.client.close()
   } finally {
     await terminateChild(child)
     childProcesses.delete(child)
@@ -2306,11 +2393,10 @@ test("stale instance 会把同 scopeKey 的 open request 标记为 expired", asy
 })
 
 test("terminal request 会被自动 cleaned，并在保留期后 purge", async () => {
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-request-cleanup`)
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-request-cleanup-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
-  const requestDir = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "requests", "question")
-  const deadLetterDir = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "dead-letter", "question")
   const diagnosticsPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "wechat-broker.diagnostics.jsonl")
   const child = spawnBrokerEntry({
     endpoint,
@@ -2323,58 +2409,55 @@ test("terminal request 会被自动 cleaned，并在保留期后 purge", async (
   })
 
   try {
-    await mkdirSync(requestDir, { recursive: true })
-
     const now = Date.now()
     const answeredRouteKey = "question-clean-target"
     const oldCleanedRouteKey = "question-cleaned-old"
-
-    await writeFile(
-      path.join(requestDir, `${answeredRouteKey}.json`),
-      JSON.stringify({
-        kind: "question",
-        requestID: "q-clean-target",
-        routeKey: answeredRouteKey,
-        handle: "qclean1",
-        scopeKey: "instance-cleanup",
-        wechatAccountId: "wx-cleanup",
-        userId: "u-cleanup",
-        status: "answered",
-        createdAt: now - 1_000,
-        answeredAt: now - 500,
-      }, null, 2),
-      "utf8",
-    )
-
-    await writeFile(
-      path.join(requestDir, `${oldCleanedRouteKey}.json`),
-      JSON.stringify({
-        kind: "question",
-        requestID: "q-cleaned-old",
-        routeKey: oldCleanedRouteKey,
-        handle: "qclean2",
-        scopeKey: "instance-cleanup",
-        wechatAccountId: "wx-cleanup",
-        userId: "u-cleanup",
-        status: "cleaned",
-        createdAt: now - 5_000,
-        answeredAt: now - 4_000,
-        cleanedAt: now - 2_000,
-      }, null, 2),
-      "utf8",
-    )
+    const state = brokerStateStore.createEmptyBrokerState({ track: false })
+    brokerStateStore.upsertBrokerIndexedRequest(state, {
+      kind: "question",
+      requestID: "q-clean-target",
+      routeKey: answeredRouteKey,
+      handle: "qclean1",
+      scopeKey: "instance-cleanup",
+      wechatAccountId: "wx-cleanup",
+      userId: "u-cleanup",
+      status: "answered",
+      createdAt: now - 1_000,
+      answeredAt: now - 500,
+      terminalReason: "answered",
+    })
+    brokerStateStore.upsertBrokerIndexedRequest(state, {
+      kind: "question",
+      requestID: "q-cleaned-old",
+      routeKey: oldCleanedRouteKey,
+      handle: "qclean2",
+      scopeKey: "instance-cleanup",
+      wechatAccountId: "wx-cleanup",
+      userId: "u-cleanup",
+      status: "cleaned",
+      createdAt: now - 5_000,
+      answeredAt: now - 4_000,
+      cleanedAt: now - 2_000,
+      terminalReason: "answered",
+    })
+    await writeBrokerStateFixture(sandboxConfigHome, state)
 
     await waitForBrokerMetadata(brokerJsonPath)
 
-    const cleaned = await waitForJsonFile(
-      path.join(requestDir, `${answeredRouteKey}.json`),
-      (record) => record?.status === "cleaned",
+    const cleaned = await waitForBrokerStateSnapshot(
+      sandboxConfigHome,
+      (snapshot) => snapshot.requestIndex?.[`question:${answeredRouteKey}`]?.status === "cleaned",
       5_000,
     )
-    assert.equal(cleaned.status, "cleaned")
-    assert.equal(typeof cleaned.cleanedAt, "number")
+    assert.equal(cleaned.requestIndex[`question:${answeredRouteKey}`].status, "cleaned")
+    assert.equal(typeof cleaned.requestIndex[`question:${answeredRouteKey}`].cleanedAt, "number")
 
-    await waitForFileRemoved(path.join(requestDir, `${oldCleanedRouteKey}.json`), 5_000)
+    const purged = await waitForBrokerStateSnapshot(
+      sandboxConfigHome,
+      (snapshot) => snapshot.requestIndex?.[`question:${oldCleanedRouteKey}`] === undefined,
+      5_000,
+    )
+    assert.equal(purged.requestIndex[`question:${oldCleanedRouteKey}`], undefined)
 
     const diagnosticsRaw = await waitForFileText(
       diagnosticsPath,
@@ -2386,8 +2469,6 @@ test("terminal request 会被自动 cleaned，并在保留期后 purge", async (
     assert.match(diagnosticsRaw, /"routeKey":"question-clean-target"/)
     assert.match(diagnosticsRaw, /"type":"requestPurged"/)
     assert.match(diagnosticsRaw, /"routeKey":"question-cleaned-old"/)
-    await assert.rejects(() => readFile(path.join(deadLetterDir, `${answeredRouteKey}.json`), "utf8"), /ENOENT|no such file/i)
-    await assert.rejects(() => readFile(path.join(deadLetterDir, `${oldCleanedRouteKey}.json`), "utf8"), /ENOENT|no such file/i)
   } finally {
     await terminateChild(child)
     childProcesses.delete(child)
@@ -2399,8 +2480,7 @@ test("broker 默认 heartbeat timeout 常量固定为 30000ms", async () => {
   assert.equal(brokerServer.DEFAULT_HEARTBEAT_TIMEOUT_MS, 30_000)
 })
 
-test("instances 目录不可写时，registerInstance 不可静默成功", async () => {
-  const protocol = await import(DIST_PROTOCOL_MODULE)
+test("legacy registerInstance 已被明确移除，不再受 instances 目录状态影响", async () => {
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-instance-persist-error-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
@@ -2414,35 +2494,22 @@ test("instances 目录不可写时，registerInstance 不可静默成功", async
 
     const response = await sendFrameAndReadResponse(
       endpoint,
-      protocol.serializeEnvelope({
-        id: "register-persist-error",
-        type: "registerInstance",
-        instanceID: "persist-error-a",
-        payload: { pid: 8899, displayName: "Broken", projectDir: "/tmp/broken" },
-      }),
+      `${JSON.stringify({ id: "register-persist-error", type: "registerInstance", instanceID: "persist-error-a", payload: { pid: 8899, displayName: "Broken", projectDir: "/tmp/broken" } })}\n`,
     )
 
     assert.equal(response.type, "error")
-    assert.equal(response.payload.code, "brokerUnavailable")
+    assert.equal(response.payload.code, "notImplemented")
+    assert.match(String(response.payload.message), /legacy path removed/i)
   } finally {
     await terminateChild(child)
     childProcesses.delete(child)
   }
 })
 
-test("stale 恢复时 heartbeat 返回后，磁盘快照应已是 connected（避免旧写回滚）", async () => {
-  const protocol = await import(DIST_PROTOCOL_MODULE)
+test("stale 恢复时，instanceOnline 重新上报后 broker-state-store 会立即回到 connected", async () => {
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-instance-ordering-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
-  const instancePath = path.join(
-    sandboxConfigHome,
-    "opencode",
-    "account-switcher",
-    "wechat",
-    "instances",
-    "instance-ordering-a.json",
-  )
   const child = spawnBrokerEntry({
     endpoint,
     xdgConfigHome: sandboxConfigHome,
@@ -2454,64 +2521,57 @@ test("stale 恢复时 heartbeat 返回后，磁盘快照应已是 connected（�
 
   try {
     await waitForBrokerMetadata(brokerJsonPath)
-    const conn = await createPersistentConnection(endpoint)
-
     const heavyDisplayName = "D".repeat(1024 * 512)
-    const registerAck = await conn.send({
-      id: "register-ordering-a",
-      type: "registerInstance",
+    const bridge = await connectLiveBridgeClient(endpoint, {
       instanceID: "instance-ordering-a",
+      instanceIncarnation: "inc-ordering-a",
+      fullSyncEvents: [{
+        type: "instanceOnline",
+        payload: {
+          instanceID: "instance-ordering-a",
+          connectedAt: Date.now(),
+          pid: 7878,
+          displayName: heavyDisplayName,
+          projectDir: "/tmp/ordering",
+        },
+      }],
+    })
+
+    await waitForBrokerStateSnapshot(
+      sandboxConfigHome,
+      (snapshot) => snapshot.connections?.["instance-ordering-a"]?.["inc-ordering-a"]?.online === false,
+      5_000,
+    )
+
+    bridge.nextEventSeq = await sendLiveBridgeEvent(bridge, {
+      instanceID: "instance-ordering-a",
+      nextEventSeq: bridge.nextEventSeq,
+      type: "instanceOnline",
       payload: {
+        instanceID: "instance-ordering-a",
+        connectedAt: Date.now(),
         pid: 7878,
         displayName: heavyDisplayName,
         projectDir: "/tmp/ordering",
       },
     })
-    assert.equal(registerAck.type, "registerAck")
 
-    await waitForInstanceSnapshot(instancePath, (snapshot) => snapshot.status === "stale")
-
-    const heartbeatResponse = await conn.send({
-      id: "heartbeat-ordering-a",
-      type: "heartbeat",
-      instanceID: "instance-ordering-a",
-      sessionToken: registerAck.payload.sessionToken,
-      payload: {},
-    })
-    assert.equal(heartbeatResponse.type, "pong")
-
-    const immediateDiskSnapshot = await waitForInstanceSnapshot(
-      instancePath,
-      (snapshot) => snapshot.status === "connected" && !("staleSince" in snapshot),
-    )
-    assert.equal(immediateDiskSnapshot.status, "connected")
-    assert.equal("staleSince" in immediateDiskSnapshot, false)
-
-    const diagnosticsPath = path.join(
+    const immediateDiskSnapshot = await waitForBrokerStateSnapshot(
       sandboxConfigHome,
-      "opencode",
-      "account-switcher",
-      "wechat",
-      "wechat-broker.diagnostics.jsonl",
-    )
-    const diagnosticsRaw = await waitForFileText(
-      diagnosticsPath,
-      (text) => text.includes('"type":"instanceRecovered"'),
+      (snapshot) => snapshot.connections?.["instance-ordering-a"]?.["inc-ordering-a"]?.online === true,
       5_000,
     )
-    assert.match(diagnosticsRaw, /"code":"instanceRecovered"/)
-    assert.match(diagnosticsRaw, /"instanceID":"instance-ordering-a"/)
-    assert.match(diagnosticsRaw, /"type":"instanceRecovered"/)
+    assert.equal(immediateDiskSnapshot.connections["instance-ordering-a"]["inc-ordering-a"].online, true)
+    assert.equal(immediateDiskSnapshot.active.instances["instance-ordering-a"].online, true)
 
-    await conn.close()
+    await bridge.client.close()
   } finally {
     await terminateChild(child)
     childProcesses.delete(child)
   }
 })
 
-test("非法 instanceID 注册应被拒绝，且不会写出越界快照文件", async () => {
-  const protocol = await import(DIST_PROTOCOL_MODULE)
+test("非法 instanceID 的 hello/register 应被拒绝，且不会写出越界状态文件", async () => {
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-instance-path-safety-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
@@ -2522,12 +2582,17 @@ test("非法 instanceID 注册应被拒绝，且不会写出越界快照文件",
 
     const response = await sendFrameAndReadResponse(
       endpoint,
-      protocol.serializeEnvelope({
-        id: "register-invalid-instanceid",
-        type: "registerInstance",
+      `${JSON.stringify({
+        id: "hello-invalid-instanceid",
+        type: "hello/register",
         instanceID: "../escape-out",
-        payload: { pid: 5566, displayName: "Invalid", projectDir: "/tmp/invalid" },
-      }),
+        payload: {
+          protocolVersion: LIVE_PROTOCOL_VERSION,
+          stateGeneration: LIVE_STATE_GENERATION,
+          instanceID: "../escape-out",
+          instanceIncarnation: "inc-invalid",
+        },
+      })}\n`,
     )
     assert.equal(response.type, "error")
     assert.equal(response.payload.code, "invalidMessage")
@@ -2547,14 +2612,12 @@ test("非法 instanceID 注册应被拒绝，且不会写出越界快照文件",
   }
 })
 
-test("broker 通知合并：短窗口内重复 question 候选只保留一个待发送通知", async () => {
-  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}`)
+test("broker 重复 question candidate 不会膨胀成多条 authoritative active question", async () => {
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-notification-merge-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
   const wechatStateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
   const operatorPath = path.join(wechatStateRoot, "operator.json")
-  const notificationsDir = path.join(wechatStateRoot, "notifications")
 
   mkdirSync(path.dirname(operatorPath), { recursive: true })
   await writeFile(
@@ -2572,52 +2635,29 @@ test("broker 通知合并：短窗口内重复 question 候选只保留一个待
   try {
     await waitForBrokerMetadata(brokerJsonPath)
 
-    const client = await brokerClient.connect(endpoint, {
-      bridge: {
-        collectNotificationCandidates: async () => {
-          const createdAt = Date.now()
-          return [
-            {
-              idempotencyKey: "notif-merge-question-1",
-              kind: "question",
-              requestID: "question-merge-1",
-              createdAt,
-              routeKey: "question-merge-1",
-              handle: "q1",
-            },
-            {
-              idempotencyKey: "notif-merge-question-2",
-              kind: "question",
-              requestID: "question-merge-1",
-              createdAt: createdAt + 100,
-              routeKey: "question-merge-1",
-              handle: "q1",
-            },
-          ]
-        },
+    const lifecycle = await createQuestionBridgeLifecycle(endpoint, async () => [
+      {
+        id: "question-merge-1",
+        sessionID: "session-merge-1",
+        questions: [{ header: "Merge", question: "Need merge" }],
       },
-    })
+      {
+        id: "question-merge-1",
+        sessionID: "session-merge-1",
+        questions: [{ header: "Merge", question: "Need merge" }],
+      },
+    ], "question-merge")
 
     try {
-      await client.registerInstance({ instanceID: "instance-merge-question", pid: process.pid })
-
-      await waitForNotificationRecords(
-        notificationsDir,
-        (fileName) => fileName.startsWith("notif-merge-question-"),
-        (items) => items.length >= 1,
+      const snapshot = await waitForBrokerStateSnapshot(
+        sandboxConfigHome,
+        (state) => Object.keys(state.active?.questions ?? {}).length === 1,
+        5_000,
       )
-      await delay(300)
-      const records = await waitForNotificationRecords(
-        notificationsDir,
-        (fileName) => fileName.startsWith("notif-merge-question-"),
-        () => true,
-      )
-
-      assert.equal(records.filter((record) => record.status === "pending").length, 1)
-      assert.equal(new Set(records.map((record) => record.routeKey)).size, 1)
-      assert.equal(new Set(records.map((record) => record.handle)).size, 1)
+      assert.equal(Object.keys(snapshot.active.questions).length, 1)
+      assert.equal(new Set(Object.values(snapshot.active.questions).map((record) => record.routeKey)).size, 1)
     } finally {
-      await client.close()
+      await lifecycle.close()
     }
   } finally {
     await terminateChild(child)
@@ -2625,7 +2665,7 @@ test("broker 通知合并：短窗口内重复 question 候选只保留一个待
   }
 })
 
-test("broker 通知合并：重复候选不会先以 pending 进入可发送集合再被 suppress", async () => {
+test("broker 重复 question candidate 在 full sync 后只保留单条 authoritative route", async () => {
   const brokerServer = await import(DIST_BROKER_SERVER_MODULE)
   const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}`)
   const notificationStore = await import("../dist/wechat/notification-store.js")
@@ -2633,18 +2673,9 @@ test("broker 通知合并：重复候选不会先以 pending 进入可发送集�
 
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-notification-race-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
-  const notificationsDir = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "notifications")
   const previousStateRoot = process.env.WECHAT_STATE_ROOT_OVERRIDE
-  const persistedStatuses = []
 
   process.env.WECHAT_STATE_ROOT_OVERRIDE = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
-  notificationStore.setNotificationStoreTestHooks({
-    afterWriteNotification: async (record) => {
-      if (record.idempotencyKey.startsWith("notif-race-question-")) {
-        persistedStatuses.push({ idempotencyKey: record.idempotencyKey, status: record.status })
-      }
-    },
-  })
 
   const server = await brokerServer.startBrokerServer(endpoint)
 
@@ -2655,52 +2686,31 @@ test("broker 通知合并：重复候选不会先以 pending 进入可发送集�
       boundAt: Date.now(),
     })
 
-    const client = await brokerClient.connect(server.endpoint, {
-      bridge: {
-        collectNotificationCandidates: async () => {
-          const createdAt = Date.now()
-          return [
-            {
-              idempotencyKey: "notif-race-question-1",
-              kind: "question",
-              requestID: "question-race-1",
-              createdAt,
-              routeKey: "question-race-1",
-              handle: "q1",
-            },
-            {
-              idempotencyKey: "notif-race-question-2",
-              kind: "question",
-              requestID: "question-race-1",
-              createdAt: createdAt + 100,
-              routeKey: "question-race-1",
-              handle: "q1",
-            },
-          ]
-        },
+    const lifecycle = await createQuestionBridgeLifecycle(server.endpoint, async () => [
+      {
+        id: "question-race-1",
+        sessionID: "session-race-1",
+        questions: [{ header: "Race", question: "Need merge" }],
       },
-    })
+      {
+        id: "question-race-1",
+        sessionID: "session-race-1",
+        questions: [{ header: "Race", question: "Need merge" }],
+      },
+    ], "question-race")
 
     try {
-      await client.registerInstance({ instanceID: "instance-race-question", pid: process.pid })
-      await waitForNotificationRecords(
-        notificationsDir,
-        (fileName) => fileName.startsWith("notif-race-question-"),
-        (items) => items.length === 2,
+      const snapshot = await waitForBrokerStateSnapshot(
+        sandboxConfigHome,
+        (state) => Object.keys(state.active?.questions ?? {}).length === 1,
+        5_000,
       )
-
-      assert.deepEqual(
-        persistedStatuses.filter((entry) => entry.idempotencyKey === "notif-race-question-2").map((entry) => entry.status),
-        ["suppressed"],
-      )
-
-      const pending = await notificationStore.listPendingNotifications()
-      assert.equal(pending.filter((record) => record.idempotencyKey.startsWith("notif-race-question-")).length, 1)
+      assert.equal(Object.keys(snapshot.active.questions).length, 1)
+      assert.equal(new Set(Object.values(snapshot.active.questions).map((record) => record.routeKey)).size, 1)
     } finally {
-      await client.close()
+      await lifecycle.close()
     }
   } finally {
-    notificationStore.setNotificationStoreTestHooks(undefined)
     if (previousStateRoot === undefined) {
       delete process.env.WECHAT_STATE_ROOT_OVERRIDE
     } else {
@@ -2710,14 +2720,12 @@ test("broker 通知合并：重复候选不会先以 pending 进入可发送集�
   }
 })
 
-test("broker 通知合并不会吞掉不同 handle 的 question 通知", async () => {
-  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}`)
+test("broker 不会吞掉不同 question candidate，它们会各自保留 authoritative active question", async () => {
   const sandboxConfigHome = await mkdtemp(path.join(os.tmpdir(), "wechat-broker-notification-distinct-"))
   const endpoint = createBrokerEndpoint(sandboxConfigHome)
   const brokerJsonPath = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat", "broker.json")
   const wechatStateRoot = path.join(sandboxConfigHome, "opencode", "account-switcher", "wechat")
   const operatorPath = path.join(wechatStateRoot, "operator.json")
-  const notificationsDir = path.join(wechatStateRoot, "notifications")
 
   mkdirSync(path.dirname(operatorPath), { recursive: true })
   await writeFile(
@@ -2735,46 +2743,30 @@ test("broker 通知合并不会吞掉不同 handle 的 question 通知", async (
   try {
     await waitForBrokerMetadata(brokerJsonPath)
 
-    const client = await brokerClient.connect(endpoint, {
-      bridge: {
-        collectNotificationCandidates: async () => {
-          const createdAt = Date.now()
-          return [
-            {
-              idempotencyKey: "notif-distinct-question-1",
-              kind: "question",
-              requestID: "question-distinct-1",
-              createdAt,
-              routeKey: "question-distinct-1",
-              handle: "q1",
-            },
-            {
-              idempotencyKey: "notif-distinct-question-2",
-              kind: "question",
-              requestID: "question-distinct-2",
-              createdAt: createdAt + 100,
-              routeKey: "question-distinct-2",
-              handle: "q2",
-            },
-          ]
-        },
+    const lifecycle = await createQuestionBridgeLifecycle(endpoint, async () => [
+      {
+        id: "question-distinct-1",
+        sessionID: "session-distinct-1",
+        questions: [{ header: "Distinct", question: "First" }],
       },
-    })
+      {
+        id: "question-distinct-2",
+        sessionID: "session-distinct-2",
+        questions: [{ header: "Distinct", question: "Second" }],
+      },
+    ], "question-distinct")
 
     try {
-      await client.registerInstance({ instanceID: "instance-distinct-question", pid: process.pid })
-
-      const records = await waitForNotificationRecords(
-        notificationsDir,
-        (fileName) => fileName.startsWith("notif-distinct-question-"),
-        (items) => items.filter((item) => item.status === "pending").length === 2,
+      const snapshot = await waitForBrokerStateSnapshot(
+        sandboxConfigHome,
+        (state) => Object.keys(state.active?.questions ?? {}).length === 2,
+        5_000,
       )
-
-      assert.equal(records.filter((record) => record.status === "pending").length, 2)
-      assert.equal(new Set(records.map((record) => record.routeKey)).size, 2)
-      assert.equal(new Set(records.map((record) => record.handle)).size, 2)
+      assert.equal(Object.keys(snapshot.active.questions).length, 2)
+      assert.equal(new Set(Object.values(snapshot.active.questions).map((record) => record.routeKey)).size, 2)
+      assert.equal(new Set(Object.values(snapshot.active.questions).map((record) => record.handle)).size, 2)
     } finally {
-      await client.close()
+      await lifecycle.close()
     }
   } finally {
     await terminateChild(child)

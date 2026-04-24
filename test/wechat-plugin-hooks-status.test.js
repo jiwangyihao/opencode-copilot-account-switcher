@@ -257,12 +257,6 @@ serialTest("plugin-hooks 不再把实例初始化当作第二条 eager broker �
               pendingCommands: [],
             }
           },
-          registerInstance: async () => ({
-            sessionToken: "plugin-live-session",
-            registeredAt: 1_700_000_100_000,
-            registrationEpoch: "plugin-live-epoch",
-            brokerPid: process.pid,
-          }),
           ping: async () => {
             pingCalls += 1
             return {}
@@ -692,12 +686,6 @@ serialTest("bridge lifecycle registerHello 生成的 instanceID 应按进程唯�
           pendingCommands: [],
         }
       },
-      registerInstance: async () => ({
-        sessionToken: "bridge-instance-id-session",
-        registeredAt: 1_700_000_100_000,
-        registrationEpoch: "bridge-instance-id-epoch",
-        brokerPid: process.pid,
-      }),
       ping: async () => ({ type: "pong", payload: {} }),
       close: async () => {},
     }),
@@ -747,12 +735,6 @@ serialTest("bridge lifecycle steady keepalive 使用 ping，close 清理且幂�
           needFullSync: false,
         },
         pendingCommands: [],
-      }),
-      registerInstance: async () => ({
-        sessionToken: "steady-keepalive-session",
-        registeredAt: 1_700_000_100_000,
-        registrationEpoch: "steady-keepalive-epoch",
-        brokerPid: process.pid,
       }),
       ping: async () => {
         pingCalls += 1
@@ -873,12 +855,6 @@ serialTest("bridge lifecycle ping 失败后会重连 broker，但不会假定 fu
             pendingCommands: [],
           }
         },
-        registerInstance: async () => ({
-          sessionToken: `reconnect-session-${currentConnect}`,
-          registeredAt: 1_700_000_100_000 + currentConnect,
-          registrationEpoch: `reconnect-epoch-${currentConnect}`,
-          brokerPid: process.pid,
-        }),
         ping: async () => {
           if (currentConnect === 1) {
             throw new Error("broker connection closed")

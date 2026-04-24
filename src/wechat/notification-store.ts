@@ -1,6 +1,5 @@
 import path from "node:path"
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises"
-import { readDeadLetter } from "./dead-letter-store.js"
 import {
   WECHAT_FILE_MODE,
   ensureWechatStateLayout,
@@ -15,8 +14,6 @@ import {
 } from "./notification-types.js"
 import { normalizeHandle } from "./handle.js"
 import { normalizeRequestPromptSummary } from "./question-interaction.js"
-import { findRequestByRouteKey } from "./request-store.js"
-import { isLiveTokenState, readTokenState } from "./token-store.js"
 import type { RequestTerminalReason } from "./request-store.js"
 
 type NotificationStoreTestHooks = {
@@ -292,8 +289,7 @@ function toRecord(input: unknown): NotificationRecord {
 async function readNotification(idempotencyKey: string): Promise<NotificationRecord> {
   try {
     const raw = await readFile(notificationStatePath(idempotencyKey), "utf8")
-    const parsed = toRecord(JSON.parse(raw))
-    const record = await backfillNotificationScopeKey(parsed)
+    const record = toRecord(JSON.parse(raw))
     if (record.idempotencyKey !== idempotencyKey) {
       throw new Error("invalid notification record format")
     }
@@ -304,63 +300,6 @@ async function readNotification(idempotencyKey: string): Promise<NotificationRec
     if (error instanceof Error && error.message === "invalid notification record format") throw error
     throw new Error("invalid notification record format")
   }
-}
-
-async function readNotificationSnapshot(idempotencyKey: string): Promise<NotificationRecord> {
-  const raw = await readFile(notificationStatePath(idempotencyKey), "utf8")
-  return toRecord(JSON.parse(raw))
-}
-
-async function backfillNotificationScopeKey(record: NotificationRecord): Promise<NotificationRecord> {
-  if (
-    record.kind === "sessionError"
-    || record.kind === "naturalStop"
-    || !isNonEmptyString(record.routeKey)
-    || isNonEmptyString(record.scopeKey)
-  ) {
-    return record
-  }
-
-  const requestKind = record.kind === "requestTerminal" ? record.requestKind : record.kind
-  if (!isRequestNotificationKind(requestKind)) {
-    return record
-  }
-
-  const request = await findRequestByRouteKey({
-    kind: requestKind,
-    routeKey: record.routeKey,
-  }).catch(() => undefined)
-  const fallbackScopeKey = request?.scopeKey
-    ?? await readDeadLetter(requestKind, record.routeKey)
-      .then((deadLetter) => deadLetter?.scopeKey ?? deadLetter?.instanceID)
-      .catch(() => undefined)
-
-  if (!isNonEmptyString(fallbackScopeKey)) {
-    return record
-  }
-
-  await notificationStoreTestHooks?.beforePersistBackfilledScopeKey?.({
-    record,
-    scopeKey: fallbackScopeKey,
-  })
-
-  const current = await readNotificationSnapshot(record.idempotencyKey)
-  if (current.kind === "sessionError" || current.kind === "naturalStop") {
-    return current
-  }
-  if (isNonEmptyString(current.scopeKey)) {
-    return current
-  }
-
-  const enriched = {
-    ...current,
-    scopeKey: fallbackScopeKey,
-  }
-  if (!sameNotificationSnapshot(current, record)) {
-    return enriched
-  }
-  await writeNotification(enriched)
-  return enriched
 }
 
 export function setNotificationStoreTestHooks(hooks: NotificationStoreTestHooks | undefined): void {
@@ -507,16 +446,6 @@ export async function upsertNotification(
 
   try {
     const current = await readNotification(input.idempotencyKey)
-    if (current.status === "failed") {
-      const tokenState = await readTokenState(input.wechatAccountId, input.userId).catch(() => undefined)
-      if (isLiveTokenState(tokenState)) {
-        return writeNotification({
-          ...input,
-          status: initialStatus,
-          ...(initialStatus === "suppressed" ? { suppressedAt: options.suppressedAt } : {}),
-        })
-      }
-    }
     return current
   } catch (error) {
     const issue = error as NodeJS.ErrnoException

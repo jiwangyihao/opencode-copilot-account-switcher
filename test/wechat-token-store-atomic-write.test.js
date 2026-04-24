@@ -21,7 +21,7 @@ test("测试隔离会显式固定 WECHAT_STATE_ROOT_OVERRIDE", () => {
   assert.equal(process.env.WECHAT_STATE_ROOT_OVERRIDE, statePaths.wechatStateRoot())
 })
 
-test("readTokenState() 在 upsertInboundToken() 写入进行中不会读到半截 JSON", async () => {
+test("readTokenState() 在 upsertInboundToken() 写入进行中不会读到半截 JSON，也不会回退旧 live token 文件", async () => {
   await statePaths.ensureWechatStateLayout()
 
   const wechatAccountId = "wx-atomic"
@@ -81,7 +81,10 @@ test("readTokenState() 在 upsertInboundToken() 写入进行中不会读到半�
     await partialWriteObserved
 
     const duringWrite = await tokenStore.readTokenState(wechatAccountId, userId)
-    assert.deepEqual(duringWrite, oldState)
+    assert.equal(duringWrite, undefined)
+
+    const persistedDuringWrite = JSON.parse(await fsPromises.readFile(filePath, "utf8"))
+    assert.deepEqual(persistedDuringWrite, oldState)
 
     releaseWrite()
 

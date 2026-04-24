@@ -11,9 +11,15 @@ import {
 } from "./broker-server.js"
 import {
   prepareBrokerStateStoreForStartup,
+  loadBrokerStateStoreForMutation,
+  persistBrokerStateStoreSnapshot,
   readBrokerAuthoritativeView as readLiveBrokerAuthoritativeView,
   readBrokerCommandStateByAction as readLiveBrokerCommandStateByAction,
+  readBrokerIndexedRequest,
+  readLegacyHandleClosure,
   readBrokerStateUpgradeCloseReason,
+  upsertBrokerIndexedRequest,
+  writeLegacyHandleClosure,
   type BrokerAuthoritativeView,
   type BrokerCommandActionInput,
   type BrokerCommandRecord,
@@ -43,20 +49,11 @@ import {
 import {
   commitPreparedRecoveryRequestReopen,
   findRequestByRouteKey,
-  findOpenRequestByHandle,
-  findTerminalRequestByHandle,
-  markRequestAnswered,
-  markRequestRejected,
   prepareRecoveryRequestReopen,
   rollbackPreparedRecoveryRequestReopen,
 } from "./request-store.js"
 import {
-  findActiveNaturalStopByHandle,
-  findSentNotificationByRequest,
-  findTerminalNaturalStopByHandle,
   listPendingNotifications,
-  markNaturalStopTerminal,
-  markNotificationResolved,
 } from "./notification-store.js"
 import {
   createBrokerMutationQueue,
@@ -65,7 +62,7 @@ import {
   type RecoveryMutation,
 } from "./broker-mutation-queue.js"
 import { buildQuestionAnswersFromReply } from "./question-interaction.js"
-import { formatNaturalStopClosedText, formatTerminalRequestClosedText } from "./notification-format.js"
+import { formatBrokerLegacyHandleClosureText } from "./notification-format.js"
 import { formatAggregatedStatusReplyFromBrokerView } from "./status-format.js"
 
 type ReplyMutationResult = {
@@ -295,6 +292,21 @@ function toErrorMessage(error: unknown): string {
   return String(error)
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null) {
+    return {}
+  }
+  return value as Record<string, unknown>
+}
+
+function readNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
 function getSdkMutationError(result: unknown): string | undefined {
   if (!result || typeof result !== "object") {
     return undefined
@@ -466,77 +478,120 @@ export function createBrokerWechatSlashCommandHandler(input: {
     }
   }
 
-  const findOpenRequestSafely = async (requestInput: {
-    kind: "question" | "permission"
-    handle: string
-  }) => {
-    try {
-      return await findOpenRequestByHandle(requestInput)
-    } catch (error) {
-      if (isInvalidHandleError(error)) {
-        return undefined
-      }
-      throw error
+  const readCurrentBrokerView = async (): Promise<BrokerAuthoritativeView> => {
+    const brokerView = await Promise.resolve(readBrokerAuthoritativeView())
+    if (brokerView) {
+      return brokerView
+    }
+    return {
+      connections: {},
+      active: {
+        instances: {},
+        sessions: {},
+        questions: {},
+        permissions: {},
+        naturalStops: {},
+        retryErrors: {},
+      },
+      terminalMetadata: {},
+      retainedOccupancy: {},
+      commandLedger: {},
+      legacyHandleClosures: {},
     }
   }
 
-  const findTerminalRequestSafely = async (requestInput: {
-    kind: "question" | "permission"
-    handle: string
-  }) => {
-    try {
-      return await findTerminalRequestByHandle(requestInput)
-    } catch (error) {
-      if (isInvalidHandleError(error)) {
-        return undefined
-      }
-      throw error
+  const findActiveRequestByHandle = async (kind: "question" | "permission", handle: string) => {
+    if (typeof handle !== "string" || handle.trim().length === 0) {
+      return undefined
     }
+    const brokerView = await readCurrentBrokerView()
+    const records = kind === "question" ? brokerView.active.questions : brokerView.active.permissions
+    return Object.values(records)
+      .map((item) => asRecord(item))
+      .find((item) => readNonEmptyString(item.handle) === handle)
   }
 
-  const findActiveNaturalStopSafely = async (handle: string) => {
-    try {
-      return await findActiveNaturalStopByHandle({ handle })
-    } catch (error) {
-      if (isInvalidHandleError(error)) {
-        return undefined
-      }
-      throw error
+  const findLegacyRequestClosureByHandle = async (kind: "question" | "permission", handle: string) => {
+    if (typeof handle !== "string" || handle.trim().length === 0) {
+      return undefined
     }
+    const brokerView = await readCurrentBrokerView()
+    const closure = brokerView.legacyHandleClosures[handle] ?? readLegacyHandleClosure(undefined, { kind, handle })
+    if (closure?.kind === kind) {
+      return closure
+    }
+    return undefined
   }
 
-  const findTerminalNaturalStopSafely = async (handle: string) => {
-    try {
-      return await findTerminalNaturalStopByHandle({ handle })
-    } catch (error) {
-      if (isInvalidHandleError(error)) {
-        return undefined
-      }
-      throw error
+  const findActiveNaturalStopByHandle = async (handle: string) => {
+    if (typeof handle !== "string" || handle.trim().length === 0) {
+      return undefined
     }
+    const brokerView = await readCurrentBrokerView()
+    const naturalStop = brokerView.active.naturalStops[handle]
+    return naturalStop ? asRecord(naturalStop) : undefined
   }
 
-  const resolveNotificationForOpenRequest = async (request: {
+  const findLegacyNaturalStopClosureByHandle = async (handle: string) => {
+    if (typeof handle !== "string" || handle.trim().length === 0) {
+      return undefined
+    }
+    const brokerView = await readCurrentBrokerView()
+    const closure = brokerView.legacyHandleClosures[handle] ?? readLegacyHandleClosure(undefined, { kind: "naturalStop", handle })
+    if (closure?.kind === "naturalStop") {
+      return closure
+    }
+    return undefined
+  }
+
+  const persistAuthoritativeRequestTerminal = async (input: {
     kind: "question" | "permission"
     routeKey: string
+    openRecord: Record<string, unknown>
+    status: "answered" | "rejected"
+  }) => {
+    const finalizedAt = Date.now()
+    const brokerState = await loadBrokerStateStoreForMutation()
+    const current = await readBrokerIndexedRequest({ kind: input.kind, routeKey: input.routeKey }, brokerState)
+    const requestID = current?.requestID ?? readNonEmptyString(input.openRecord.requestID)
+    const handle = current?.handle ?? readNonEmptyString(input.openRecord.handle)
+    const wechatAccountId = current?.wechatAccountId ?? readNonEmptyString(input.openRecord.wechatAccountId)
+    const userId = current?.userId ?? readNonEmptyString(input.openRecord.userId)
+    const createdAt = current?.createdAt ?? readFiniteNumber(input.openRecord.createdAt)
+
+    if (!requestID || !handle || !wechatAccountId || !userId || createdAt === undefined) {
+      return
+    }
+
+    upsertBrokerIndexedRequest(brokerState, {
+      kind: input.kind,
+      requestID,
+      routeKey: input.routeKey,
+      handle,
+      ...(current?.scopeKey ? { scopeKey: current.scopeKey } : readNonEmptyString(input.openRecord.scopeKey) ? { scopeKey: readNonEmptyString(input.openRecord.scopeKey) } : {}),
+      ...(current?.prompt !== undefined ? { prompt: current.prompt } : Object.hasOwn(input.openRecord, "prompt") ? { prompt: input.openRecord.prompt } : {}),
+      wechatAccountId,
+      userId,
+      status: input.status,
+      createdAt,
+      ...(input.status === "answered" ? { answeredAt: finalizedAt } : { rejectedAt: finalizedAt }),
+      terminalReason: input.status,
+      terminalResultSent: current?.terminalResultSent === true,
+    })
+    await persistBrokerStateStoreSnapshot(brokerState)
+  }
+
+  const persistAuthoritativeNaturalStopReply = async (input: {
     handle: string
   }) => {
-    try {
-      const sentNotification = await findSentNotificationByRequest({
-        kind: request.kind,
-        routeKey: request.routeKey,
-        handle: request.handle,
-      })
-      if (!sentNotification) {
-        return
-      }
-      await markNotificationResolved({
-        idempotencyKey: sentNotification.idempotencyKey,
-        resolvedAt: Date.now(),
-      })
-    } catch {
-      // best-effort only: notification resolve failure should not fail slash reply
-    }
+    const brokerState = await loadBrokerStateStoreForMutation()
+    delete brokerState.active.naturalStops[input.handle]
+    writeLegacyHandleClosure(brokerState, {
+      kind: "naturalStop",
+      handle: input.handle,
+      reason: "replied",
+    })
+    await persistBrokerStateStoreSnapshot(brokerState)
   }
 
   const commandStatusMessage = (status: BrokerCommandRecord["status"]): string | undefined => {
@@ -560,59 +615,41 @@ export function createBrokerWechatSlashCommandHandler(input: {
     return "unknown"
   }
 
-  const finalizeQuestionReply = async (openQuestion: {
+  const finalizeQuestionReply = async (openQuestion: Record<string, unknown> & {
     routeKey: string
     handle: string
   }) => {
-    await markRequestAnswered({
+    await persistAuthoritativeRequestTerminal({
       kind: "question",
       routeKey: openQuestion.routeKey,
-      answeredAt: Date.now(),
-    })
-    await resolveNotificationForOpenRequest({
-      kind: "question",
-      routeKey: openQuestion.routeKey,
-      handle: openQuestion.handle,
+      openRecord: asRecord(openQuestion),
+      status: "answered",
     })
     return `已回复问题：${openQuestion.handle}`
   }
 
   const finalizePermissionReply = async (
-    openPermission: {
+    openPermission: Record<string, unknown> & {
       routeKey: string
       handle: string
     },
     reply: "once" | "always" | "reject",
   ) => {
-    if (reply === "reject") {
-      await markRequestRejected({
-        kind: "permission",
-        routeKey: openPermission.routeKey,
-        rejectedAt: Date.now(),
-      })
-    } else {
-      await markRequestAnswered({
-        kind: "permission",
-        routeKey: openPermission.routeKey,
-        answeredAt: Date.now(),
-      })
-    }
-    await resolveNotificationForOpenRequest({
+    await persistAuthoritativeRequestTerminal({
       kind: "permission",
       routeKey: openPermission.routeKey,
-      handle: openPermission.handle,
+      openRecord: asRecord(openPermission),
+      status: reply === "reject" ? "rejected" : "answered",
     })
     return `已处理权限请求：${openPermission.handle} (${reply})`
   }
 
   const finalizeNaturalStopReply = async (openNaturalStop: {
-    idempotencyKey: string
+    idempotencyKey?: string
     handle?: string
   }, handle: string) => {
-    await markNaturalStopTerminal({
-      idempotencyKey: openNaturalStop.idempotencyKey,
-      resolvedAt: Date.now(),
-      terminalReason: "replied",
+    await persistAuthoritativeNaturalStopReply({
+      handle: readNonEmptyString(openNaturalStop.handle) ?? handle,
     })
     return `已回复中止通知：${openNaturalStop.handle ?? handle}`
   }
@@ -807,27 +844,19 @@ export function createBrokerWechatSlashCommandHandler(input: {
     }
 
     if (command.type === "reply") {
-      const openQuestion = await findOpenRequestSafely({
-        kind: "question",
-        handle: command.handle,
-      })
+      const openQuestion = await findActiveRequestByHandle("question", command.handle)
       if (!openQuestion) {
-        const terminalQuestion = await findTerminalRequestSafely({
-          kind: "question",
-          handle: command.handle,
-        })
+        const terminalQuestion = await findLegacyRequestClosureByHandle("question", command.handle)
         if (terminalQuestion) {
-          return formatTerminalRequestClosedText({
-            requestKind: "question",
-            handle: terminalQuestion.handle,
-            terminalReason: terminalQuestion.terminalReason,
-            replacementHandle: terminalQuestion.replacementHandle,
-          })
+          return formatBrokerLegacyHandleClosureText(terminalQuestion)
         }
-        const openNaturalStop = await findActiveNaturalStopSafely(command.handle)
+        const openNaturalStop = await findActiveNaturalStopByHandle(command.handle)
         if (openNaturalStop) {
-          const instanceID = openNaturalStop.replyTarget?.instanceID ?? openNaturalStop.scopeKey
-          const sessionID = openNaturalStop.replyTarget?.sessionID ?? openNaturalStop.sessionID
+          const replyTarget = asRecord(openNaturalStop.replyTarget)
+          const instanceID = readNonEmptyString(replyTarget.instanceID)
+            ?? readNonEmptyString(openNaturalStop.scopeKey)
+            ?? readNonEmptyString(openNaturalStop.instanceID)
+          const sessionID = readNonEmptyString(replyTarget.sessionID) ?? readNonEmptyString(openNaturalStop.sessionID)
           if (!instanceID || !sessionID) {
             return `回复中止通知失败：bridge unavailable`
           }
@@ -862,7 +891,7 @@ export function createBrokerWechatSlashCommandHandler(input: {
                 instanceID,
                 mutationId,
                 sessionID,
-                handle: openNaturalStop.handle ?? command.handle,
+                handle: readNonEmptyString(openNaturalStop.handle) ?? command.handle,
                 text: command.text,
               })
             } catch (error) {
@@ -879,12 +908,9 @@ export function createBrokerWechatSlashCommandHandler(input: {
           return finalizeNaturalStopReply(openNaturalStop, command.handle)
         }
 
-        const terminalNaturalStop = await findTerminalNaturalStopSafely(command.handle)
+        const terminalNaturalStop = await findLegacyNaturalStopClosureByHandle(command.handle)
         if (terminalNaturalStop) {
-          return formatNaturalStopClosedText({
-            handle: terminalNaturalStop.handle,
-            terminalReason: terminalNaturalStop.naturalStopTerminalReason,
-          })
+          return formatBrokerLegacyHandleClosureText(terminalNaturalStop)
         }
         const upgradeCloseReason = await readBrokerStateUpgradeCloseReason(command.handle)
         if (upgradeCloseReason) {
@@ -892,25 +918,35 @@ export function createBrokerWechatSlashCommandHandler(input: {
         }
         return `未找到待回复问题：${command.handle}`
       }
+      const questionRequestID = readNonEmptyString(openQuestion.requestID)
+      const questionRouteKey = readNonEmptyString(openQuestion.routeKey)
+      const questionHandle = readNonEmptyString(openQuestion.handle) ?? command.handle
+      const questionInstanceID = readNonEmptyString(openQuestion.scopeKey) ?? readNonEmptyString(openQuestion.instanceID)
       let answers: QuestionAnswer[]
       try {
+        const prompt = openQuestion.prompt
         answers = buildQuestionAnswersFromReply(
-          openQuestion.prompt && "mode" in openQuestion.prompt ? openQuestion.prompt : undefined,
+          prompt && typeof prompt === "object" && prompt !== null && "mode" in prompt
+            ? prompt as Parameters<typeof buildQuestionAnswersFromReply>[0]
+            : undefined,
           command.text,
         )
       } catch (error) {
         return error instanceof Error ? error.message : "问题回复格式无效"
       }
+      if (!questionRequestID) {
+        return `回复问题失败：bridge unavailable`
+      }
 
-      const commandState = openQuestion.scopeKey
+      const commandState = questionInstanceID && questionRequestID
         ? await readBrokerCommandStateByAction({
             type: "replyQuestion",
             target: {
-              instanceID: openQuestion.scopeKey,
-              requestID: openQuestion.requestID,
+              instanceID: questionInstanceID,
+              requestID: questionRequestID,
             },
             payload: {
-              requestID: openQuestion.requestID,
+              requestID: questionRequestID,
               answers,
             },
           })
@@ -920,7 +956,10 @@ export function createBrokerWechatSlashCommandHandler(input: {
         return pendingMessage
       }
       if (commandState?.status === "completed") {
-        return finalizeQuestionReply(openQuestion)
+        if (!questionRouteKey) {
+          return `已回复问题：${questionHandle}`
+        }
+        return finalizeQuestionReply({ ...openQuestion, routeKey: questionRouteKey, handle: questionHandle })
       }
       if (commandState?.status === "failed") {
         return `回复问题失败：${readCommandFailureMessage(commandState)}`
@@ -929,14 +968,14 @@ export function createBrokerWechatSlashCommandHandler(input: {
       const mutationId = `reply-question-${Date.now()}-${Math.random().toString(16).slice(2)}`
       let result: ReplyMutationResult
       if (input.sendReplyQuestionRpc) {
-        if (!openQuestion.scopeKey) {
+        if (!questionInstanceID || !questionRequestID) {
           return `回复问题失败：bridge unavailable`
         }
         try {
           result = await input.sendReplyQuestionRpc({
-            instanceID: openQuestion.scopeKey,
+            instanceID: questionInstanceID,
             mutationId,
-            requestID: openQuestion.requestID,
+            requestID: questionRequestID,
             answers,
           })
         } catch (error) {
@@ -944,7 +983,7 @@ export function createBrokerWechatSlashCommandHandler(input: {
         }
       } else {
         const replyResult = await input.client?.question?.reply?.(withOptionalDirectory({
-          requestID: openQuestion.requestID,
+          requestID: questionRequestID,
           answers,
         }, input.directory))
         const replyError = getSdkMutationError(replyResult)
@@ -955,7 +994,10 @@ export function createBrokerWechatSlashCommandHandler(input: {
       if (result.ok !== true) {
         return `回复问题失败：${result.errorMessage ?? "unknown"}`
       }
-      return finalizeQuestionReply(openQuestion)
+      if (!questionRouteKey) {
+        return `已回复问题：${questionHandle}`
+      }
+      return finalizeQuestionReply({ ...openQuestion, routeKey: questionRouteKey, handle: questionHandle })
     }
 
     if (command.type === "recover") {
@@ -1048,22 +1090,11 @@ export function createBrokerWechatSlashCommandHandler(input: {
       return `已恢复请求：${result.recovered.handle}`
     }
 
-    const openPermission = await findOpenRequestSafely({
-      kind: "permission",
-      handle: command.handle,
-    })
+    const openPermission = await findActiveRequestByHandle("permission", command.handle)
     if (!openPermission) {
-      const terminalPermission = await findTerminalRequestSafely({
-        kind: "permission",
-        handle: command.handle,
-      })
+      const terminalPermission = await findLegacyRequestClosureByHandle("permission", command.handle)
       if (terminalPermission) {
-        return formatTerminalRequestClosedText({
-          requestKind: "permission",
-          handle: terminalPermission.handle,
-          terminalReason: terminalPermission.terminalReason,
-          replacementHandle: terminalPermission.replacementHandle,
-        })
+        return formatBrokerLegacyHandleClosureText(terminalPermission)
       }
       const upgradeCloseReason = await readBrokerStateUpgradeCloseReason(command.handle)
       if (upgradeCloseReason) {
@@ -1072,15 +1103,23 @@ export function createBrokerWechatSlashCommandHandler(input: {
       return `未找到待处理权限请求：${command.handle}`
     }
 
-    const commandState = openPermission.scopeKey
+    const permissionRequestID = readNonEmptyString(openPermission.requestID)
+    const permissionRouteKey = readNonEmptyString(openPermission.routeKey)
+    const permissionHandle = readNonEmptyString(openPermission.handle) ?? command.handle
+    const permissionInstanceID = readNonEmptyString(openPermission.scopeKey) ?? readNonEmptyString(openPermission.instanceID)
+    if (!permissionRequestID) {
+      return `处理权限请求失败：bridge unavailable`
+    }
+
+    const commandState = permissionInstanceID && permissionRequestID
       ? await readBrokerCommandStateByAction({
           type: "replyPermission",
           target: {
-            instanceID: openPermission.scopeKey,
-            requestID: openPermission.requestID,
+            instanceID: permissionInstanceID,
+            requestID: permissionRequestID,
           },
           payload: {
-            requestID: openPermission.requestID,
+            requestID: permissionRequestID,
             reply: command.reply,
             ...(command.message ? { message: command.message } : {}),
           },
@@ -1091,7 +1130,10 @@ export function createBrokerWechatSlashCommandHandler(input: {
       return pendingMessage
     }
     if (commandState?.status === "completed") {
-      return finalizePermissionReply(openPermission, command.reply)
+      if (!permissionRouteKey) {
+        return `已处理权限请求：${permissionHandle} (${command.reply})`
+      }
+      return finalizePermissionReply({ ...openPermission, routeKey: permissionRouteKey, handle: permissionHandle }, command.reply)
     }
     if (commandState?.status === "failed") {
       return `处理权限请求失败：${readCommandFailureMessage(commandState)}`
@@ -1100,14 +1142,14 @@ export function createBrokerWechatSlashCommandHandler(input: {
     const mutationId = `reply-permission-${Date.now()}-${Math.random().toString(16).slice(2)}`
     let result: ReplyMutationResult
     if (input.sendReplyPermissionRpc) {
-      if (!openPermission.scopeKey) {
+      if (!permissionInstanceID || !permissionRequestID) {
         return `处理权限请求失败：bridge unavailable`
       }
       try {
         result = await input.sendReplyPermissionRpc({
-          instanceID: openPermission.scopeKey,
+          instanceID: permissionInstanceID,
           mutationId,
-          requestID: openPermission.requestID,
+          requestID: permissionRequestID,
           reply: command.reply,
           ...(command.message ? { message: command.message } : {}),
         })
@@ -1116,7 +1158,7 @@ export function createBrokerWechatSlashCommandHandler(input: {
       }
     } else {
       const permissionReplyResult = await input.client?.permission?.reply?.(withOptionalDirectory({
-        requestID: openPermission.requestID,
+        requestID: permissionRequestID,
         reply: command.reply,
         ...(command.message ? { message: command.message } : {}),
       }, input.directory))
@@ -1129,10 +1171,13 @@ export function createBrokerWechatSlashCommandHandler(input: {
       return `处理权限请求失败：${result.errorMessage ?? "unknown"}`
     }
     await input.permissionMutationTestHooks?.beforeFinalizePermission?.({
-      routeKey: openPermission.routeKey,
-      handle: openPermission.handle,
+      routeKey: permissionRouteKey ?? "",
+      handle: permissionHandle,
     })
-    return finalizePermissionReply(openPermission, command.reply)
+    if (!permissionRouteKey) {
+      return `已处理权限请求：${permissionHandle} (${command.reply})`
+    }
+    return finalizePermissionReply({ ...openPermission, routeKey: permissionRouteKey, handle: permissionHandle }, command.reply)
   }
 }
 
@@ -1201,13 +1246,17 @@ export function createBrokerWechatStatusRuntimeLifecycle(
           const immutableScopeKey = typeof failure.scopeKey === "string" && failure.scopeKey.trim().length > 0
             ? failure.scopeKey
             : undefined
-          const request = !immutableScopeKey && requestKind && typeof failure.routeKey === "string" && failure.routeKey.trim().length > 0
-            ? await findRequestByRouteKey({
-                kind: requestKind,
-                routeKey: failure.routeKey,
-              })
+          const brokerView = !immutableScopeKey && requestKind && typeof failure.routeKey === "string" && failure.routeKey.trim().length > 0
+            ? readLiveBrokerAuthoritativeView()
             : undefined
-          const instanceID = immutableScopeKey ?? request?.scopeKey
+          const authoritativeRequest = brokerView
+            ? Object.values(requestKind === "question" ? brokerView.active.questions : brokerView.active.permissions)
+                .map((item) => asRecord(item))
+                .find((item) => readNonEmptyString(item.routeKey) === failure.routeKey)
+            : undefined
+          const instanceID = immutableScopeKey
+            ?? readNonEmptyString(authoritativeRequest?.scopeKey)
+            ?? readNonEmptyString(authoritativeRequest?.instanceID)
           if (!instanceID) {
             return
           }

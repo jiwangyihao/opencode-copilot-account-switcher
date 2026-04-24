@@ -2,6 +2,12 @@ import path from "node:path"
 import { randomUUID } from "node:crypto"
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { WECHAT_FILE_MODE, ensureWechatStateLayout, tokenStatePath } from "./state-paths.js"
+import {
+  loadBrokerStateStoreForMutation,
+  persistBrokerStateStoreSnapshot,
+  readBrokerDeliveryToken,
+  upsertBrokerDeliveryToken,
+} from "./broker-state-store.js"
 
 export type TokenSource = "question" | "permission" | "message"
 
@@ -141,10 +147,18 @@ async function writeTokenState(key: TokenKey, state: TokenState) {
     throw error
   }
 
-  return normalizeTokenState(state)
+  const normalized = normalizeTokenState(state)
+  const brokerState = await loadBrokerStateStoreForMutation()
+  upsertBrokerDeliveryToken(brokerState, {
+    ...safeKey,
+    ...normalized,
+  })
+  await persistBrokerStateStoreSnapshot(brokerState)
+
+  return normalized
 }
 
-export async function readTokenState(wechatAccountId: string, userId: string): Promise<TokenState | undefined> {
+async function readPersistedTokenStateFile(wechatAccountId: string, userId: string): Promise<TokenState | undefined> {
   try {
     const safeKey = toTokenKey({ wechatAccountId, userId })
     const raw = await readFile(tokenStatePath(safeKey.wechatAccountId, safeKey.userId), "utf8")
@@ -155,6 +169,25 @@ export async function readTokenState(wechatAccountId: string, userId: string): P
     if (error instanceof Error && error.message === "invalid token state format") throw error
     throw new Error("invalid token state format")
   }
+}
+
+export async function readTokenState(wechatAccountId: string, userId: string): Promise<TokenState | undefined> {
+  const brokerToken = await readBrokerDeliveryToken({ wechatAccountId, userId })
+  if (brokerToken) {
+    return normalizeTokenState({
+      contextToken: brokerToken.contextToken,
+      updatedAt: brokerToken.updatedAt,
+      source: brokerToken.source,
+      sourceRef: brokerToken.sourceRef,
+      staleReason: brokerToken.staleReason,
+    })
+  }
+
+  const persisted = await readPersistedTokenStateFile(wechatAccountId, userId)
+  if (persisted) {
+    return undefined
+  }
+  return undefined
 }
 
 export function isLiveTokenState(state: TokenState | undefined): state is TokenState {
@@ -183,6 +216,9 @@ export async function markTokenStale(input: TokenKey & { staleReason: string }):
   let current: TokenState | undefined
   try {
     current = await readTokenState(safeKey.wechatAccountId, safeKey.userId)
+    if (!current) {
+      current = await readPersistedTokenStateFile(safeKey.wechatAccountId, safeKey.userId)
+    }
   } catch (error) {
     if (error instanceof Error && error.message === "invalid token state format") {
       current = undefined

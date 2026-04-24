@@ -47,6 +47,7 @@ export type BrokerConnectionState = {
   lastEventSeq: number
   lastAckedEventSeq: number
   lastSentBrokerSeq: number
+  lastObservedAt?: number
   connectedAt?: number
   disconnectedAt?: number
   disconnectReason?: string
@@ -71,11 +72,78 @@ export type BrokerTerminalMetadata = {
   replacementHandle?: string
   terminalResultSent?: boolean
   retainedUntil?: number
+  handle?: string
+  requestID?: string
+  scopeKey?: string
+  prompt?: unknown
+  wechatAccountId?: string
+  userId?: string
+  createdAt?: number
+  answeredAt?: number
+  rejectedAt?: number
+  expiredAt?: number
+  cleanedAt?: number
 }
 
 export type BrokerRetainedOccupancy = {
   handle: string
   retainedUntil: number
+}
+
+export type BrokerIndexedRequestRecord = {
+  kind: "question" | "permission"
+  requestID: string
+  routeKey: string
+  handle: string
+  scopeKey?: string
+  prompt?: unknown
+  wechatAccountId: string
+  userId: string
+  status: "open" | "answered" | "rejected" | "expired" | "cleaned"
+  createdAt: number
+  answeredAt?: number
+  rejectedAt?: number
+  expiredAt?: number
+  cleanedAt?: number
+  terminalReason?: "answered" | "rejected" | "expired" | "replaced"
+  replacementHandle?: string
+  terminalResultSent?: boolean
+}
+
+export type BrokerDeliveryTokenState = {
+  wechatAccountId: string
+  userId: string
+  contextToken: string
+  updatedAt: number
+  source: "question" | "permission" | "message"
+  sourceRef?: string
+  staleReason?: string
+}
+
+export type BrokerRuntimeExpiredRequest = BrokerIndexedRequestRecord
+
+export type BrokerRuntimeClosedNaturalStop = {
+  handle: string
+  scopeKey?: string
+  idempotencyKey?: string
+  terminalReason: string
+}
+
+export type BrokerRuntimeCleanupResult = {
+  cleanedRequests: BrokerIndexedRequestRecord[]
+  purgedRequests: BrokerIndexedRequestRecord[]
+}
+
+export type BrokerLegacyHandleKind = "question" | "permission" | "naturalStop"
+
+export type BrokerLegacyHandleClosure = {
+  kind: BrokerLegacyHandleKind
+  handle: string
+  reason: string
+  message?: string
+  replacementHandle?: string
+  routeKey?: string
+  retainedUntil?: number
 }
 
 export type BrokerCommandRecord = {
@@ -126,6 +194,9 @@ export type BrokerState = {
   active: BrokerActiveState
   terminalMetadata: Record<string, BrokerTerminalMetadata>
   retainedOccupancy: Record<string, BrokerRetainedOccupancy>
+  legacyHandleClosures: Record<string, BrokerLegacyHandleClosure>
+  requestIndex: Record<string, BrokerIndexedRequestRecord>
+  deliveryTokens: Record<string, BrokerDeliveryTokenState>
   commandLedger: Record<string, BrokerCommandRecord>
   controlLedger: Record<string, BrokerControlRecord>
   fullSync: {
@@ -200,6 +271,16 @@ export type MarkBrokerCommandResultInput = {
   failure?: UnknownRecord
 }
 
+export type UpsertRetryErrorSummaryInput = {
+  instanceID: string
+  sessionID?: string
+  action: string
+  redactedSummary: string
+  severityAdvice: string
+  updatedAt?: number
+  instanceIncarnation?: string
+}
+
 export type MarkConnectionAckedEventSeqInput = BrokerAckPayload & {
   instanceID: string
 }
@@ -217,6 +298,8 @@ export type BrokerAuthoritativeView = {
   active: BrokerActiveState
   terminalMetadata: Record<string, BrokerTerminalMetadata>
   retainedOccupancy: Record<string, BrokerRetainedOccupancy>
+  commandLedger: Record<string, BrokerCommandRecord>
+  legacyHandleClosures: Record<string, BrokerLegacyHandleClosure>
 }
 
 export type BrokerCommandActionInput = {
@@ -228,6 +311,7 @@ export type BrokerCommandActionInput = {
 const trackedBrokerStates: BrokerState[] = []
 const trackedBrokerStateTouch = new WeakMap<BrokerState, number>()
 let nextTrackedBrokerStateTouch = 0
+let brokerStateMutationTarget: BrokerState | undefined
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0
@@ -285,11 +369,37 @@ function cloneUnknownValue<T>(value: T): T {
 }
 
 function cloneTerminalMetadataMap(value: Record<string, BrokerTerminalMetadata>) {
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, { ...item }]))
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneUnknownValue(item)]))
 }
 
 function cloneRetainedOccupancyMap(value: Record<string, BrokerRetainedOccupancy>) {
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, { ...item }]))
+}
+
+function cloneLegacyHandleClosure(record: BrokerLegacyHandleClosure): BrokerLegacyHandleClosure {
+  return {
+    ...record,
+  }
+}
+
+function cloneLegacyHandleClosureMap(value: Record<string, BrokerLegacyHandleClosure>) {
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneLegacyHandleClosure(item)]))
+}
+
+function cloneIndexedRequestRecord(record: BrokerIndexedRequestRecord): BrokerIndexedRequestRecord {
+  return cloneUnknownValue(record)
+}
+
+function cloneRequestIndexMap(value: Record<string, BrokerIndexedRequestRecord>) {
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneIndexedRequestRecord(item)]))
+}
+
+function cloneDeliveryTokenState(record: BrokerDeliveryTokenState): BrokerDeliveryTokenState {
+  return { ...record }
+}
+
+function cloneDeliveryTokenMap(value: Record<string, BrokerDeliveryTokenState>) {
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneDeliveryTokenState(item)]))
 }
 
 function normalizeHandleClosures(value: unknown): string[] {
@@ -409,7 +519,7 @@ async function collectLegacyHandleClosures(): Promise<string[]> {
   ])).sort((left, right) => left.localeCompare(right))
 }
 
-function restorePersistedBrokerState(raw: unknown): BrokerState | undefined {
+function restorePersistedBrokerState(raw: unknown, options: { track?: boolean } = {}): BrokerState | undefined {
   if (!isRecord(raw) || !isRecord(raw.connections) || !isRecord(raw.active)) {
     return undefined
   }
@@ -426,7 +536,7 @@ function restorePersistedBrokerState(raw: unknown): BrokerState | undefined {
     return undefined
   }
 
-  const state = createEmptyBrokerState()
+  const state = createEmptyBrokerState({ track: options.track === false ? false : true })
   state.connections = cloneUnknownValue(raw.connections as Record<string, Record<string, BrokerConnectionState>>)
   state.active = cloneUnknownValue(active as BrokerActiveState)
   state.terminalMetadata = isRecord(raw.terminalMetadata)
@@ -434,6 +544,15 @@ function restorePersistedBrokerState(raw: unknown): BrokerState | undefined {
     : {}
   state.retainedOccupancy = isRecord(raw.retainedOccupancy)
     ? cloneUnknownValue(raw.retainedOccupancy as Record<string, BrokerRetainedOccupancy>)
+    : {}
+  state.legacyHandleClosures = isRecord(raw.legacyHandleClosures)
+    ? cloneUnknownValue(raw.legacyHandleClosures as Record<string, BrokerLegacyHandleClosure>)
+    : {}
+  state.requestIndex = isRecord(raw.requestIndex)
+    ? cloneUnknownValue(raw.requestIndex as Record<string, BrokerIndexedRequestRecord>)
+    : {}
+  state.deliveryTokens = isRecord(raw.deliveryTokens)
+    ? cloneUnknownValue(raw.deliveryTokens as Record<string, BrokerDeliveryTokenState>)
     : {}
   state.commandLedger = isRecord(raw.commandLedger)
     ? cloneUnknownValue(raw.commandLedger as Record<string, BrokerCommandRecord>)
@@ -453,7 +572,7 @@ function restorePersistedBrokerState(raw: unknown): BrokerState | undefined {
       ? { lastCompletedInstanceIncarnation: raw.fullSync.lastCompletedInstanceIncarnation }
       : {}),
   }
-  return rememberBrokerState(state)
+  return options.track === false ? state : rememberBrokerState(state)
 }
 
 async function writeBrokerStateStoreSnapshot(state: BrokerState): Promise<void> {
@@ -464,6 +583,29 @@ async function writeBrokerStateStoreSnapshot(state: BrokerState): Promise<void> 
 
 export async function persistBrokerStateStoreSnapshot(state: BrokerState): Promise<void> {
   await writeBrokerStateStoreSnapshot(state)
+}
+
+export async function loadBrokerStateStoreSnapshot(): Promise<BrokerState | undefined> {
+  const raw = await readJsonFile(brokerStateStorePath())
+  const restored = restorePersistedBrokerState(raw, { track: false })
+  if (restored) {
+    return restored
+  }
+
+  return resolveBrokerState()
+}
+
+export async function loadBrokerStateStoreForMutation(): Promise<BrokerState> {
+  if (brokerStateMutationTarget) {
+    return rememberBrokerState(brokerStateMutationTarget)
+  }
+
+  const restored = await loadBrokerStateStoreSnapshot()
+  return restored ? rememberBrokerState(restored) : createEmptyBrokerState()
+}
+
+export function setBrokerStateMutationTarget(state: BrokerState | undefined): void {
+  brokerStateMutationTarget = state ? rememberBrokerState(state) : undefined
 }
 
 export async function readBrokerStateSchemaMarker(): Promise<BrokerStateSchemaMarker | undefined> {
@@ -735,18 +877,66 @@ function requireCommand(state: BrokerState, commandId: string): BrokerCommandRec
   return current
 }
 
-export function createEmptyBrokerState(): BrokerState {
-  return rememberBrokerState({
+export function createEmptyBrokerState(options: { track?: boolean } = {}): BrokerState {
+  const state: BrokerState = {
     connections: {},
     active: createEmptyActiveState(),
     terminalMetadata: {},
     retainedOccupancy: {},
+    legacyHandleClosures: {},
+    requestIndex: {},
+    deliveryTokens: {},
     commandLedger: {},
     controlLedger: {},
     fullSync: {
       stagedByControlId: {},
     },
-  })
+  }
+  return options.track === false ? state : rememberBrokerState(state)
+}
+
+function isLegacyHandleKind(value: unknown): value is BrokerLegacyHandleKind {
+  return value === "question" || value === "permission" || value === "naturalStop"
+}
+
+function toLegacyHandleClosure(input: BrokerLegacyHandleClosure): BrokerLegacyHandleClosure {
+  if (!isLegacyHandleKind(input.kind) || !isNonEmptyString(input.handle) || !isNonEmptyString(input.reason)) {
+    throw new Error("invalid legacy handle closure")
+  }
+
+  return {
+    kind: input.kind,
+    handle: input.handle,
+    reason: input.reason,
+    ...(isNonEmptyString(input.message) ? { message: input.message.trim() } : {}),
+    ...(isNonEmptyString(input.replacementHandle) ? { replacementHandle: input.replacementHandle.trim() } : {}),
+    ...(isNonEmptyString(input.routeKey) ? { routeKey: input.routeKey.trim() } : {}),
+    ...(isSafeInteger(input.retainedUntil) ? { retainedUntil: input.retainedUntil } : {}),
+  }
+}
+
+export function writeLegacyHandleClosure(state: BrokerState, input: BrokerLegacyHandleClosure): BrokerLegacyHandleClosure {
+  rememberBrokerState(state)
+  const next = toLegacyHandleClosure(input)
+  state.legacyHandleClosures[next.handle] = next
+  return next
+}
+
+export function readLegacyHandleClosure(
+  state: BrokerState | undefined,
+  input: { kind: BrokerLegacyHandleKind; handle: string },
+): BrokerLegacyHandleClosure | undefined {
+  if (!isLegacyHandleKind(input.kind) || !isNonEmptyString(input.handle)) {
+    return undefined
+  }
+
+  const resolved = resolveBrokerState(state)
+  const candidate = resolved?.legacyHandleClosures[input.handle]
+  if (!candidate || candidate.kind !== input.kind) {
+    return undefined
+  }
+
+  return cloneLegacyHandleClosure(candidate)
 }
 
 export function applyBridgeEvent<TPayload = unknown>(
@@ -830,6 +1020,10 @@ export function applyBridgeEvent<TPayload = unknown>(
         ...(instanceID ? { instanceID } : {}),
         instanceIncarnation: event.instanceIncarnation,
       }
+      const handle = getStringField(payload, "handle")
+      if (handle) {
+        delete state.legacyHandleClosures[handle]
+      }
       return state
     }
     case "questionClosed": {
@@ -837,7 +1031,7 @@ export function applyBridgeEvent<TPayload = unknown>(
       if (!routeKey) {
         throw new Error("invalid question payload")
       }
-
+      const currentQuestion = isRecord(state.active.questions[routeKey]) ? state.active.questions[routeKey] : undefined
       delete state.active.questions[routeKey]
       const reason = getStringField(payload, "reason")
       if (reason) {
@@ -848,6 +1042,17 @@ export function applyBridgeEvent<TPayload = unknown>(
             ? { terminalResultSent: payload.terminalResultSent }
             : {}),
           ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
+        }
+        const handle = getStringField(payload, "handle") ?? (currentQuestion ? getStringField(currentQuestion, "handle") : undefined)
+        if (handle) {
+          writeLegacyHandleClosure(state, {
+            kind: "question",
+            handle,
+            reason,
+            routeKey,
+            ...(isNonEmptyString(payload.replacementHandle) ? { replacementHandle: payload.replacementHandle } : {}),
+            ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
+          })
         }
       }
       return state
@@ -865,6 +1070,10 @@ export function applyBridgeEvent<TPayload = unknown>(
         ...(instanceID ? { instanceID } : {}),
         instanceIncarnation: event.instanceIncarnation,
       }
+      const handle = getStringField(payload, "handle")
+      if (handle) {
+        delete state.legacyHandleClosures[handle]
+      }
       return state
     }
     case "permissionClosed": {
@@ -872,7 +1081,7 @@ export function applyBridgeEvent<TPayload = unknown>(
       if (!routeKey) {
         throw new Error("invalid permission payload")
       }
-
+      const currentPermission = isRecord(state.active.permissions[routeKey]) ? state.active.permissions[routeKey] : undefined
       delete state.active.permissions[routeKey]
       const reason = getStringField(payload, "reason")
       if (reason) {
@@ -883,6 +1092,17 @@ export function applyBridgeEvent<TPayload = unknown>(
             ? { terminalResultSent: payload.terminalResultSent }
             : {}),
           ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
+        }
+        const handle = getStringField(payload, "handle") ?? (currentPermission ? getStringField(currentPermission, "handle") : undefined)
+        if (handle) {
+          writeLegacyHandleClosure(state, {
+            kind: "permission",
+            handle,
+            reason,
+            routeKey,
+            ...(isNonEmptyString(payload.replacementHandle) ? { replacementHandle: payload.replacementHandle } : {}),
+            ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
+          })
         }
       }
       return state
@@ -899,6 +1119,7 @@ export function applyBridgeEvent<TPayload = unknown>(
         ...(instanceID ? { instanceID } : {}),
         instanceIncarnation: event.instanceIncarnation,
       }
+      delete state.legacyHandleClosures[handle]
       return state
     }
     case "naturalStopClosed": {
@@ -906,7 +1127,7 @@ export function applyBridgeEvent<TPayload = unknown>(
       if (!handle) {
         throw new Error("invalid naturalStop payload")
       }
-
+      const currentNaturalStop = isRecord(state.active.naturalStops[handle]) ? state.active.naturalStops[handle] : undefined
       delete state.active.naturalStops[handle]
       const retainedUntil = getNumberField(payload, "retainedUntil")
       if (retainedUntil !== undefined) {
@@ -914,6 +1135,18 @@ export function applyBridgeEvent<TPayload = unknown>(
           handle,
           retainedUntil,
         }
+      }
+      const reason = getStringField(payload, "reason")
+        ?? getStringField(payload, "terminalReason")
+        ?? getStringField(payload, "naturalStopTerminalReason")
+        ?? (currentNaturalStop ? getStringField(currentNaturalStop, "naturalStopTerminalReason") : undefined)
+      if (reason) {
+        writeLegacyHandleClosure(state, {
+          kind: "naturalStop",
+          handle,
+          reason,
+          ...(retainedUntil !== undefined ? { retainedUntil } : {}),
+        })
       }
       return state
     }
@@ -1094,8 +1327,539 @@ function requireControlRecord(state: BrokerState, controlId: string): BrokerCont
   return current
 }
 
+function createRetryErrorKey(input: Pick<UpsertRetryErrorSummaryInput, "instanceID" | "sessionID">): string {
+  return isNonEmptyString(input.sessionID) ? input.sessionID.trim() : input.instanceID.trim()
+}
+
+function createBrokerRequestIndexKey(input: Pick<BrokerIndexedRequestRecord, "kind" | "routeKey">): string {
+  return `${input.kind}:${input.routeKey}`
+}
+
+function createBrokerDeliveryTokenKey(input: Pick<BrokerDeliveryTokenState, "wechatAccountId" | "userId">): string {
+  return `${input.wechatAccountId}:${input.userId}`
+}
+
+function readBrokerScopeKey(record: Record<string, unknown>): string | undefined {
+  return getStringField(record, "scopeKey") ?? getStringField(record, "instanceID")
+}
+
+function toBrokerIndexedRequestRecord(input: BrokerIndexedRequestRecord): BrokerIndexedRequestRecord {
+  if (
+    (input.kind !== "question" && input.kind !== "permission")
+    || !isNonEmptyString(input.requestID)
+    || !isNonEmptyString(input.routeKey)
+    || !isNonEmptyString(input.handle)
+    || !isNonEmptyString(input.wechatAccountId)
+    || !isNonEmptyString(input.userId)
+    || !isSafeInteger(input.createdAt)
+  ) {
+    throw new Error("invalid broker indexed request")
+  }
+
+  if (!["open", "answered", "rejected", "expired", "cleaned"].includes(input.status)) {
+    throw new Error("invalid broker indexed request")
+  }
+
+  return cloneUnknownValue({
+    kind: input.kind,
+    requestID: input.requestID,
+    routeKey: input.routeKey,
+    handle: input.handle,
+    ...(isNonEmptyString(input.scopeKey) ? { scopeKey: input.scopeKey } : {}),
+    ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
+    wechatAccountId: input.wechatAccountId,
+    userId: input.userId,
+    status: input.status,
+    createdAt: input.createdAt,
+    ...(isSafeInteger(input.answeredAt) ? { answeredAt: input.answeredAt } : {}),
+    ...(isSafeInteger(input.rejectedAt) ? { rejectedAt: input.rejectedAt } : {}),
+    ...(isSafeInteger(input.expiredAt) ? { expiredAt: input.expiredAt } : {}),
+    ...(isSafeInteger(input.cleanedAt) ? { cleanedAt: input.cleanedAt } : {}),
+    ...(isNonEmptyString(input.terminalReason) ? { terminalReason: input.terminalReason } : {}),
+    ...(isNonEmptyString(input.replacementHandle) ? { replacementHandle: input.replacementHandle } : {}),
+    ...(input.terminalResultSent === true ? { terminalResultSent: true } : {}),
+  })
+}
+
+function toBrokerDeliveryTokenState(input: BrokerDeliveryTokenState): BrokerDeliveryTokenState {
+  if (
+    !isNonEmptyString(input.wechatAccountId)
+    || !isNonEmptyString(input.userId)
+    || !isNonEmptyString(input.contextToken)
+    || !isSafeInteger(input.updatedAt)
+    || (input.source !== "question" && input.source !== "permission" && input.source !== "message")
+  ) {
+    throw new Error("invalid broker delivery token")
+  }
+
+  if (
+    (input.sourceRef !== undefined && !isNonEmptyString(input.sourceRef))
+    || (input.staleReason !== undefined && !isNonEmptyString(input.staleReason))
+  ) {
+    throw new Error("invalid broker delivery token")
+  }
+
+  return {
+    wechatAccountId: input.wechatAccountId,
+    userId: input.userId,
+    contextToken: input.contextToken,
+    updatedAt: input.updatedAt,
+    source: input.source,
+    ...(isNonEmptyString(input.sourceRef) ? { sourceRef: input.sourceRef } : {}),
+    ...(isNonEmptyString(input.staleReason) ? { staleReason: input.staleReason } : {}),
+  }
+}
+
 export function readBrokerControlRecord(state: BrokerState, controlId: string): BrokerControlRecord | undefined {
   return state.controlLedger[controlId]
+}
+
+export function upsertRetryErrorSummary(
+  state: BrokerState,
+  input: UpsertRetryErrorSummaryInput,
+): UnknownRecord {
+  rememberBrokerState(state)
+  if (
+    !isNonEmptyString(input.instanceID)
+    || !isNonEmptyString(input.action)
+    || !isNonEmptyString(input.redactedSummary)
+    || !isNonEmptyString(input.severityAdvice)
+  ) {
+    throw new Error("invalid retry error summary")
+  }
+  if (input.updatedAt !== undefined) {
+    assertNonNegativeInteger(input.updatedAt, "updatedAt")
+  }
+
+  const key = createRetryErrorKey(input)
+  const next: UnknownRecord = {
+    instanceID: input.instanceID.trim(),
+    action: input.action.trim(),
+    redactedSummary: input.redactedSummary.trim(),
+    severityAdvice: input.severityAdvice.trim(),
+    ...(isNonEmptyString(input.sessionID) ? { sessionID: input.sessionID.trim() } : {}),
+    ...(input.updatedAt !== undefined ? { updatedAt: input.updatedAt } : {}),
+    ...(isNonEmptyString(input.instanceIncarnation) ? { instanceIncarnation: input.instanceIncarnation.trim() } : {}),
+  }
+  state.active.retryErrors[key] = next
+  return next
+}
+
+export function upsertBrokerIndexedRequest(
+  state: BrokerState,
+  input: BrokerIndexedRequestRecord,
+): BrokerIndexedRequestRecord {
+  rememberBrokerState(state)
+  const next = toBrokerIndexedRequestRecord(input)
+  state.requestIndex[createBrokerRequestIndexKey(next)] = cloneIndexedRequestRecord(next)
+
+  if (next.status === "open") {
+    const activeKey = next.kind === "question" ? "questions" : "permissions"
+    state.active[activeKey][next.routeKey] = {
+      routeKey: next.routeKey,
+      handle: next.handle,
+      requestID: next.requestID,
+      ...(isNonEmptyString(next.scopeKey) ? { scopeKey: next.scopeKey, instanceID: next.scopeKey } : {}),
+      ...(next.prompt !== undefined ? { prompt: cloneUnknownValue(next.prompt) } : {}),
+      wechatAccountId: next.wechatAccountId,
+      userId: next.userId,
+      createdAt: next.createdAt,
+    }
+    delete state.terminalMetadata[next.routeKey]
+    delete state.legacyHandleClosures[next.handle]
+    return cloneIndexedRequestRecord(next)
+  }
+
+  const activeKey = next.kind === "question" ? "questions" : "permissions"
+  delete state.active[activeKey][next.routeKey]
+  state.terminalMetadata[next.routeKey] = {
+    reason: next.terminalReason ?? next.status,
+    ...(isNonEmptyString(next.replacementHandle) ? { replacementHandle: next.replacementHandle } : {}),
+    ...(next.terminalResultSent === true ? { terminalResultSent: true } : {}),
+    handle: next.handle,
+    requestID: next.requestID,
+    ...(isNonEmptyString(next.scopeKey) ? { scopeKey: next.scopeKey } : {}),
+    ...(next.prompt !== undefined ? { prompt: cloneUnknownValue(next.prompt) } : {}),
+    wechatAccountId: next.wechatAccountId,
+    userId: next.userId,
+    createdAt: next.createdAt,
+    ...(isSafeInteger(next.answeredAt) ? { answeredAt: next.answeredAt } : {}),
+    ...(isSafeInteger(next.rejectedAt) ? { rejectedAt: next.rejectedAt } : {}),
+    ...(isSafeInteger(next.expiredAt) ? { expiredAt: next.expiredAt } : {}),
+    ...(isSafeInteger(next.cleanedAt) ? { cleanedAt: next.cleanedAt } : {}),
+  }
+  writeLegacyHandleClosure(state, {
+    kind: next.kind,
+    handle: next.handle,
+    reason: next.terminalReason ?? next.status,
+    routeKey: next.routeKey,
+    ...(isNonEmptyString(next.replacementHandle) ? { replacementHandle: next.replacementHandle } : {}),
+  })
+  return cloneIndexedRequestRecord(next)
+}
+
+export async function readBrokerIndexedRequest(
+  input: { kind: "question" | "permission"; routeKey: string },
+  state?: BrokerState,
+): Promise<BrokerIndexedRequestRecord | undefined> {
+  const resolved = state ?? await loadBrokerStateStoreSnapshot()
+  if (!resolved || !isNonEmptyString(input.routeKey)) {
+    return undefined
+  }
+
+  const current = resolved.requestIndex[createBrokerRequestIndexKey(input)]
+  if (current) {
+    return cloneIndexedRequestRecord(current)
+  }
+
+  const activeKey = input.kind === "question" ? "questions" : "permissions"
+  const active = resolved.active[activeKey][input.routeKey]
+  if (isRecord(active)) {
+    const requestID = getStringField(active, "requestID")
+    const handle = getStringField(active, "handle")
+    const wechatAccountId = getStringField(active, "wechatAccountId")
+    const userId = getStringField(active, "userId")
+    const createdAt = getNumberField(active, "createdAt")
+    if (requestID && handle && wechatAccountId && userId && createdAt !== undefined) {
+      return {
+        kind: input.kind,
+        requestID,
+        routeKey: input.routeKey,
+        handle,
+        ...(getStringField(active, "scopeKey") ? { scopeKey: getStringField(active, "scopeKey") } : {}),
+        ...(Object.hasOwn(active, "prompt") ? { prompt: cloneUnknownValue(active.prompt) } : {}),
+        wechatAccountId,
+        userId,
+        status: "open",
+        createdAt,
+      }
+    }
+  }
+
+  const terminal = resolved.terminalMetadata[input.routeKey]
+  if (
+    terminal
+    && isNonEmptyString(terminal.handle)
+    && isNonEmptyString(terminal.requestID)
+    && isNonEmptyString(terminal.wechatAccountId)
+    && isNonEmptyString(terminal.userId)
+    && isSafeInteger(terminal.createdAt)
+  ) {
+    return {
+      kind: input.kind,
+      requestID: terminal.requestID,
+      routeKey: input.routeKey,
+      handle: terminal.handle,
+      ...(isNonEmptyString(terminal.scopeKey) ? { scopeKey: terminal.scopeKey } : {}),
+      ...(terminal.prompt !== undefined ? { prompt: cloneUnknownValue(terminal.prompt) } : {}),
+      wechatAccountId: terminal.wechatAccountId,
+      userId: terminal.userId,
+      status: terminal.cleanedAt !== undefined ? "cleaned" : terminal.expiredAt !== undefined ? "expired" : terminal.rejectedAt !== undefined ? "rejected" : "answered",
+      createdAt: terminal.createdAt,
+      ...(isSafeInteger(terminal.answeredAt) ? { answeredAt: terminal.answeredAt } : {}),
+      ...(isSafeInteger(terminal.rejectedAt) ? { rejectedAt: terminal.rejectedAt } : {}),
+      ...(isSafeInteger(terminal.expiredAt) ? { expiredAt: terminal.expiredAt } : {}),
+      ...(isSafeInteger(terminal.cleanedAt) ? { cleanedAt: terminal.cleanedAt } : {}),
+      ...(isNonEmptyString(terminal.reason) ? { terminalReason: terminal.reason as BrokerIndexedRequestRecord["terminalReason"] } : {}),
+      ...(isNonEmptyString(terminal.replacementHandle) ? { replacementHandle: terminal.replacementHandle } : {}),
+      ...(terminal.terminalResultSent === true ? { terminalResultSent: true } : {}),
+    }
+  }
+
+  return undefined
+}
+
+export function upsertBrokerDeliveryToken(
+  state: BrokerState,
+  input: BrokerDeliveryTokenState,
+): BrokerDeliveryTokenState {
+  rememberBrokerState(state)
+  const next = toBrokerDeliveryTokenState(input)
+  state.deliveryTokens[createBrokerDeliveryTokenKey(next)] = cloneDeliveryTokenState(next)
+  return cloneDeliveryTokenState(next)
+}
+
+export async function readBrokerDeliveryToken(
+  input: { wechatAccountId: string; userId: string },
+  state?: BrokerState,
+): Promise<BrokerDeliveryTokenState | undefined> {
+  const resolved = state ?? await loadBrokerStateStoreSnapshot()
+  if (!resolved || !isNonEmptyString(input.wechatAccountId) || !isNonEmptyString(input.userId)) {
+    return undefined
+  }
+
+  const current = resolved.deliveryTokens[createBrokerDeliveryTokenKey(input)]
+  return current ? cloneDeliveryTokenState(current) : undefined
+}
+
+function collectBrokerOpenRequestsForScope(
+  state: BrokerState,
+  scopeKey: string,
+): BrokerIndexedRequestRecord[] {
+  const indexed = new Map<string, BrokerIndexedRequestRecord>()
+
+  for (const record of Object.values(state.requestIndex)) {
+    if (record.status !== "open") {
+      continue
+    }
+    if (record.scopeKey !== scopeKey) {
+      continue
+    }
+    indexed.set(createBrokerRequestIndexKey(record), cloneIndexedRequestRecord(record))
+  }
+
+  for (const kind of ["question", "permission"] as const) {
+    const source = kind === "question" ? state.active.questions : state.active.permissions
+    for (const [routeKey, rawRecord] of Object.entries(source)) {
+      if (!isRecord(rawRecord)) {
+        continue
+      }
+      if (readBrokerScopeKey(rawRecord) !== scopeKey) {
+        continue
+      }
+      const key = createBrokerRequestIndexKey({ kind, routeKey })
+      if (indexed.has(key)) {
+        continue
+      }
+      const requestID = getStringField(rawRecord, "requestID")
+      const handle = getStringField(rawRecord, "handle")
+      const wechatAccountId = getStringField(rawRecord, "wechatAccountId")
+      const userId = getStringField(rawRecord, "userId")
+      const createdAt = getNumberField(rawRecord, "createdAt")
+      if (!requestID || !handle || !wechatAccountId || !userId || createdAt === undefined) {
+        continue
+      }
+      indexed.set(key, {
+        kind,
+        requestID,
+        routeKey,
+        handle,
+        scopeKey,
+        ...(Object.hasOwn(rawRecord, "prompt") ? { prompt: cloneUnknownValue(rawRecord.prompt) } : {}),
+        wechatAccountId,
+        userId,
+        status: "open",
+        createdAt,
+      })
+    }
+  }
+
+  return [...indexed.values()].sort((left, right) => left.createdAt - right.createdAt)
+}
+
+export function expireBrokerIndexedRequestsForScope(
+  state: BrokerState,
+  input: { scopeKey: string; expiredAt: number },
+): BrokerRuntimeExpiredRequest[] {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.scopeKey)) {
+    throw new Error("invalid broker request expiration scope")
+  }
+  assertNonNegativeInteger(input.expiredAt, "expiredAt")
+
+  const expired: BrokerRuntimeExpiredRequest[] = []
+  for (const record of collectBrokerOpenRequestsForScope(state, input.scopeKey)) {
+    const next = upsertBrokerIndexedRequest(state, {
+      ...record,
+      status: "expired",
+      expiredAt: input.expiredAt,
+      terminalReason: "expired",
+      terminalResultSent: record.terminalResultSent === true,
+    })
+    expired.push(next)
+  }
+
+  return expired
+}
+
+export function closeBrokerNaturalStopsForScope(
+  state: BrokerState,
+  input: { scopeKey: string; terminalReason: string },
+): BrokerRuntimeClosedNaturalStop[] {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.scopeKey) || !isNonEmptyString(input.terminalReason)) {
+    throw new Error("invalid broker natural-stop closure scope")
+  }
+
+  const closed: BrokerRuntimeClosedNaturalStop[] = []
+  for (const [handle, rawRecord] of Object.entries(state.active.naturalStops)) {
+    if (!isRecord(rawRecord) || readBrokerScopeKey(rawRecord) !== input.scopeKey) {
+      continue
+    }
+    delete state.active.naturalStops[handle]
+    const retainedUntil = getNumberField(rawRecord, "retainedUntil")
+    if (retainedUntil !== undefined) {
+      state.retainedOccupancy[handle] = {
+        handle,
+        retainedUntil,
+      }
+    }
+    writeLegacyHandleClosure(state, {
+      kind: "naturalStop",
+      handle,
+      reason: input.terminalReason,
+      ...(retainedUntil !== undefined ? { retainedUntil } : {}),
+    })
+    closed.push({
+      handle,
+      ...(readBrokerScopeKey(rawRecord) ? { scopeKey: readBrokerScopeKey(rawRecord) } : {}),
+      ...(getStringField(rawRecord, "idempotencyKey") ? { idempotencyKey: getStringField(rawRecord, "idempotencyKey") } : {}),
+      terminalReason: input.terminalReason,
+    })
+  }
+
+  return closed
+}
+
+function readBrokerRequestTerminalTimestamp(record: BrokerIndexedRequestRecord): number | undefined {
+  if (record.status === "answered") {
+    return record.answeredAt
+  }
+  if (record.status === "rejected") {
+    return record.rejectedAt
+  }
+  if (record.status === "expired") {
+    return record.expiredAt
+  }
+  if (record.status === "cleaned") {
+    return record.cleanedAt
+  }
+  return undefined
+}
+
+export function cleanupBrokerRuntimeTerminalRequests(
+  state: BrokerState,
+  input: { now: number; cleanAfterMs: number; purgeRetentionMs: number },
+): BrokerRuntimeCleanupResult {
+  rememberBrokerState(state)
+  assertNonNegativeInteger(input.now, "now")
+  assertNonNegativeInteger(input.cleanAfterMs, "cleanAfterMs")
+  assertNonNegativeInteger(input.purgeRetentionMs, "purgeRetentionMs")
+
+  const cleanedRequests: BrokerIndexedRequestRecord[] = []
+  const purgedRequests: BrokerIndexedRequestRecord[] = []
+
+  for (const record of Object.values(state.requestIndex)) {
+    if (!["answered", "rejected", "expired"].includes(record.status)) {
+      continue
+    }
+    const terminalAt = readBrokerRequestTerminalTimestamp(record)
+    if (terminalAt === undefined || input.now - terminalAt < input.cleanAfterMs) {
+      continue
+    }
+    cleanedRequests.push(upsertBrokerIndexedRequest(state, {
+      ...record,
+      status: "cleaned",
+      cleanedAt: input.now,
+      terminalReason: record.terminalReason,
+      replacementHandle: record.replacementHandle,
+      terminalResultSent: record.terminalResultSent,
+    }))
+  }
+
+  const purgeCutoff = input.now - input.purgeRetentionMs
+  for (const [key, record] of Object.entries(state.requestIndex)) {
+    if (record.status !== "cleaned") {
+      continue
+    }
+    if (!isSafeInteger(record.cleanedAt) || record.cleanedAt >= purgeCutoff) {
+      continue
+    }
+    purgedRequests.push(cloneIndexedRequestRecord(record))
+    delete state.requestIndex[key]
+  }
+
+  return { cleanedRequests, purgedRequests }
+}
+
+export function markBrokerConnectionObserved(
+  state: BrokerState,
+  input: BrokerConnectionScope & { observedAt: number; connectedAt?: number },
+): BrokerConnectionState {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.instanceID) || !isNonEmptyString(input.instanceIncarnation)) {
+    throw new Error("invalid broker connection observation")
+  }
+  assertNonNegativeInteger(input.observedAt, "observedAt")
+  if (input.connectedAt !== undefined) {
+    assertNonNegativeInteger(input.connectedAt, "connectedAt")
+  }
+
+  const connection = ensureConnection(state, input.instanceID, input.instanceIncarnation)
+  connection.online = true
+  connection.lastObservedAt = input.observedAt
+  if (input.connectedAt !== undefined) {
+    connection.connectedAt = input.connectedAt
+  }
+  delete connection.disconnectedAt
+  delete connection.disconnectReason
+
+  if (isRecord(state.active.instances[input.instanceID])) {
+    state.active.instances[input.instanceID] = {
+      ...state.active.instances[input.instanceID],
+      instanceID: input.instanceID,
+      instanceIncarnation: input.instanceIncarnation,
+      online: true,
+    }
+  }
+
+  return { ...connection }
+}
+
+export function markBrokerConnectionOffline(
+  state: BrokerState,
+  input: BrokerConnectionScope & { disconnectedAt: number; reason: string },
+): BrokerConnectionState {
+  rememberBrokerState(state)
+  if (!isNonEmptyString(input.instanceID) || !isNonEmptyString(input.instanceIncarnation) || !isNonEmptyString(input.reason)) {
+    throw new Error("invalid broker connection offline")
+  }
+  assertNonNegativeInteger(input.disconnectedAt, "disconnectedAt")
+
+  const connection = ensureConnection(state, input.instanceID, input.instanceIncarnation)
+  connection.online = false
+  connection.disconnectedAt = input.disconnectedAt
+  connection.disconnectReason = input.reason
+
+  if (isRecord(state.active.instances[input.instanceID])) {
+    state.active.instances[input.instanceID] = {
+      ...state.active.instances[input.instanceID],
+      instanceID: input.instanceID,
+      instanceIncarnation: input.instanceIncarnation,
+      online: false,
+      disconnectedAt: input.disconnectedAt,
+      disconnectReason: input.reason,
+    }
+  }
+
+  return { ...connection }
+}
+
+export function listTimedOutBrokerConnectionScopes(
+  state: BrokerState,
+  input: { now: number; timeoutMs: number },
+): BrokerConnectionScope[] {
+  assertNonNegativeInteger(input.now, "now")
+  assertNonNegativeInteger(input.timeoutMs, "timeoutMs")
+
+  const timedOut: BrokerConnectionScope[] = []
+  for (const [instanceID, incarnations] of Object.entries(state.connections)) {
+    for (const [instanceIncarnation, connection] of Object.entries(incarnations)) {
+      if (!connection.online) {
+        continue
+      }
+      const lastObservedAt = connection.lastObservedAt ?? connection.connectedAt
+      if (!isSafeInteger(lastObservedAt)) {
+        continue
+      }
+      if (input.now - lastObservedAt < input.timeoutMs) {
+        continue
+      }
+      timedOut.push({ instanceID, instanceIncarnation })
+    }
+  }
+
+  return timedOut
 }
 
 export function readBrokerAuthoritativeView(state?: BrokerState): BrokerAuthoritativeView {
@@ -1106,6 +1870,8 @@ export function readBrokerAuthoritativeView(state?: BrokerState): BrokerAuthorit
       active: createEmptyActiveState(),
       terminalMetadata: {},
       retainedOccupancy: {},
+      commandLedger: {},
+      legacyHandleClosures: {},
     }
   }
 
@@ -1114,6 +1880,10 @@ export function readBrokerAuthoritativeView(state?: BrokerState): BrokerAuthorit
     active: cloneActiveState(resolved.active),
     terminalMetadata: cloneTerminalMetadataMap(resolved.terminalMetadata),
     retainedOccupancy: cloneRetainedOccupancyMap(resolved.retainedOccupancy),
+    commandLedger: Object.fromEntries(
+      Object.entries(resolved.commandLedger).map(([key, item]) => [key, cloneCommandRecord(item)]),
+    ),
+    legacyHandleClosures: cloneLegacyHandleClosureMap(resolved.legacyHandleClosures),
   }
 }
 

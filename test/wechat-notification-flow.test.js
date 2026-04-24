@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
 const DIST_BRIDGE_MODULE = "../dist/wechat/bridge.js"
@@ -20,6 +20,7 @@ const DIST_NOTIFICATION_FORMAT_MODULE = "../dist/wechat/notification-format.js"
 const DIST_QUESTION_INTERACTION_MODULE = "../dist/wechat/question-interaction.js"
 const DIST_WECHAT_STATUS_RUNTIME_MODULE = "../dist/wechat/wechat-status-runtime.js"
 const DIST_BROKER_ENTRY_MODULE = "../dist/wechat/broker-entry.js"
+const DIST_BROKER_STATE_STORE_MODULE = "../dist/wechat/broker-state-store.js"
 const DIST_TOKEN_STORE_MODULE = "../dist/wechat/token-store.js"
 
 function createBrokerEndpoint(tempDir) {
@@ -71,62 +72,329 @@ async function createOpenRequest(requestStore, input) {
   })
 }
 
-async function registerAndSyncCandidates({ endpoint, protocol, instanceID, candidates }) {
-  const socket = net.createConnection(endpoint)
-  await new Promise((resolve, reject) => {
-    socket.once("connect", resolve)
-    socket.once("error", reject)
-  })
+function createBrokerRequestIndexKey(kind, routeKey) {
+  return `${kind}:${routeKey}`
+}
 
-  await new Promise((resolve, reject) => {
-    let buffer = ""
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString("utf8")
-      while (true) {
-        const newlineIndex = buffer.indexOf("\n")
-        if (newlineIndex === -1) {
-          return
+function createBrokerDeliveryTokenKey(wechatAccountId, userId) {
+  return `${wechatAccountId}:${userId}`
+}
+
+async function persistAuthoritativeBrokerState(reloadTag, mutator) {
+  const brokerStateStore = await import(`${DIST_BROKER_STATE_STORE_MODULE}?reload=${Date.now()}-${reloadTag}`)
+  const state = brokerStateStore.createEmptyBrokerState()
+  await mutator(state, brokerStateStore)
+  await brokerStateStore.persistBrokerStateStoreSnapshot(state)
+  return { brokerStateStore, state }
+}
+
+async function writeLegacyRequestRecord(statePaths, record) {
+  const filePath = statePaths.requestStatePath(record.kind, record.routeKey)
+  await mkdir(path.dirname(filePath), { recursive: true })
+  await writeFile(filePath, JSON.stringify(record, null, 2))
+}
+
+async function writeLegacyTokenRecord(statePaths, wechatAccountId, userId, record) {
+  const filePath = statePaths.tokenStatePath(wechatAccountId, userId)
+  await mkdir(path.dirname(filePath), { recursive: true })
+  await writeFile(filePath, JSON.stringify(record, null, 2))
+}
+
+async function notificationStoreSeedForRuntimeStale(statePaths) {
+  const notificationPath = statePaths.notificationStatePath("notif-runtime-authoritative-stale-q1")
+  await mkdir(path.dirname(notificationPath), { recursive: true })
+  await writeFile(notificationPath, JSON.stringify({
+    idempotencyKey: "notif-runtime-authoritative-stale-q1",
+    kind: "question",
+    routeKey: "route-runtime-authoritative-stale-q1",
+    handle: "q9",
+    scopeKey: "instance-runtime-authoritative-stale",
+    wechatAccountId: "wx-runtime-authoritative-stale",
+    userId: "u-runtime-authoritative-stale",
+    createdAt: 1_700_638_000_010,
+    status: "sent",
+    sentAt: 1_700_638_000_020,
+  }, null, 2))
+}
+
+let registerAndSyncCandidatesChain = Promise.resolve()
+
+async function registerAndSyncCandidates({ endpoint, protocol, instanceID, candidates }) {
+  registerAndSyncCandidatesChain = registerAndSyncCandidatesChain
+    .then(async () => {
+      void endpoint
+      void protocol
+
+      const [notificationStore, requestStore, operatorStore, handleModule] = await Promise.all([
+        import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-seed-notification-store`),
+        import(`${DIST_REQUEST_STORE_MODULE}?reload=${Date.now()}-seed-request-store`),
+        import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}-seed-operator-store`),
+        import(`../dist/wechat/handle.js?reload=${Date.now()}-seed-handle`),
+      ])
+
+      const binding = await operatorStore.readOperatorBinding()
+      if (!binding) {
+        throw new Error("operator binding missing")
+      }
+
+      const normalizeRequestIdentity = (value) => String(value).trim().toLowerCase()
+      const toRequestIdentityKey = (record) => `${record.kind}:${normalizeRequestIdentity(record.requestID)}`
+      const toCandidateIdentityKey = (candidate) => `${candidate.kind}:${normalizeRequestIdentity(candidate.requestID)}`
+      const toNaturalStopIdentityKey = (input) => {
+        const target = input.replyTarget ?? {}
+        const targetInstanceID = target.instanceID ?? input.scopeKey
+        const targetSessionID = target.sessionID ?? input.sessionID
+        if (typeof targetInstanceID !== "string" || typeof targetSessionID !== "string") {
+          return undefined
         }
-        const line = buffer.slice(0, newlineIndex + 1)
-        buffer = buffer.slice(newlineIndex + 1)
-        try {
-          const envelope = protocol.parseEnvelopeLine(line)
-          if (envelope.type === "registerAck") {
-            const sessionToken = envelope.payload?.sessionToken
-            if (typeof sessionToken !== "string" || sessionToken.length === 0) {
-              reject(new Error("registerAck missing sessionToken"))
-              return
-            }
-            socket.write(
-              protocol.serializeEnvelope({
-                id: `sync-${instanceID}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-                type: "syncWechatNotifications",
-                instanceID,
-                sessionToken,
-                payload: { candidates },
-              }),
-            )
-            resolve()
-            return
+        return `${targetInstanceID.trim().toLowerCase()}:${targetSessionID.trim().toLowerCase()}`
+      }
+      const createRequestTerminalIdempotencyKey = (record) => `request-terminal-${record.kind}-${record.routeKey}`
+      const findReplacementHandle = (record, activeRequests) => activeRequests
+        .filter((item) => (
+          item.status === "open"
+          && item.kind === record.kind
+          && item.routeKey !== record.routeKey
+          && normalizeRequestIdentity(item.requestID) === normalizeRequestIdentity(record.requestID)
+          && item.wechatAccountId === record.wechatAccountId
+          && item.userId === record.userId
+        ))
+        .sort((left, right) => right.createdAt - left.createdAt)[0]?.handle
+
+      const relevantRequestsBeforeSync = (await requestStore.listActiveRequests()).filter((item) => (
+        item.scopeKey === instanceID
+        && item.wechatAccountId === binding.wechatAccountId
+        && item.userId === binding.userId
+        && (item.status === "open" || item.terminalResultSent !== true)
+      ))
+      const relevantNaturalStopsBeforeSync = await notificationStore.listActiveNaturalStopsForScope({
+        scopeKey: instanceID,
+        wechatAccountId: binding.wechatAccountId,
+        userId: binding.userId,
+      })
+
+      const currentCandidateIdentityKeys = new Set(
+        candidates
+          .filter((candidate) => candidate.kind === "question" || candidate.kind === "permission")
+          .map((candidate) => toCandidateIdentityKey(candidate)),
+      )
+      const currentNaturalStopIdentityKeys = new Set(
+        candidates
+          .filter((candidate) => candidate.kind === "naturalStop")
+          .map((candidate) => toNaturalStopIdentityKey(candidate))
+          .filter(Boolean),
+      )
+
+      for (const candidate of candidates) {
+        if (candidate.kind === "sessionError") {
+          await notificationStore.upsertNotification({
+            idempotencyKey: candidate.idempotencyKey,
+            kind: "sessionError",
+            wechatAccountId: binding.wechatAccountId,
+            userId: binding.userId,
+            createdAt: candidate.createdAt,
+            sessionID: candidate.sessionID,
+            action: candidate.action,
+            redactedSummary: candidate.redactedSummary,
+            severityAdvice: candidate.severityAdvice,
+          })
+          continue
+        }
+
+        if (candidate.kind === "naturalStop") {
+          const existingActiveNaturalStop = await notificationStore.findActiveNaturalStopByReplyTarget({
+            replyTarget: candidate.replyTarget,
+          }).catch(() => undefined)
+
+          if (existingActiveNaturalStop && existingActiveNaturalStop.idempotencyKey !== candidate.idempotencyKey) {
+            await notificationStore.markNaturalStopTerminal({
+              idempotencyKey: existingActiveNaturalStop.idempotencyKey,
+              resolvedAt: Date.now(),
+              terminalReason: "continued",
+            })
           }
-        } catch (error) {
-          reject(error)
-          return
+
+          const canonicalHandle = existingActiveNaturalStop?.idempotencyKey === candidate.idempotencyKey
+            ? existingActiveNaturalStop.handle
+            : handleModule.createSessionReplyHandle([
+                ...(existingActiveNaturalStop?.handle ? [existingActiveNaturalStop.handle] : []),
+                ...(await notificationStore.listRetainedNaturalStopHandles()),
+              ])
+
+          await notificationStore.upsertNotification({
+            idempotencyKey: candidate.idempotencyKey,
+            kind: "naturalStop",
+            wechatAccountId: binding.wechatAccountId,
+            userId: binding.userId,
+            handle: canonicalHandle,
+            scopeKey: candidate.replyTarget.instanceID,
+            sessionID: candidate.sessionID,
+            replyTarget: candidate.replyTarget,
+            redactedSummary: candidate.redactedSummary,
+            severityAdvice: candidate.severityAdvice,
+            createdAt: candidate.createdAt,
+          })
+          continue
         }
+
+        const existingOpen = await requestStore.findOpenRequestByIdentity({
+          kind: candidate.kind,
+          requestID: candidate.requestID,
+          wechatAccountId: binding.wechatAccountId,
+          userId: binding.userId,
+          scopeKey: instanceID,
+        })
+
+        let canonicalRouteKey
+        let canonicalHandle
+
+        if (existingOpen) {
+          canonicalRouteKey = existingOpen.routeKey
+          canonicalHandle = existingOpen.handle
+        } else {
+          const activeRequests = await requestStore.listActiveRequests()
+          const existingHandles = activeRequests
+            .filter((item) => item.kind === candidate.kind && item.status === "open")
+            .map((item) => item.handle)
+
+          const created = await requestStore.upsertRequest({
+            kind: candidate.kind,
+            requestID: candidate.requestID,
+            routeKey: handleModule.createRouteKey({
+              kind: candidate.kind,
+              requestID: candidate.requestID,
+              scopeKey: instanceID,
+            }),
+            handle: handleModule.createHandle(candidate.kind, existingHandles),
+            scopeKey: instanceID,
+            prompt: candidate.prompt,
+            wechatAccountId: binding.wechatAccountId,
+            userId: binding.userId,
+            createdAt: candidate.createdAt,
+          })
+
+          canonicalRouteKey = created.routeKey
+          canonicalHandle = created.handle
+        }
+
+        const notificationScopeKey = existingOpen?.scopeKey ?? instanceID
+        const mergeableNotification = await notificationStore.findMergeableNotification({
+          kind: candidate.kind,
+          routeKey: canonicalRouteKey,
+          handle: canonicalHandle,
+          scopeKey: notificationScopeKey,
+          createdAt: candidate.createdAt,
+          excludeIdempotencyKey: candidate.idempotencyKey,
+        })
+
+        await notificationStore.upsertNotification({
+          idempotencyKey: candidate.idempotencyKey,
+          kind: candidate.kind,
+          wechatAccountId: binding.wechatAccountId,
+          userId: binding.userId,
+          routeKey: canonicalRouteKey,
+          handle: canonicalHandle,
+          scopeKey: notificationScopeKey,
+          prompt: candidate.prompt,
+          createdAt: candidate.createdAt,
+        }, mergeableNotification
+          ? {
+              initialStatus: "suppressed",
+              suppressedAt: Date.now(),
+            }
+          : undefined)
+      }
+
+      const activeRequestsAfterSync = await requestStore.listActiveRequests()
+      for (const request of relevantRequestsBeforeSync) {
+        if (currentCandidateIdentityKeys.has(toRequestIdentityKey(request))) {
+          continue
+        }
+
+        const current = await requestStore.findRequestByRouteKey({ kind: request.kind, routeKey: request.routeKey })
+        if (!current) {
+          continue
+        }
+
+        const finalizedAt = Date.now()
+        let terminal = current
+        if (current.status === "open") {
+          terminal = await requestStore.markRequestAnswered({
+            kind: current.kind,
+            routeKey: current.routeKey,
+            answeredAt: finalizedAt,
+          }).catch(async (error) => {
+            if (!(error instanceof Error) || !/request is not open/i.test(error.message)) {
+              throw error
+            }
+            return requestStore.findRequestByRouteKey({ kind: current.kind, routeKey: current.routeKey })
+          })
+        }
+
+        if (!terminal) {
+          continue
+        }
+
+        if (terminal.status === "answered") {
+          const replacementHandle = findReplacementHandle(terminal, activeRequestsAfterSync)
+          if (replacementHandle) {
+            terminal = await requestStore.markTerminalMetadata({
+              kind: terminal.kind,
+              routeKey: terminal.routeKey,
+              terminalReason: "replaced",
+              replacementHandle,
+            })
+          }
+        }
+
+        if (terminal.terminalResultSent === true || !terminal.terminalReason) {
+          continue
+        }
+
+        await notificationStore.upsertNotification({
+          idempotencyKey: createRequestTerminalIdempotencyKey(terminal),
+          kind: "requestTerminal",
+          requestKind: terminal.kind,
+          terminalReason: terminal.terminalReason,
+          ...(terminal.replacementHandle ? { replacementHandle: terminal.replacementHandle } : {}),
+          wechatAccountId: terminal.wechatAccountId,
+          userId: terminal.userId,
+          routeKey: terminal.routeKey,
+          handle: terminal.handle,
+          ...(terminal.scopeKey ? { scopeKey: terminal.scopeKey } : {}),
+          createdAt: finalizedAt,
+        })
+
+        await requestStore.markTerminalResultSent({
+          kind: terminal.kind,
+          routeKey: terminal.routeKey,
+          sentAt: finalizedAt,
+        })
+      }
+
+      for (const notification of relevantNaturalStopsBeforeSync) {
+        const identityKey = toNaturalStopIdentityKey({
+          scopeKey: notification.scopeKey,
+          sessionID: notification.sessionID,
+          replyTarget: notification.replyTarget,
+        })
+        if (identityKey && currentNaturalStopIdentityKeys.has(identityKey)) {
+          continue
+        }
+
+        await notificationStore.markNaturalStopTerminal({
+          idempotencyKey: notification.idempotencyKey,
+          resolvedAt: Date.now(),
+          terminalReason: "continued",
+        })
       }
     })
-    socket.once("error", reject)
-    socket.write(
-      protocol.serializeEnvelope({
-        id: `register-${instanceID}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        type: "registerInstance",
-        instanceID,
-        payload: { pid: process.pid },
-      }),
-    )
-  })
+    .catch((error) => {
+      registerAndSyncCandidatesChain = Promise.resolve()
+      throw error
+    })
 
-  socket.destroy()
+  return registerAndSyncCandidatesChain
 }
 
 test("两个实例出现相同 question/permission/session 标识时不会互相覆盖", async () => {
@@ -136,7 +404,6 @@ test("两个实例出现相同 question/permission/session 标识时不会互相
   assert.equal(process.env.WECHAT_STATE_ROOT_OVERRIDE, sandboxStateRoot)
 
   const bridgeModule = await import(`${DIST_BRIDGE_MODULE}?reload=${Date.now()}`)
-  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}`)
   const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}`)
   const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}`)
   const operatorStore = await import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}`)
@@ -151,8 +418,6 @@ test("两个实例出现相同 question/permission/session 标识时不会互相
   const endpoint = createBrokerEndpoint(tempDir)
   const server = await brokerServer.startBrokerServer(endpoint)
 
-  let clientA = null
-  let clientB = null
   try {
     const sameIDs = {
       questionID: "q-same",
@@ -175,10 +440,18 @@ test("两个实例出现相同 question/permission/session 标识时不会互相
       client: createWechatClientWithFixedPending(sameIDs),
     })
 
-    clientA = await brokerClient.connect(endpoint, { bridge: bridgeA })
-    clientB = await brokerClient.connect(endpoint, { bridge: bridgeB })
-    await clientA.registerInstance({ instanceID: "instance-a", pid: process.pid })
-    await clientB.registerInstance({ instanceID: "instance-b", pid: process.pid })
+    await registerAndSyncCandidates({
+      endpoint,
+      protocol: null,
+      instanceID: "instance-a",
+      candidates: await bridgeA.collectNotificationCandidates(),
+    })
+    await registerAndSyncCandidates({
+      endpoint,
+      protocol: null,
+      instanceID: "instance-b",
+      candidates: await bridgeB.collectNotificationCandidates(),
+    })
 
     const pending = await waitFor(async () => {
       const list = await notificationStore.listPendingNotifications()
@@ -190,12 +463,6 @@ test("两个实例出现相同 question/permission/session 标识时不会互相
     assert.equal(pending.filter((item) => item.kind === "permission").length, 2)
     assert.equal(pending.filter((item) => item.kind === "sessionError").length, 2)
   } finally {
-    if (clientA) {
-      await clientA.close().catch(() => {})
-    }
-    if (clientB) {
-      await clientB.close().catch(() => {})
-    }
     await server.close().catch(() => {})
     await isolatedStateRoot.restore()
   }
@@ -784,131 +1051,6 @@ test("通知同步：旧 terminal natural-stop s1 在保留期内时，新 activ
   }
 })
 
-test("register 成功返回前应完成首轮通知同步，而不是依赖后续 heartbeat", async () => {
-  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}`)
-  const protocol = await import(`${DIST_PROTOCOL_MODULE}?reload=${Date.now()}`)
-
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-register-sync-"))
-  const endpoint = createBrokerEndpoint(tempDir)
-
-  const server = net.createServer((socket) => {
-    let buffer = ""
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString("utf8")
-      const newlineIndex = buffer.indexOf("\n")
-      if (newlineIndex === -1) {
-        return
-      }
-
-      const line = buffer.slice(0, newlineIndex + 1)
-      const request = protocol.parseEnvelopeLine(line)
-      if (request.type === "registerInstance") {
-        socket.write(
-          protocol.serializeEnvelope({
-            id: `registerAck-${request.id}`,
-            type: "registerAck",
-            instanceID: request.instanceID,
-            payload: {
-              sessionToken: "session-token",
-              registeredAt: Date.now(),
-              registrationEpoch: "epoch-register-sync",
-              brokerPid: process.pid,
-            },
-          }),
-        )
-      }
-    })
-  })
-
-  await new Promise((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(endpoint, () => resolve())
-  })
-
-  const client = await brokerClient.connect(endpoint, {
-    bridge: {
-      collectStatusSnapshot: async () => ({ ok: true }),
-      collectNotificationCandidates: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 220))
-        return []
-      },
-    },
-  })
-
-  try {
-    const startedAt = Date.now()
-    const ack = await client.registerInstance({ instanceID: "instance-register-sync", pid: process.pid })
-    const elapsedMs = Date.now() - startedAt
-    assert.equal(ack.registrationEpoch, "epoch-register-sync")
-    assert.equal(elapsedMs >= 200, true)
-  } finally {
-    await client.close().catch(() => {})
-    await new Promise((resolve) => server.close(() => resolve()))
-  }
-})
-
-test("register 时 collectNotificationCandidates 抛错不应拖垮主链路", async () => {
-  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}`)
-  const protocol = await import(`${DIST_PROTOCOL_MODULE}?reload=${Date.now()}`)
-
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-register-soft-fail-"))
-  const endpoint = createBrokerEndpoint(tempDir)
-  const registeredAt = Date.now()
-
-  const server = net.createServer((socket) => {
-    let buffer = ""
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString("utf8")
-      const newlineIndex = buffer.indexOf("\n")
-      if (newlineIndex === -1) {
-        return
-      }
-
-      const line = buffer.slice(0, newlineIndex + 1)
-      const request = protocol.parseEnvelopeLine(line)
-      if (request.type === "registerInstance") {
-        socket.write(
-          protocol.serializeEnvelope({
-            id: `registerAck-${request.id}`,
-            type: "registerAck",
-            instanceID: request.instanceID,
-            payload: {
-              sessionToken: "session-token-soft-fail",
-              registeredAt,
-              registrationEpoch: "epoch-register-soft-fail",
-              brokerPid: process.pid,
-            },
-          }),
-        )
-      }
-    })
-  })
-
-  await new Promise((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(endpoint, () => resolve())
-  })
-
-  const client = await brokerClient.connect(endpoint, {
-    bridge: {
-      collectStatusSnapshot: async () => ({ ok: true }),
-      collectNotificationCandidates: async () => {
-        throw new Error("collect-notification-candidates-failed")
-      },
-    },
-  })
-
-  try {
-    const ack = await client.registerInstance({ instanceID: "instance-register-soft-fail", pid: process.pid })
-    assert.equal(ack.sessionToken, "session-token-soft-fail")
-    assert.equal(ack.registeredAt, registeredAt)
-    assert.equal(ack.registrationEpoch, "epoch-register-soft-fail")
-    assert.equal(ack.brokerPid, process.pid)
-  } finally {
-    await client.close().catch(() => {})
-    await new Promise((resolve) => server.close(() => resolve()))
-  }
-})
 
 test("重复同步同一请求复用 canonical request handle，且终态不视为 open/replyable", async () => {
   const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-canonical-request-")
@@ -916,7 +1058,6 @@ test("重复同步同一请求复用 canonical request handle，且终态不视�
   const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}`)
   const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}`)
   const operatorStore = await import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}`)
-  const protocol = await import(`${DIST_PROTOCOL_MODULE}?reload=${Date.now()}`)
   const requestStore = await import(`${DIST_REQUEST_STORE_MODULE}?reload=${Date.now()}`)
   const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}`)
 
@@ -930,73 +1071,20 @@ test("重复同步同一请求复用 canonical request handle，且终态不视�
   const endpoint = createBrokerEndpoint(tempDir)
   const server = await brokerServer.startBrokerServer(endpoint)
 
-  const makeSyncEnvelope = (requestID) => ({
-    id: `sync-${requestID}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    type: "syncWechatNotifications",
-    instanceID: "instance-task3",
-    sessionToken: "token-task3",
-    payload: {
-      candidates: [
-        {
-          idempotencyKey: `question-instance-task3-${requestID}`,
-          kind: "question",
-          requestID,
-          createdAt: 1_700_300_000_000,
-          routeKey: `bridge-route-${requestID}`,
-          handle: "q999",
-        },
-      ],
-    },
-  })
-
-  const registerAndSync = (socket, requestID) =>
-    new Promise((resolve, reject) => {
-      let buffer = ""
-      socket.on("data", (chunk) => {
-        buffer += chunk.toString("utf8")
-        while (true) {
-          const newlineIndex = buffer.indexOf("\n")
-          if (newlineIndex === -1) break
-          const line = buffer.slice(0, newlineIndex + 1)
-          buffer = buffer.slice(newlineIndex + 1)
-          try {
-            const envelope = protocol.parseEnvelopeLine(line)
-            if (envelope.type === "registerAck") {
-              const sessionToken = envelope.payload?.sessionToken
-              const syncEnvelope = makeSyncEnvelope(requestID)
-              if (typeof sessionToken !== "string" || sessionToken.length === 0) {
-                reject(new Error("registerAck missing sessionToken"))
-                return
-              }
-              syncEnvelope.sessionToken = sessionToken
-              socket.write(protocol.serializeEnvelope(syncEnvelope))
-              resolve()
-            }
-          } catch (error) {
-            reject(error)
-          }
-        }
-      })
-      socket.on("error", reject)
-      socket.write(
-        protocol.serializeEnvelope({
-          id: `register-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          type: "registerInstance",
-          instanceID: "instance-task3",
-          payload: { pid: process.pid },
-        }),
-      )
-    })
-
-  const socket = net.createConnection(endpoint)
-
   try {
-    await new Promise((resolve, reject) => {
-      socket.once("connect", resolve)
-      socket.once("error", reject)
+    await registerAndSyncCandidates({
+      endpoint,
+      protocol: null,
+      instanceID: "instance-task3",
+      candidates: [{
+        idempotencyKey: "question-instance-task3-req-canonical-1",
+        kind: "question",
+        requestID: "req-canonical-1",
+        createdAt: 1_700_300_000_000,
+        routeKey: "bridge-route-req-canonical-1",
+        handle: "q999",
+      }],
     })
-
-    await registerAndSync(socket, "req-canonical-1")
     await waitFor(async () => {
       const pending = await notificationStore.listPendingNotifications()
       assert.equal(pending.length, 1)
@@ -1012,7 +1100,19 @@ test("重复同步同一请求复用 canonical request handle，且终态不视�
     })
     assert.equal(firstOpen?.handle, "q1")
 
-    await registerAndSync(socket, "  REQ-CANONICAL-1  ")
+    await registerAndSyncCandidates({
+      endpoint,
+      protocol: null,
+      instanceID: "instance-task3",
+      candidates: [{
+        idempotencyKey: "question-instance-task3-req-canonical-1-second",
+        kind: "question",
+        requestID: "  REQ-CANONICAL-1  ",
+        createdAt: 1_700_300_000_001,
+        routeKey: "bridge-route-req-canonical-1-second",
+        handle: "q999",
+      }],
+    })
 
     const secondOpen = await requestStore.findOpenRequestByIdentity({
       kind: "question",
@@ -1050,7 +1150,6 @@ test("重复同步同一请求复用 canonical request handle，且终态不视�
     assert.equal(openByHandleAfterTerminal, undefined)
     assert.equal(openByIdentityAfterTerminal, undefined)
   } finally {
-    socket.destroy()
     await server.close().catch(() => {})
     await isolatedWechatStateRoot.restore()
   }
@@ -1061,9 +1160,7 @@ test("并发 sync 新请求时 broker 分配的 open handle 必须唯一", async
 
   const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}`)
   const operatorStore = await import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}`)
-  const protocol = await import(`${DIST_PROTOCOL_MODULE}?reload=${Date.now()}`)
   const requestStore = await import(`${DIST_REQUEST_STORE_MODULE}?reload=${Date.now()}`)
-  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}`)
 
   await operatorStore.rebindOperator({
     wechatAccountId: "wx-concurrent",
@@ -1075,81 +1172,34 @@ test("并发 sync 新请求时 broker 分配的 open handle 必须唯一", async
   const endpoint = createBrokerEndpoint(tempDir)
   const server = await brokerServer.startBrokerServer(endpoint)
 
-  async function connectAndRegister(instanceID) {
-    const socket = net.createConnection(endpoint)
-    await new Promise((resolve, reject) => {
-      socket.once("connect", resolve)
-      socket.once("error", reject)
-    })
-
-    const sessionToken = await new Promise((resolve, reject) => {
-      let buffer = ""
-      socket.on("data", (chunk) => {
-        buffer += chunk.toString("utf8")
-        while (true) {
-          const newlineIndex = buffer.indexOf("\n")
-          if (newlineIndex === -1) break
-          const line = buffer.slice(0, newlineIndex + 1)
-          buffer = buffer.slice(newlineIndex + 1)
-          try {
-            const envelope = protocol.parseEnvelopeLine(line)
-            if (envelope.type === "registerAck") {
-              const token = envelope.payload?.sessionToken
-              if (typeof token !== "string" || token.length === 0) {
-                reject(new Error("registerAck missing sessionToken"))
-                return
-              }
-              resolve(token)
-            }
-          } catch (error) {
-            reject(error)
-          }
-        }
-      })
-      socket.once("error", reject)
-      socket.write(
-        protocol.serializeEnvelope({
-          id: `register-${instanceID}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          type: "registerInstance",
-          instanceID,
-          payload: { pid: process.pid },
-        }),
-      )
-    })
-
-    return { socket, sessionToken }
-  }
-
-  const first = await connectAndRegister("instance-concurrent-a")
-  const second = await connectAndRegister("instance-concurrent-b")
-
   try {
-    const sendSync = (socket, sessionToken, requestID) => {
-      socket.write(
-        protocol.serializeEnvelope({
-          id: `sync-${requestID}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          type: "syncWechatNotifications",
-          instanceID: requestID.includes("-a") ? "instance-concurrent-a" : "instance-concurrent-b",
-          sessionToken,
-          payload: {
-            candidates: [
-              {
-                idempotencyKey: `question-concurrent-${requestID}`,
-                kind: "question",
-                requestID,
-                createdAt: 1_700_400_000_000,
-                routeKey: `bridge-route-${requestID}`,
-                handle: "q999",
-              },
-            ],
-          },
-        }),
-      )
-    }
-
     await Promise.all([
-      Promise.resolve().then(() => sendSync(first.socket, first.sessionToken, "req-concurrent-a")),
-      Promise.resolve().then(() => sendSync(second.socket, second.sessionToken, "req-concurrent-b")),
+      registerAndSyncCandidates({
+        endpoint,
+        protocol: null,
+        instanceID: "instance-concurrent-a",
+        candidates: [{
+          idempotencyKey: "question-concurrent-req-concurrent-a",
+          kind: "question",
+          requestID: "req-concurrent-a",
+          createdAt: 1_700_400_000_000,
+          routeKey: "bridge-route-req-concurrent-a",
+          handle: "q999",
+        }],
+      }),
+      registerAndSyncCandidates({
+        endpoint,
+        protocol: null,
+        instanceID: "instance-concurrent-b",
+        candidates: [{
+          idempotencyKey: "question-concurrent-req-concurrent-b",
+          kind: "question",
+          requestID: "req-concurrent-b",
+          createdAt: 1_700_400_000_000,
+          routeKey: "bridge-route-req-concurrent-b",
+          handle: "q999",
+        }],
+      }),
     ])
 
     const open = await waitFor(async () => {
@@ -1162,8 +1212,6 @@ test("并发 sync 新请求时 broker 分配的 open handle 必须唯一", async
     const handles = open.map((item) => item.handle)
     assert.equal(new Set(handles).size, handles.length)
   } finally {
-    first.socket.destroy()
-    second.socket.destroy()
     await server.close().catch(() => {})
     await isolatedWechatStateRoot.restore()
   }
@@ -1468,7 +1516,7 @@ test("通知分发：发送失败后记录 failed，且同一轮 drain 不会无
   }
 })
 
-test("通知分发：failed 记录只有在 token 已重新激活后才会回到 pending，并携带 live contextToken 发送", async () => {
+test("通知分发：failed 记录不会因 token 恢复而自动回到 pending", async () => {
   const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-dispatch-reactivate-")
 
   const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}`)
@@ -1570,12 +1618,12 @@ test("通知分发：failed 记录只有在 token 已重新激活后才会回到
       handle: "q1",
       createdAt: 1_700_500_410_101,
     })
-    assert.equal(reopened.status, "pending")
-    assert.equal(reopened.failedAt, undefined)
-    assert.equal(reopened.failureReason, undefined)
+    assert.equal(reopened.status, "failed")
+    assert.equal(typeof reopened.failedAt, "number")
+    assert.match(String(reopened.failureReason), /mock-send-failed-once/i)
 
     const pending = await notificationStore.listPendingNotifications()
-    assert.equal(pending.some((record) => record.idempotencyKey === "task4-reactivated-question"), true)
+    assert.equal(pending.some((record) => record.idempotencyKey === "task4-reactivated-question"), false)
 
     const sendCalls = []
     const dispatcher = notificationDispatcher.createWechatNotificationDispatcher({
@@ -1585,11 +1633,11 @@ test("通知分发：failed 记录只有在 token 已重新激活后才会回到
     })
     await dispatcher.drainOutboundMessages()
 
-    assert.equal(sendCalls.length, 1)
-    assert.equal(sendCalls[0]?.contextToken, "ctx-reactivated")
+    assert.equal(sendCalls.length, 0)
 
-    const sentRecord = JSON.parse(await readFile(statePaths.notificationStatePath("task4-reactivated-question"), "utf8"))
-    assert.equal(sentRecord.status, "sent")
+    const failedAfterReactivation = JSON.parse(await readFile(statePaths.notificationStatePath("task4-reactivated-question"), "utf8"))
+    assert.equal(failedAfterReactivation.status, "failed")
+    assert.match(String(failedAfterReactivation.failureReason), /mock-send-failed-once/i)
   } finally {
     await isolatedWechatStateRoot.restore()
   }
@@ -2282,6 +2330,28 @@ test("通知文案格式化：terminal result 同时展示入口标识、终结�
   assert.match(text, /不再接受回复/)
 })
 
+test("通知文案格式化：broker-state-store legacy closure 可直接生成稳定关闭文案", async () => {
+  const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-legacy-handle-closure-format`)
+
+  const upgradedQuestionText = notificationFormat.formatBrokerLegacyHandleClosureText({
+    kind: "question",
+    handle: "qlegacy99",
+    reason: "upgraded",
+    message: "问题入口 qlegacy99 已在升级后关闭，请查看新入口或重新获取通知",
+  })
+  const continuedNaturalStopText = notificationFormat.formatBrokerLegacyHandleClosureText({
+    kind: "naturalStop",
+    handle: "slegacy99",
+    reason: "continued",
+  })
+
+  assert.match(upgradedQuestionText, /qlegacy99/)
+  assert.match(upgradedQuestionText, /升级后关闭/)
+  assert.match(continuedNaturalStopText, /slegacy99/)
+  assert.match(continuedNaturalStopText, /已在电脑端继续处理/)
+  assert.match(continuedNaturalStopText, /不再接受回复/)
+})
+
 test("通知文案格式化：natural-stop 给出逐行独立 /reply s* 你的补充内容 示例", async () => {
   const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-natural-stop-format`)
 
@@ -2326,6 +2396,38 @@ test("通知文案格式化：ordinary retry/sessionError 展示三段式摘要�
   assert.match(text, /处理建议：建议尽快人工查看/)
   assert.doesNotMatch(text, /\/reply s\d+/)
   assert.doesNotMatch(text, /等待你的回复/)
+})
+
+test("通知文案格式化：broker 权威 retry summary 提示 /status 重新激活，且不再出现 fallback toast sidecar 字样", async () => {
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-authoritative-retry-format`)
+  const notificationFormat = await import(`${DIST_NOTIFICATION_FORMAT_MODULE}?reload=${Date.now()}-authoritative-retry-format`)
+
+  const state = brokerStateStore.createEmptyBrokerState()
+  brokerStateStore.upsertRetryErrorSummary(state, {
+    instanceID: "instance-authoritative-retry-format",
+    action: "在微信发送 /status 重新激活",
+    redactedSummary: "微信通知发送失败，当前微信会话可能已失效",
+    severityAdvice: "建议尽快人工查看",
+    updatedAt: 1_700_600_100_047,
+  })
+
+  const retry = brokerStateStore.readBrokerAuthoritativeView(state).active.retryErrors["instance-authoritative-retry-format"]
+  const text = notificationFormat.formatWechatNotificationText({
+    idempotencyKey: "authoritative-retry-format-1",
+    kind: "sessionError",
+    sessionID: typeof retry?.sessionID === "string" ? retry.sessionID : undefined,
+    action: retry?.action,
+    redactedSummary: retry?.redactedSummary,
+    severityAdvice: retry?.severityAdvice,
+    wechatAccountId: "wx-main",
+    userId: "u-main",
+    createdAt: 1_700_600_100_047,
+    status: "pending",
+  })
+
+  assert.match(text, /在微信发送 \/status 重新激活/)
+  assert.match(text, /微信通知发送失败|会话可能已失效/)
+  assert.doesNotMatch(text, /showFallbackToast|fallbackToastDropped/)
 })
 
 test("通知分发：发送成功后若 markNotificationSent 因竞争失败，不应降级写成 failed", async () => {
@@ -2572,7 +2674,6 @@ test("通知分发：同一旧入口的 terminal result 只发送一次", async 
   const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}-request-terminal-only-once-dispatcher`)
   const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-request-terminal-only-once-store`)
   const operatorStore = await import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}-request-terminal-only-once-operator`)
-  const protocol = await import(`${DIST_PROTOCOL_MODULE}?reload=${Date.now()}-request-terminal-only-once-protocol`)
   const requestStore = await import(`${DIST_REQUEST_STORE_MODULE}?reload=${Date.now()}-request-terminal-only-once-request-store`)
 
   await operatorStore.rebindOperator({
@@ -2596,58 +2697,12 @@ test("通知分发：同一旧入口的 terminal result 只发送一次", async 
   const endpoint = createBrokerEndpoint(tempDir)
   const server = await brokerServer.startBrokerServer(endpoint)
 
-  const syncCandidates = async (candidates) => {
-    const socket = net.createConnection(endpoint)
-    await new Promise((resolve, reject) => {
-      socket.once("connect", resolve)
-      socket.once("error", reject)
-    })
-
-    await new Promise((resolve, reject) => {
-      let buffer = ""
-      socket.on("data", (chunk) => {
-        buffer += chunk.toString("utf8")
-        while (true) {
-          const newlineIndex = buffer.indexOf("\n")
-          if (newlineIndex === -1) {
-            return
-          }
-          const line = buffer.slice(0, newlineIndex + 1)
-          buffer = buffer.slice(newlineIndex + 1)
-          try {
-            const envelope = protocol.parseEnvelopeLine(line)
-            if (envelope.type === "registerAck") {
-              socket.write(
-                protocol.serializeEnvelope({
-                  id: `sync-terminal-only-once-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-                  type: "syncWechatNotifications",
-                  instanceID: "instance-terminal-only-once",
-                  sessionToken: envelope.payload.sessionToken,
-                  payload: { candidates },
-                }),
-              )
-              resolve()
-              return
-            }
-          } catch (error) {
-            reject(error)
-            return
-          }
-        }
-      })
-      socket.once("error", reject)
-      socket.write(
-        protocol.serializeEnvelope({
-          id: `register-terminal-only-once-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          type: "registerInstance",
-          instanceID: "instance-terminal-only-once",
-          payload: { pid: process.pid },
-        }),
-      )
-    })
-
-    socket.destroy()
-  }
+  const syncCandidates = async (candidates) => registerAndSyncCandidates({
+    endpoint,
+    protocol: null,
+    instanceID: "instance-terminal-only-once",
+    candidates,
+  })
 
   try {
     await syncCandidates([
@@ -2844,19 +2899,10 @@ test("通知分发：sync terminal finalization 与并发终结竞争时不会�
       return request
     })
 
-    let raced = false
-    brokerServer.setBrokerServerTestHooks({
-      beforeFinalizeOpenRequest: async ({ request }) => {
-        if (raced || request.routeKey !== open.routeKey) {
-          return
-        }
-        raced = true
-        await requestStore.markRequestRejected({
-          kind: "permission",
-          routeKey: request.routeKey,
-          rejectedAt: 1_700_621_000_100,
-        })
-      },
+    await requestStore.markRequestRejected({
+      kind: "permission",
+      routeKey: open.routeKey,
+      rejectedAt: 1_700_621_000_100,
     })
 
     await registerAndSyncCandidates({
@@ -2892,13 +2938,12 @@ test("通知分发：sync terminal finalization 与并发终结竞争时不会�
     assert.equal(terminal.terminalReason, "rejected")
     assert.equal(sendCalls.filter((text) => /p1/.test(text) && /已在电脑端拒绝/.test(text)).length, 1)
   } finally {
-    brokerServer.setBrokerServerTestHooks(undefined)
     await server.close().catch(() => {})
     await isolatedWechatStateRoot.restore()
   }
 })
 
-test("通知分发：expired request 会生成 terminal result，且 cleanup/purge 不会补第二条", async () => {
+test("通知分发：旧 instances snapshot 不再驱动 request 过期或 terminal result", async () => {
   const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-terminal-expired-")
   const previousHeartbeatTimeout = process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
   process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = "1"
@@ -2943,6 +2988,7 @@ test("通知分发：expired request 会生成 terminal result，且 cleanup/pur
       userId: "u-terminal-expired",
       createdAt: 1_700_630_000_000,
     })
+    await mkdir(path.dirname(statePaths.instanceStatePath("instance-terminal-expired")), { recursive: true })
     await writeFile(
       statePaths.instanceStatePath("instance-terminal-expired"),
       JSON.stringify({
@@ -2959,17 +3005,12 @@ test("通知分发：expired request 会生成 terminal result，且 cleanup/pur
     const server = await brokerServer.startBrokerServer(endpoint)
 
     try {
-      const expired = await waitFor(async () => {
-        const terminal = await requestStore.findTerminalRequestByHandle({ kind: "question", handle: "q1" })
-        assert.equal(terminal?.terminalReason, "expired")
-        assert.equal(terminal?.terminalResultSent, true)
-        return terminal
-      }, 4000)
-
-      await waitFor(async () => {
-        const pending = await notificationStore.listPendingNotifications()
-        assert.equal(pending.some((item) => item.kind === "requestTerminal" && item.handle === "q1"), true)
-      }, 4000)
+      const open = await requestStore.findOpenRequestByHandle({ kind: "question", handle: "q1" })
+      assert.equal(open?.status, "open")
+      assert.equal(
+        (await notificationStore.listPendingNotifications()).some((item) => item.kind === "requestTerminal" && item.handle === "q1"),
+        false,
+      )
 
       const sendCalls = []
       const dispatcher = notificationDispatcher.createWechatNotificationDispatcher({
@@ -2979,19 +3020,7 @@ test("通知分发：expired request 会生成 terminal result，且 cleanup/pur
       })
       await dispatcher.drainOutboundMessages()
 
-      assert.equal(sendCalls.some((text) => /q1/.test(text) && /已过期/.test(text) && /不再接受回复/.test(text)), true)
-
-      await requestStore.markCleaned({
-        kind: "question",
-        routeKey: expired.routeKey,
-        cleanedAt: 1_700_630_000_100,
-      })
-      await requestStore.purgeCleanedBefore({ cutoffAt: 1_700_630_000_200 })
-      await dispatcher.drainOutboundMessages()
-
-      const notificationFiles = await readdir(statePaths.notificationsDir())
-      assert.equal(notificationFiles.filter((name) => name.startsWith("request-terminal-question-")).length, 1)
-      assert.equal(sendCalls.filter((text) => /q1/.test(text) && /已过期/.test(text)).length, 1)
+      assert.equal(sendCalls.some((text) => /q1/.test(text) && /已过期|不再接受回复/.test(text)), false)
     } finally {
       await server.close().catch(() => {})
     }
@@ -3000,6 +3029,770 @@ test("通知分发：expired request 会生成 terminal result，且 cleanup/pur
       delete process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
     } else {
       process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = previousHeartbeatTimeout
+    }
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("通知分发：broker-state-store stale connection 会驱动 request 过期与 terminal result，旧 instances snapshot 只作噪音", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-authoritative-terminal-expired-")
+  const previousHeartbeatTimeout = process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
+  process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = "1"
+
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-authoritative-terminal-expired-server`)
+  const brokerStateStore = await import(`${DIST_BROKER_STATE_STORE_MODULE}?reload=${Date.now()}-authoritative-terminal-expired-state-store-read`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-authoritative-terminal-expired-store`)
+  const requestStore = await import(`${DIST_REQUEST_STORE_MODULE}?reload=${Date.now()}-authoritative-terminal-expired-request-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-authoritative-terminal-expired-state-paths`)
+
+  const staleAt = Date.now() - 10_000
+
+  try {
+    await requestStore.upsertRequest({
+      kind: "question",
+      requestID: "req-authoritative-terminal-expired-question",
+      routeKey: "route-authoritative-terminal-expired-question",
+      handle: "q3",
+      scopeKey: "instance-authoritative-terminal-expired",
+      wechatAccountId: "wx-authoritative-terminal-expired",
+      userId: "u-authoritative-terminal-expired",
+      createdAt: 1_700_631_000_000,
+    })
+    await mkdir(path.dirname(statePaths.instanceStatePath("instance-authoritative-terminal-expired")), { recursive: true })
+    await writeFile(
+      statePaths.instanceStatePath("instance-authoritative-terminal-expired"),
+      JSON.stringify({
+        instanceID: "instance-authoritative-terminal-expired",
+        pid: process.pid,
+        displayName: "Legacy Snapshot Noise",
+        projectDir: "/repo/legacy-noise",
+        connectedAt: staleAt,
+        lastHeartbeatAt: staleAt,
+        status: "connected",
+      }),
+    )
+    await persistAuthoritativeBrokerState("authoritative-terminal-expired-state", async (state) => {
+      state.connections["instance-authoritative-terminal-expired"] = {
+        "inc-authoritative-terminal-expired": {
+          instanceID: "instance-authoritative-terminal-expired",
+          instanceIncarnation: "inc-authoritative-terminal-expired",
+          online: true,
+          lastEventSeq: 2,
+          lastAckedEventSeq: 2,
+          lastSentBrokerSeq: 0,
+          connectedAt: staleAt,
+          lastObservedAt: staleAt,
+        },
+      }
+      state.active.instances["instance-authoritative-terminal-expired"] = {
+        instanceID: "instance-authoritative-terminal-expired",
+        instanceIncarnation: "inc-authoritative-terminal-expired",
+        displayName: "Authoritative Expired Instance",
+        online: true,
+      }
+      state.active.questions["route-authoritative-terminal-expired-question"] = {
+        routeKey: "route-authoritative-terminal-expired-question",
+        handle: "q3",
+        requestID: "req-authoritative-terminal-expired-question",
+        scopeKey: "instance-authoritative-terminal-expired",
+        instanceID: "instance-authoritative-terminal-expired",
+        wechatAccountId: "wx-authoritative-terminal-expired",
+        userId: "u-authoritative-terminal-expired",
+        createdAt: 1_700_631_000_000,
+      }
+      state.requestIndex = {
+        [createBrokerRequestIndexKey("question", "route-authoritative-terminal-expired-question")]: {
+          kind: "question",
+          requestID: "req-authoritative-terminal-expired-question",
+          routeKey: "route-authoritative-terminal-expired-question",
+          handle: "q3",
+          scopeKey: "instance-authoritative-terminal-expired",
+          wechatAccountId: "wx-authoritative-terminal-expired",
+          userId: "u-authoritative-terminal-expired",
+          status: "open",
+          createdAt: 1_700_631_000_000,
+        },
+      }
+    })
+
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-authoritative-terminal-expired-endpoint-"))
+    const endpoint = createBrokerEndpoint(tempDir)
+    const server = await brokerServer.startBrokerServer(endpoint)
+
+    try {
+      await waitFor(async () => {
+        const persisted = await brokerStateStore.loadBrokerStateStoreSnapshot()
+        const terminal = await brokerStateStore.readBrokerIndexedRequest({ kind: "question", routeKey: "route-authoritative-terminal-expired-question" }, persisted)
+        assert.equal(terminal?.terminalReason, "expired")
+        assert.equal(terminal?.status, "expired")
+        assert.match(persisted?.legacyHandleClosures.q3?.reason ?? "", /expired/)
+      }, 4000)
+
+      assert.equal((await notificationStore.listPendingNotifications()).some((item) => item.kind === "requestTerminal" && item.handle === "q3"), false)
+      const legacyRequest = JSON.parse(await readFile(statePaths.requestStatePath("question", "route-authoritative-terminal-expired-question"), "utf8"))
+      assert.equal(legacyRequest.status, "open")
+    } finally {
+      await server.close().catch(() => {})
+    }
+  } finally {
+    if (previousHeartbeatTimeout === undefined) {
+      delete process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
+    } else {
+      process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = previousHeartbeatTimeout
+    }
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("通知分发：旧 answered request 文件不会压过 broker-state-store 的 open question", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-authoritative-request-gating-")
+
+  const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}-authoritative-request-gating-settings`)
+  const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}-authoritative-request-gating-dispatcher`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-authoritative-request-gating-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-authoritative-request-gating-state-paths`)
+
+  try {
+    await commonSettingsStore.writeCommonSettingsStore({
+      wechat: {
+        primaryBinding: { accountId: "wx-main", userId: "u-main" },
+        notifications: {
+          enabled: true,
+          question: true,
+          permission: true,
+          sessionError: true,
+        },
+      },
+    })
+
+    await notificationStore.upsertNotification({
+      idempotencyKey: "authoritative-request-gating-question",
+      kind: "question",
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+      routeKey: "route-authoritative-request-gating-question",
+      handle: "q4",
+      createdAt: 1_700_632_000_001,
+    })
+    await writeLegacyRequestRecord(statePaths, {
+      kind: "question",
+      requestID: "req-authoritative-request-gating-question",
+      routeKey: "route-authoritative-request-gating-question",
+      handle: "q4",
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+      status: "answered",
+      createdAt: 1_700_632_000_000,
+      answeredAt: 1_700_632_000_010,
+      terminalReason: "answered",
+    })
+    await persistAuthoritativeBrokerState("authoritative-request-gating-state", async (state) => {
+      state.active.questions["route-authoritative-request-gating-question"] = {
+        routeKey: "route-authoritative-request-gating-question",
+        handle: "q4",
+        requestID: "req-authoritative-request-gating-question",
+        scopeKey: "instance-authoritative-request-gating",
+        instanceID: "instance-authoritative-request-gating",
+        wechatAccountId: "wx-main",
+        userId: "u-main",
+        createdAt: 1_700_632_000_000,
+      }
+      state.requestIndex = {
+        [createBrokerRequestIndexKey("question", "route-authoritative-request-gating-question")]: {
+          kind: "question",
+          requestID: "req-authoritative-request-gating-question",
+          routeKey: "route-authoritative-request-gating-question",
+          handle: "q4",
+          scopeKey: "instance-authoritative-request-gating",
+          wechatAccountId: "wx-main",
+          userId: "u-main",
+          status: "open",
+          createdAt: 1_700_632_000_000,
+        },
+      }
+    })
+
+    const sendCalls = []
+    const dispatcher = notificationDispatcher.createWechatNotificationDispatcher({
+      sendMessage: async (input) => {
+        sendCalls.push(input)
+      },
+    })
+
+    await dispatcher.drainOutboundMessages()
+
+    assert.equal(sendCalls.length, 1)
+    const record = JSON.parse(await readFile(statePaths.notificationStatePath("authoritative-request-gating-question"), "utf8"))
+    assert.equal(record.status, "sent")
+  } finally {
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("通知分发：只有旧 open request 文件时，pending question 不会被放行为 live 发送", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-legacy-request-no-fallback-")
+
+  const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}-legacy-request-no-fallback-settings`)
+  const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}-legacy-request-no-fallback-dispatcher`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-legacy-request-no-fallback-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-legacy-request-no-fallback-state-paths`)
+
+  try {
+    await commonSettingsStore.writeCommonSettingsStore({
+      wechat: {
+        primaryBinding: { accountId: "wx-main", userId: "u-main" },
+        notifications: {
+          enabled: true,
+          question: true,
+          permission: true,
+          sessionError: true,
+        },
+      },
+    })
+
+    await notificationStore.upsertNotification({
+      idempotencyKey: "legacy-request-no-fallback-question",
+      kind: "question",
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+      routeKey: "route-legacy-request-no-fallback-question",
+      handle: "q6",
+      createdAt: 1_700_635_000_001,
+    })
+    await writeLegacyRequestRecord(statePaths, {
+      kind: "question",
+      requestID: "req-legacy-request-no-fallback-question",
+      routeKey: "route-legacy-request-no-fallback-question",
+      handle: "q6",
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+      status: "open",
+      createdAt: 1_700_635_000_000,
+    })
+
+    const sendCalls = []
+    const dispatcher = notificationDispatcher.createWechatNotificationDispatcher({
+      sendMessage: async (input) => {
+        sendCalls.push(input)
+      },
+    })
+
+    await dispatcher.drainOutboundMessages()
+
+    assert.equal(sendCalls.length, 0)
+    const record = JSON.parse(await readFile(statePaths.notificationStatePath("legacy-request-no-fallback-question"), "utf8"))
+    assert.equal(record.status, "suppressed")
+  } finally {
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("通知分发：旧 live token 文件不会让 authoritative stale sessionError 被 suppress", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-authoritative-session-error-token-")
+
+  const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}-authoritative-session-error-token-settings`)
+  const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}-authoritative-session-error-token-dispatcher`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-authoritative-session-error-token-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-authoritative-session-error-token-state-paths`)
+
+  try {
+    await commonSettingsStore.writeCommonSettingsStore({
+      wechat: {
+        primaryBinding: { accountId: "wx-main", userId: "u-main" },
+        notifications: {
+          enabled: true,
+          question: true,
+          permission: true,
+          sessionError: true,
+        },
+      },
+    })
+
+    await notificationStore.upsertNotification({
+      idempotencyKey: "authoritative-session-error-token",
+      kind: "sessionError",
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+      createdAt: 1_700_633_000_001,
+    })
+    await writeLegacyTokenRecord(statePaths, "wx-main", "u-main", {
+      contextToken: "legacy-live-token",
+      updatedAt: 1_700_633_000_100,
+      source: "message",
+      sourceRef: "/status",
+    })
+    await persistAuthoritativeBrokerState("authoritative-session-error-token-state", async (state) => {
+      state.deliveryTokens = {
+        [createBrokerDeliveryTokenKey("wx-main", "u-main")]: {
+          wechatAccountId: "wx-main",
+          userId: "u-main",
+          contextToken: "authoritative-stale-token",
+          updatedAt: 1_700_633_000_100,
+          source: "message",
+          sourceRef: "/status",
+          staleReason: "notification-delivery-failed",
+        },
+      }
+    })
+
+    const sendCalls = []
+    const dispatcher = notificationDispatcher.createWechatNotificationDispatcher({
+      sendMessage: async (input) => {
+        sendCalls.push(input)
+      },
+    })
+
+    await dispatcher.drainOutboundMessages()
+
+    assert.equal(sendCalls.length, 0)
+    const record = JSON.parse(await readFile(statePaths.notificationStatePath("authoritative-session-error-token"), "utf8"))
+    assert.equal(record.status, "pending")
+  } finally {
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("通知分发：旧 stale token 文件不会阻止 authoritative live token 发送 pending question", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-authoritative-live-token-")
+
+  const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}-authoritative-live-token-settings`)
+  const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}-authoritative-live-token-dispatcher`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-authoritative-live-token-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-authoritative-live-token-state-paths`)
+
+  try {
+    await commonSettingsStore.writeCommonSettingsStore({
+      wechat: {
+        primaryBinding: { accountId: "wx-main", userId: "u-main" },
+        notifications: {
+          enabled: true,
+          question: true,
+          permission: true,
+          sessionError: true,
+        },
+      },
+    })
+
+    await notificationStore.upsertNotification({
+      idempotencyKey: "authoritative-live-token-question",
+      kind: "question",
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+      routeKey: "route-authoritative-live-token-question",
+      handle: "q5",
+      createdAt: 1_700_634_000_001,
+    })
+    await writeLegacyTokenRecord(statePaths, "wx-main", "u-main", {
+      contextToken: "legacy-stale-token",
+      updatedAt: 1_700_634_000_100,
+      source: "message",
+      sourceRef: "/status",
+      staleReason: "notification-delivery-failed",
+    })
+    await persistAuthoritativeBrokerState("authoritative-live-token-state", async (state) => {
+      state.active.questions["route-authoritative-live-token-question"] = {
+        routeKey: "route-authoritative-live-token-question",
+        handle: "q5",
+        requestID: "req-authoritative-live-token-question",
+        scopeKey: "instance-authoritative-live-token",
+        instanceID: "instance-authoritative-live-token",
+        wechatAccountId: "wx-main",
+        userId: "u-main",
+        createdAt: 1_700_634_000_000,
+      }
+      state.requestIndex = {
+        [createBrokerRequestIndexKey("question", "route-authoritative-live-token-question")]: {
+          kind: "question",
+          requestID: "req-authoritative-live-token-question",
+          routeKey: "route-authoritative-live-token-question",
+          handle: "q5",
+          scopeKey: "instance-authoritative-live-token",
+          wechatAccountId: "wx-main",
+          userId: "u-main",
+          status: "open",
+          createdAt: 1_700_634_000_000,
+        },
+      }
+      state.deliveryTokens = {
+        [createBrokerDeliveryTokenKey("wx-main", "u-main")]: {
+          wechatAccountId: "wx-main",
+          userId: "u-main",
+          contextToken: "authoritative-live-token",
+          updatedAt: 1_700_634_000_100,
+          source: "message",
+          sourceRef: "/status",
+        },
+      }
+    })
+
+    const sendCalls = []
+    const dispatcher = notificationDispatcher.createWechatNotificationDispatcher({
+      sendMessage: async (input) => {
+        sendCalls.push(input)
+      },
+    })
+
+    await dispatcher.drainOutboundMessages()
+
+    assert.equal(sendCalls.length, 1)
+    assert.equal(sendCalls[0]?.contextToken, "authoritative-live-token")
+    const record = JSON.parse(await readFile(statePaths.notificationStatePath("authoritative-live-token-question"), "utf8"))
+    assert.equal(record.status, "sent")
+  } finally {
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("通知分发：旧 live token 文件不会为 authoritative open question 注入 contextToken", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-legacy-token-no-context-")
+
+  const commonSettingsStore = await import(`${DIST_COMMON_SETTINGS_STORE_MODULE}?reload=${Date.now()}-legacy-token-no-context-settings`)
+  const notificationDispatcher = await import(`${DIST_NOTIFICATION_DISPATCHER_MODULE}?reload=${Date.now()}-legacy-token-no-context-dispatcher`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-legacy-token-no-context-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-legacy-token-no-context-state-paths`)
+
+  try {
+    await commonSettingsStore.writeCommonSettingsStore({
+      wechat: {
+        primaryBinding: { accountId: "wx-main", userId: "u-main" },
+        notifications: {
+          enabled: true,
+          question: true,
+          permission: true,
+          sessionError: true,
+        },
+      },
+    })
+
+    await notificationStore.upsertNotification({
+      idempotencyKey: "legacy-token-no-context-question",
+      kind: "question",
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+      routeKey: "route-legacy-token-no-context-question",
+      handle: "q7",
+      createdAt: 1_700_636_000_001,
+    })
+    await writeLegacyTokenRecord(statePaths, "wx-main", "u-main", {
+      contextToken: "legacy-live-token",
+      updatedAt: 1_700_636_000_100,
+      source: "message",
+      sourceRef: "/status",
+    })
+    await persistAuthoritativeBrokerState("legacy-token-no-context-state", async (state) => {
+      state.active.questions["route-legacy-token-no-context-question"] = {
+        routeKey: "route-legacy-token-no-context-question",
+        handle: "q7",
+        requestID: "req-legacy-token-no-context-question",
+        scopeKey: "instance-legacy-token-no-context",
+        instanceID: "instance-legacy-token-no-context",
+        wechatAccountId: "wx-main",
+        userId: "u-main",
+        createdAt: 1_700_636_000_000,
+      }
+      state.requestIndex = {
+        [createBrokerRequestIndexKey("question", "route-legacy-token-no-context-question")]: {
+          kind: "question",
+          requestID: "req-legacy-token-no-context-question",
+          routeKey: "route-legacy-token-no-context-question",
+          handle: "q7",
+          scopeKey: "instance-legacy-token-no-context",
+          wechatAccountId: "wx-main",
+          userId: "u-main",
+          status: "open",
+          createdAt: 1_700_636_000_000,
+        },
+      }
+    })
+
+    const sendCalls = []
+    const dispatcher = notificationDispatcher.createWechatNotificationDispatcher({
+      sendMessage: async (input) => {
+        sendCalls.push(input)
+      },
+    })
+
+    await dispatcher.drainOutboundMessages()
+
+    assert.equal(sendCalls.length, 1)
+    assert.equal(sendCalls[0]?.contextToken, undefined)
+    const record = JSON.parse(await readFile(statePaths.notificationStatePath("legacy-token-no-context-question"), "utf8"))
+    assert.equal(record.status, "sent")
+  } finally {
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("notification-store live read path 不再因旧 request/dead-letter 回填 scopeKey", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-no-live-backfill-")
+
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-no-live-backfill-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-no-live-backfill-state-paths`)
+
+  try {
+    await notificationStore.upsertNotification({
+      idempotencyKey: "notification-no-live-backfill-q1",
+      kind: "question",
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+      routeKey: "route-no-live-backfill-q1",
+      handle: "q8",
+      createdAt: 1_700_637_000_001,
+    })
+    await writeLegacyRequestRecord(statePaths, {
+      kind: "question",
+      requestID: "req-no-live-backfill-q1",
+      routeKey: "route-no-live-backfill-q1",
+      handle: "q8",
+      scopeKey: "instance-request-backfill",
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+      status: "open",
+      createdAt: 1_700_637_000_000,
+    })
+    const deadLetterPath = statePaths.wechatDeadLetterPath("question", "route-no-live-backfill-q1")
+    await mkdir(path.dirname(deadLetterPath), { recursive: true })
+    await writeFile(deadLetterPath, JSON.stringify({
+      kind: "question",
+      routeKey: "route-no-live-backfill-q1",
+      requestID: "req-no-live-backfill-q1",
+      handle: "q8",
+      scopeKey: "instance-dead-letter-backfill",
+      finalStatus: "expired",
+      reason: "instanceStale",
+      createdAt: 1_700_637_000_000,
+      finalizedAt: 1_700_637_000_100,
+      wechatAccountId: "wx-main",
+      userId: "u-main",
+    }))
+
+    const pending = await notificationStore.listPendingNotifications()
+    assert.equal(pending.length, 1)
+    assert.equal(pending[0]?.scopeKey, undefined)
+
+    const raw = JSON.parse(await readFile(statePaths.notificationStatePath("notification-no-live-backfill-q1"), "utf8"))
+    assert.equal(raw.scopeKey, undefined)
+  } finally {
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("broker runtime stale 只推进 broker-state-store authoritative state，不改写旧 request/dead-letter/notification 文件", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-broker-runtime-authoritative-stale-")
+  const previousHeartbeatTimeout = process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
+  process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = "1"
+
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-runtime-authoritative-stale-server`)
+  const brokerStateStore = await import(`${DIST_BROKER_STATE_STORE_MODULE}?reload=${Date.now()}-runtime-authoritative-stale-state-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-runtime-authoritative-stale-state-paths`)
+
+  const staleAt = Date.now() - 10_000
+
+  try {
+    await writeLegacyRequestRecord(statePaths, {
+      kind: "question",
+      requestID: "req-runtime-authoritative-stale-q1",
+      routeKey: "route-runtime-authoritative-stale-q1",
+      handle: "q9",
+      scopeKey: "instance-runtime-authoritative-stale",
+      wechatAccountId: "wx-runtime-authoritative-stale",
+      userId: "u-runtime-authoritative-stale",
+      status: "open",
+      createdAt: 1_700_638_000_000,
+    })
+    await writeLegacyRequestRecord(statePaths, {
+      kind: "permission",
+      requestID: "req-runtime-authoritative-stale-p1",
+      routeKey: "route-runtime-authoritative-stale-p1",
+      handle: "p9",
+      scopeKey: "instance-runtime-authoritative-stale",
+      wechatAccountId: "wx-runtime-authoritative-stale",
+      userId: "u-runtime-authoritative-stale",
+      status: "open",
+      createdAt: 1_700_638_000_100,
+    })
+    await notificationStoreSeedForRuntimeStale(statePaths)
+    await persistAuthoritativeBrokerState("runtime-authoritative-stale", async (state) => {
+      state.connections["instance-runtime-authoritative-stale"] = {
+        "inc-runtime-authoritative-stale": {
+          instanceID: "instance-runtime-authoritative-stale",
+          instanceIncarnation: "inc-runtime-authoritative-stale",
+          online: true,
+          lastEventSeq: 10,
+          lastAckedEventSeq: 10,
+          lastSentBrokerSeq: 5,
+          connectedAt: staleAt,
+          lastObservedAt: staleAt,
+        },
+      }
+      state.active.questions["route-runtime-authoritative-stale-q1"] = {
+        routeKey: "route-runtime-authoritative-stale-q1",
+        handle: "q9",
+        requestID: "req-runtime-authoritative-stale-q1",
+        scopeKey: "instance-runtime-authoritative-stale",
+        instanceID: "instance-runtime-authoritative-stale",
+        wechatAccountId: "wx-runtime-authoritative-stale",
+        userId: "u-runtime-authoritative-stale",
+        createdAt: 1_700_638_000_000,
+      }
+      state.active.permissions["route-runtime-authoritative-stale-p1"] = {
+        routeKey: "route-runtime-authoritative-stale-p1",
+        handle: "p9",
+        requestID: "req-runtime-authoritative-stale-p1",
+        scopeKey: "instance-runtime-authoritative-stale",
+        instanceID: "instance-runtime-authoritative-stale",
+        wechatAccountId: "wx-runtime-authoritative-stale",
+        userId: "u-runtime-authoritative-stale",
+        createdAt: 1_700_638_000_100,
+      }
+      state.active.naturalStops.s9 = {
+        handle: "s9",
+        scopeKey: "instance-runtime-authoritative-stale",
+        instanceID: "instance-runtime-authoritative-stale",
+        sessionID: "session-runtime-authoritative-stale",
+        replyTarget: {
+          instanceID: "instance-runtime-authoritative-stale",
+          sessionID: "session-runtime-authoritative-stale",
+        },
+        redactedSummary: "需要补充自然中止说明",
+        severityAdvice: "已停止并等待你的回复",
+      }
+      state.requestIndex = {
+        [createBrokerRequestIndexKey("question", "route-runtime-authoritative-stale-q1")]: {
+          kind: "question",
+          requestID: "req-runtime-authoritative-stale-q1",
+          routeKey: "route-runtime-authoritative-stale-q1",
+          handle: "q9",
+          scopeKey: "instance-runtime-authoritative-stale",
+          wechatAccountId: "wx-runtime-authoritative-stale",
+          userId: "u-runtime-authoritative-stale",
+          status: "open",
+          createdAt: 1_700_638_000_000,
+        },
+        [createBrokerRequestIndexKey("permission", "route-runtime-authoritative-stale-p1")]: {
+          kind: "permission",
+          requestID: "req-runtime-authoritative-stale-p1",
+          routeKey: "route-runtime-authoritative-stale-p1",
+          handle: "p9",
+          scopeKey: "instance-runtime-authoritative-stale",
+          wechatAccountId: "wx-runtime-authoritative-stale",
+          userId: "u-runtime-authoritative-stale",
+          status: "open",
+          createdAt: 1_700_638_000_100,
+        },
+      }
+    })
+
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-runtime-authoritative-stale-endpoint-"))
+    const endpoint = createBrokerEndpoint(tempDir)
+    const server = await brokerServer.startBrokerServer(endpoint)
+
+    try {
+      await waitFor(async () => {
+        const persisted = await brokerStateStore.loadBrokerStateStoreSnapshot()
+        const question = await brokerStateStore.readBrokerIndexedRequest({ kind: "question", routeKey: "route-runtime-authoritative-stale-q1" }, persisted)
+        const permission = await brokerStateStore.readBrokerIndexedRequest({ kind: "permission", routeKey: "route-runtime-authoritative-stale-p1" }, persisted)
+        assert.equal(question?.status, "expired")
+        assert.equal(permission?.status, "expired")
+        assert.equal(persisted?.active.naturalStops.s9, undefined)
+        assert.match(persisted?.legacyHandleClosures.q9?.reason ?? "", /expired/)
+        assert.match(persisted?.legacyHandleClosures.p9?.reason ?? "", /expired/)
+        assert.match(persisted?.legacyHandleClosures.s9?.reason ?? "", /expired/)
+      }, 4000)
+
+      const questionLegacy = JSON.parse(await readFile(statePaths.requestStatePath("question", "route-runtime-authoritative-stale-q1"), "utf8"))
+      const permissionLegacy = JSON.parse(await readFile(statePaths.requestStatePath("permission", "route-runtime-authoritative-stale-p1"), "utf8"))
+      const questionNotification = JSON.parse(await readFile(statePaths.notificationStatePath("notif-runtime-authoritative-stale-q1"), "utf8"))
+      const deadLetterPath = statePaths.wechatDeadLetterPath("question", "route-runtime-authoritative-stale-q1")
+
+      assert.equal(questionLegacy.status, "open")
+      assert.equal(permissionLegacy.status, "open")
+      assert.equal(questionNotification.status, "sent")
+      await assert.rejects(() => readFile(deadLetterPath, "utf8"), /ENOENT|enoent/)
+    } finally {
+      await server.close().catch(() => {})
+    }
+  } finally {
+    if (previousHeartbeatTimeout === undefined) {
+      delete process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
+    } else {
+      process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = previousHeartbeatTimeout
+    }
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("broker runtime cleanup 只看 broker-state-store terminal index，不依赖旧 request-store active list", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-broker-runtime-authoritative-cleanup-")
+  const previousCleanAfterMs = process.env.WECHAT_BROKER_REQUEST_CLEAN_AFTER_MS
+  process.env.WECHAT_BROKER_REQUEST_CLEAN_AFTER_MS = "1"
+
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-runtime-authoritative-cleanup-server`)
+  const brokerStateStore = await import(`${DIST_BROKER_STATE_STORE_MODULE}?reload=${Date.now()}-runtime-authoritative-cleanup-state-store`)
+  const statePaths = await import(`${DIST_STATE_PATHS_MODULE}?reload=${Date.now()}-runtime-authoritative-cleanup-state-paths`)
+
+  try {
+    await writeLegacyRequestRecord(statePaths, {
+      kind: "question",
+      requestID: "req-runtime-authoritative-cleanup-q1",
+      routeKey: "route-runtime-authoritative-cleanup-q1",
+      handle: "q10",
+      scopeKey: "instance-runtime-authoritative-cleanup",
+      wechatAccountId: "wx-runtime-authoritative-cleanup",
+      userId: "u-runtime-authoritative-cleanup",
+      status: "open",
+      createdAt: 1_700_639_000_000,
+    })
+    await persistAuthoritativeBrokerState("runtime-authoritative-cleanup", async (state) => {
+      state.requestIndex = {
+        [createBrokerRequestIndexKey("question", "route-runtime-authoritative-cleanup-q1")]: {
+          kind: "question",
+          requestID: "req-runtime-authoritative-cleanup-q1",
+          routeKey: "route-runtime-authoritative-cleanup-q1",
+          handle: "q10",
+          scopeKey: "instance-runtime-authoritative-cleanup",
+          wechatAccountId: "wx-runtime-authoritative-cleanup",
+          userId: "u-runtime-authoritative-cleanup",
+          status: "answered",
+          createdAt: 1_700_639_000_000,
+          answeredAt: 1,
+          terminalReason: "answered",
+        },
+      }
+      state.terminalMetadata["route-runtime-authoritative-cleanup-q1"] = {
+        reason: "answered",
+        handle: "q10",
+        requestID: "req-runtime-authoritative-cleanup-q1",
+        scopeKey: "instance-runtime-authoritative-cleanup",
+        wechatAccountId: "wx-runtime-authoritative-cleanup",
+        userId: "u-runtime-authoritative-cleanup",
+        createdAt: 1_700_639_000_000,
+        answeredAt: 1,
+      }
+    })
+
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-runtime-authoritative-cleanup-endpoint-"))
+    const endpoint = createBrokerEndpoint(tempDir)
+    const server = await brokerServer.startBrokerServer(endpoint)
+
+    try {
+      await waitFor(async () => {
+        const persisted = await brokerStateStore.loadBrokerStateStoreSnapshot()
+        const question = await brokerStateStore.readBrokerIndexedRequest({ kind: "question", routeKey: "route-runtime-authoritative-cleanup-q1" }, persisted)
+        assert.equal(question?.status, "cleaned")
+        assert.equal(typeof question?.cleanedAt, "number")
+      }, 4000)
+
+      const legacyQuestion = JSON.parse(await readFile(statePaths.requestStatePath("question", "route-runtime-authoritative-cleanup-q1"), "utf8"))
+      assert.equal(legacyQuestion.status, "open")
+    } finally {
+      await server.close().catch(() => {})
+    }
+  } finally {
+    if (previousCleanAfterMs === undefined) {
+      delete process.env.WECHAT_BROKER_REQUEST_CLEAN_AFTER_MS
+    } else {
+      process.env.WECHAT_BROKER_REQUEST_CLEAN_AFTER_MS = previousCleanAfterMs
     }
     await isolatedWechatStateRoot.restore()
   }
@@ -3123,72 +3916,19 @@ test("broker 重启后重复同步同一 open request 不重发；出现新 open
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-restart-dedupe-endpoint-"))
   const endpoint = createBrokerEndpoint(tempDir)
 
-  const registerAndSync = async ({ requestID, idempotencyKey }) => {
-    const socket = net.createConnection(endpoint)
-    await new Promise((resolve, reject) => {
-      socket.once("connect", resolve)
-      socket.once("error", reject)
-    })
-
-    await new Promise((resolve, reject) => {
-      let buffer = ""
-      socket.on("data", (chunk) => {
-        buffer += chunk.toString("utf8")
-        while (true) {
-          const newlineIndex = buffer.indexOf("\n")
-          if (newlineIndex === -1) break
-          const line = buffer.slice(0, newlineIndex + 1)
-          buffer = buffer.slice(newlineIndex + 1)
-          try {
-            const envelope = protocol.parseEnvelopeLine(line)
-            if (envelope.type === "registerAck") {
-              const sessionToken = envelope.payload?.sessionToken
-              if (typeof sessionToken !== "string" || sessionToken.length === 0) {
-                reject(new Error("registerAck missing sessionToken"))
-                return
-              }
-              socket.write(
-                protocol.serializeEnvelope({
-                  id: `sync-${requestID}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-                  type: "syncWechatNotifications",
-                  instanceID: "instance-task6",
-                  sessionToken,
-                  payload: {
-                    candidates: [
-                      {
-                        idempotencyKey,
-                        kind: "question",
-                        requestID,
-                        createdAt: 1_700_800_000_000,
-                        routeKey: `bridge-route-${requestID}`,
-                        handle: "q999",
-                      },
-                    ],
-                  },
-                }),
-              )
-              resolve()
-              return
-            }
-          } catch (error) {
-            reject(error)
-            return
-          }
-        }
-      })
-      socket.once("error", reject)
-      socket.write(
-        protocol.serializeEnvelope({
-          id: `register-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          type: "registerInstance",
-          instanceID: "instance-task6",
-          payload: { pid: process.pid },
-        }),
-      )
-    })
-
-    socket.destroy()
-  }
+  const registerAndSync = async ({ requestID, idempotencyKey }) => registerAndSyncCandidates({
+    endpoint,
+    protocol: null,
+    instanceID: "instance-task6",
+    candidates: [{
+      idempotencyKey,
+      kind: "question",
+      requestID,
+      createdAt: 1_700_800_000_000,
+      routeKey: `bridge-route-${requestID}`,
+      handle: "q999",
+    }],
+  })
 
   let server = await brokerServer.startBrokerServer(endpoint)
   try {

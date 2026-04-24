@@ -7,6 +7,12 @@ import {
   requestStatePath,
   type WechatRequestKind,
 } from "./state-paths.js"
+import {
+  loadBrokerStateStoreForMutation,
+  persistBrokerStateStoreSnapshot,
+  readBrokerIndexedRequest,
+  upsertBrokerIndexedRequest,
+} from "./broker-state-store.js"
 import { assertValidHandleInput, createHandle, createRouteKey, normalizeHandle } from "./handle.js"
 import { normalizeRequestPromptSummary, type RequestPromptSummary } from "./question-interaction.js"
 
@@ -290,6 +296,9 @@ async function writeRequest(record: RequestRecord): Promise<RequestRecord> {
   await mkdir(path.dirname(filePath), { recursive: true })
   const normalized = normalizeRecord(record)
   await writeFile(filePath, JSON.stringify(normalized, null, 2), { mode: WECHAT_FILE_MODE })
+  const brokerState = await loadBrokerStateStoreForMutation()
+  upsertBrokerIndexedRequest(brokerState, normalized)
+  await persistBrokerStateStoreSnapshot(brokerState)
   return normalized
 }
 
@@ -824,7 +833,14 @@ export async function findRequestByRouteKey(input: {
   }
 
   assertValidRouteKey(input.routeKey)
-  return readRequestIfExists(input.kind, input.routeKey)
+  const brokerRecord = await readBrokerIndexedRequest({
+    kind: input.kind,
+    routeKey: input.routeKey,
+  })
+  if (brokerRecord) {
+    return normalizeRecord(brokerRecord as RequestRecord)
+  }
+  return undefined
 }
 
 export async function markTerminalMetadata(input: {

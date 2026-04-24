@@ -1,5 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import path from "node:path"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
@@ -598,4 +599,117 @@ test("upgrade: 旧代际 qid/handle/s* 不会退化成 not found", async () => {
   } finally {
     await isolatedStateRoot.restore()
   }
+})
+
+test("broker state store: mutation loader 只复用显式注册的 live state，避免磁盘快照覆盖 requestIndex 与 deliveryTokens", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-broker-state-mutation-loader-")
+
+  try {
+    const store = await importStore("mutation-loader-live-state")
+    const statePaths = await importStatePaths("mutation-loader-live-state")
+    const liveState = store.createEmptyBrokerState()
+    store.setBrokerStateMutationTarget(liveState)
+
+    store.upsertBrokerIndexedRequest(liveState, {
+      kind: "question",
+      requestID: "req-live-1",
+      routeKey: "route-live-1",
+      handle: "qlive1",
+      scopeKey: "inst-live-1",
+      wechatAccountId: "wx-live-1",
+      userId: "user-live-1",
+      status: "open",
+      createdAt: 1_700_000_500_000,
+    })
+    store.upsertBrokerDeliveryToken(liveState, {
+      wechatAccountId: "wx-live-1",
+      userId: "user-live-1",
+      contextToken: "ctx-live-1",
+      updatedAt: 1_700_000_500_100,
+      source: "question",
+      sourceRef: "qlive1",
+      staleReason: "notification-delivery-failed",
+    })
+
+    await mkdir(path.dirname(statePaths.brokerStateStorePath()), { recursive: true })
+    await writeFile(statePaths.brokerStateStorePath(), JSON.stringify({
+      connections: {},
+      active: {
+        instances: {},
+        sessions: {},
+        questions: {},
+        permissions: {},
+        naturalStops: {},
+        retryErrors: {},
+      },
+      terminalMetadata: {},
+      retainedOccupancy: {},
+      legacyHandleClosures: {},
+      requestIndex: {},
+      deliveryTokens: {},
+      commandLedger: {},
+      controlLedger: {},
+      fullSync: {
+        stagedByControlId: {},
+      },
+    }, null, 2), "utf8")
+
+    const persistedSnapshot = await store.loadBrokerStateStoreSnapshot()
+    assert.equal(persistedSnapshot?.requestIndex["question:route-live-1"], undefined)
+    assert.equal(persistedSnapshot?.deliveryTokens["wx-live-1:user-live-1"], undefined)
+
+    const mutableState = await store.loadBrokerStateStoreForMutation()
+
+    assert.equal(mutableState.requestIndex["question:route-live-1"]?.requestID, "req-live-1")
+    assert.equal(mutableState.deliveryTokens["wx-live-1:user-live-1"]?.contextToken, "ctx-live-1")
+    assert.equal(mutableState.active.questions["route-live-1"]?.handle, "qlive1")
+  } finally {
+    const store = await importStore("mutation-loader-live-state-cleanup")
+    store.setBrokerStateMutationTarget(undefined)
+    await isolatedStateRoot.restore()
+  }
+})
+
+test("broker state store: retained terminal metadata / s* occupancy / legacy close reason 可由权威视图独立承接", async () => {
+  const store = await importStore("authoritative-handle-closures")
+  const state = store.createEmptyBrokerState()
+
+  state.terminalMetadata["route-question-terminal"] = {
+    reason: "answered",
+    terminalResultSent: true,
+    retainedUntil: 1_700_001_000_000,
+  }
+  state.retainedOccupancy.s88 = {
+    handle: "s88",
+    retainedUntil: 1_700_001_000_100,
+  }
+  store.writeLegacyHandleClosure(state, {
+    kind: "question",
+    handle: "q88",
+    reason: "upgraded",
+    message: "问题入口 q88 已在升级后关闭，请查看新入口或重新获取通知",
+  })
+  store.writeLegacyHandleClosure(state, {
+    kind: "naturalStop",
+    handle: "s88",
+    reason: "continued",
+    message: "中止通知 s88 已结束\n原因：已在电脑端继续处理\n说明：该入口不再接受回复。",
+    retainedUntil: 1_700_001_000_100,
+  })
+
+  const view = store.readBrokerAuthoritativeView(state)
+
+  assert.deepEqual(view.terminalMetadata["route-question-terminal"], {
+    reason: "answered",
+    terminalResultSent: true,
+    retainedUntil: 1_700_001_000_000,
+  })
+  assert.deepEqual(view.retainedOccupancy.s88, {
+    handle: "s88",
+    retainedUntil: 1_700_001_000_100,
+  })
+  assert.equal(view.legacyHandleClosures.q88?.reason, "upgraded")
+  assert.equal(view.legacyHandleClosures.s88?.reason, "continued")
+  assert.match(store.readLegacyHandleClosure(state, { kind: "question", handle: "q88" })?.message ?? "", /升级后关闭/)
+  assert.match(store.readLegacyHandleClosure(state, { kind: "naturalStop", handle: "s88" })?.message ?? "", /不再接受回复/)
 })

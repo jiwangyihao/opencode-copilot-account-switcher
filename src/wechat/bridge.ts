@@ -32,7 +32,6 @@ import type {
   ReplyNaturalStopPayload,
   ReplyPermissionPayload,
   ReplyQuestionPayload,
-  ShowFallbackToastPayload,
   WechatNotificationCandidate,
 } from "./protocol.js"
 import { extractPermissionPromptSummary, extractQuestionPromptSummary } from "./question-interaction.js"
@@ -81,6 +80,14 @@ export type WechatInstanceStatusSnapshot = {
   unavailable?: InstanceUnavailableKind[]
 }
 
+export type WechatFallbackToast = {
+  wechatAccountId: string
+  userId: string
+  message: string
+  reason: "deliveryFailed"
+  registrationEpoch?: string
+}
+
 export type WechatBridgeInput = {
   instanceID: string
   instanceName: string
@@ -91,15 +98,14 @@ export type WechatBridgeInput = {
   liveReadTimeoutMs?: number
   getActiveSessionID?: () => string | undefined
   onDiagnosticEvent?: (event: WechatBridgeDiagnosticEvent) => Promise<void> | void
-  onFallbackToast?: (payload: ShowFallbackToastPayload) => Promise<void> | void
+  onFallbackToast?: (payload: WechatFallbackToast) => Promise<void> | void
 }
 
 export type WechatBridge = {
   collectStatusSnapshot: () => Promise<WechatInstanceStatusSnapshot>
   collectNotificationCandidates: () => Promise<WechatNotificationCandidate[]>
   resyncBrokerState?: (input?: { reason?: "brokerReconnect" | "manual" }) => Promise<WechatInstanceStatusSnapshot>
-  showFallbackToast?: (payload: ShowFallbackToastPayload) => Promise<void>
-  handleBrokerEnvelope?: (envelope: BrokerEnvelope) => Promise<BrokerEnvelope | null>
+  handleBrokerEnvelope?: (envelope: BrokerEnvelope) => Promise<ReplyMutationResult | null>
 }
 
 export type WechatBridgeLifecycleInput = {
@@ -114,7 +120,7 @@ export type WechatBridgeLifecycleInput = {
   statusCollectionEnabled?: boolean
   heartbeatIntervalMs?: number
   getActiveSessionID?: () => string | undefined
-  onFallbackToast?: (payload: ShowFallbackToastPayload) => Promise<void> | void
+  onFallbackToast?: (payload: WechatFallbackToast) => Promise<void> | void
 }
 
 export type WechatBridgeLifecycle = {
@@ -209,31 +215,9 @@ function withTimeout<T>(task: () => Promise<T>, timeoutMs: number, name: string)
 }
 
 type WechatBridgeDiagnosticEvent =
-  | {
-      type: "collectStatusStage"
-      instanceID: string
-      stage: string
-      status: "fulfilled" | "rejected"
-      durationMs: number
-      timeout?: boolean
-      error?: string
-    }
-  | {
+  {
       type: "collectStatusCompleted"
       instanceID: string
-      durationMs: number
-      sessionCount: number
-      unavailable?: InstanceUnavailableKind[]
-    }
-  | {
-      type: "bridgeResyncStarted"
-      instanceID: string
-      reason: "brokerReconnect" | "manual"
-    }
-  | {
-      type: "bridgeResyncCompleted"
-      instanceID: string
-      reason: "brokerReconnect" | "manual"
       durationMs: number
       sessionCount: number
       unavailable?: InstanceUnavailableKind[]
@@ -268,10 +252,6 @@ function createWechatBridgeDiagnosticsWriter(filePath: string = wechatBridgeDiag
   }
 }
 
-function isTimeoutError(error: unknown): boolean {
-  return isErrorWithMessage(error) && /timed out/i.test(error.message)
-}
-
 function toDiagnosticErrorMessage(error: unknown): string {
   if (isErrorWithMessage(error)) {
     return error.message
@@ -287,31 +267,10 @@ function wrapDiagnosticStage<T>(
   },
   task: () => Promise<T>,
 ): Promise<T> {
-  const startedAt = Date.now()
-  return Promise.resolve()
-    .then(task)
-    .then((value) => {
-      void Promise.resolve(input.onDiagnosticEvent?.({
-        type: "collectStatusStage",
-        instanceID: input.instanceID,
-        stage: input.stage,
-        status: "fulfilled",
-        durationMs: Date.now() - startedAt,
-      })).catch(() => {})
-      return value
-    })
-    .catch((error) => {
-      void Promise.resolve(input.onDiagnosticEvent?.({
-        type: "collectStatusStage",
-        instanceID: input.instanceID,
-        stage: input.stage,
-        status: "rejected",
-        durationMs: Date.now() - startedAt,
-        timeout: isTimeoutError(error),
-        error: toDiagnosticErrorMessage(error),
-      })).catch(() => {})
-      throw error
-    })
+  void input.instanceID
+  void input.stage
+  void input.onDiagnosticEvent
+  return Promise.resolve().then(task)
 }
 
 function isSdkFieldsResult<T>(value: SdkReadResult<T>): value is SdkFieldsResult<T> {
@@ -742,27 +701,11 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
   ): Promise<WechatInstanceStatusSnapshot> => {
     const reason = options.reason ?? "manual"
     const startedAt = Date.now()
-    const onDiagnosticEvent = input.onDiagnosticEvent
-
-    await Promise.resolve(onDiagnosticEvent?.({
-      type: "bridgeResyncStarted",
-      instanceID: input.instanceID,
-      reason,
-    }))
 
     try {
-      const snapshot = await collectStatusSnapshot()
-      await Promise.resolve(onDiagnosticEvent?.({
-        type: "bridgeResyncCompleted",
-        instanceID: input.instanceID,
-        reason,
-        durationMs: Date.now() - startedAt,
-        sessionCount: snapshot.sessions.length,
-        unavailable: snapshot.unavailable,
-      }))
-      return snapshot
+      return await collectStatusSnapshot()
     } catch (error) {
-      await Promise.resolve(onDiagnosticEvent?.({
+      await Promise.resolve(input.onDiagnosticEvent?.({
         type: "bridgeResyncFailed",
         code: "bridgeResyncFailed",
         instanceID: input.instanceID,
@@ -774,42 +717,30 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
     }
   }
 
-  const handleBrokerEnvelope = async (envelope: BrokerEnvelope): Promise<BrokerEnvelope | null> => {
+  const handleBrokerEnvelope = async (envelope: BrokerEnvelope): Promise<ReplyMutationResult | null> => {
     if (envelope.type === "replyQuestion") {
       const payload = envelope.payload as ReplyQuestionPayload
       if (!input.client.question.reply) {
         return {
-          id: envelope.id,
-          type: "replyQuestionResult",
-          payload: {
-            mutationId: payload.mutationId,
-            ok: false,
-            errorMessage: "question.reply unavailable",
-          },
+          mutationId: payload.mutationId,
+          ok: false,
+          errorMessage: "question.reply unavailable",
         }
       }
       const response = await input.client.question.reply({
         requestID: payload.requestID,
         answers: payload.answers as QuestionAnswer[],
       })
-      return {
-        id: envelope.id,
-        type: "replyQuestionResult",
-        payload: normalizeReplyMutationResult(payload.mutationId, response),
-      }
+      return normalizeReplyMutationResult(payload.mutationId, response)
     }
 
     if (envelope.type === "replyPermission") {
       const payload = envelope.payload as ReplyPermissionPayload
       if (!input.client.permission.reply) {
         return {
-          id: envelope.id,
-          type: "replyPermissionResult",
-          payload: {
-            mutationId: payload.mutationId,
-            ok: false,
-            errorMessage: "permission.reply unavailable",
-          },
+          mutationId: payload.mutationId,
+          ok: false,
+          errorMessage: "permission.reply unavailable",
         }
       }
       const response = await input.client.permission.reply({
@@ -817,35 +748,23 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
         reply: payload.reply,
         ...(payload.message ? { message: payload.message } : {}),
       })
-      return {
-        id: envelope.id,
-        type: "replyPermissionResult",
-        payload: normalizeReplyMutationResult(payload.mutationId, response),
-      }
+      return normalizeReplyMutationResult(payload.mutationId, response)
     }
 
     if (envelope.type === "replyNaturalStop") {
       const payload = envelope.payload as ReplyNaturalStopPayload
       if (!input.client.session.reply) {
         return {
-          id: envelope.id,
-          type: "replyNaturalStopResult",
-          payload: {
-            mutationId: payload.mutationId,
-            ok: false,
-            errorMessage: "session.reply unavailable",
-          },
+          mutationId: payload.mutationId,
+          ok: false,
+          errorMessage: "session.reply unavailable",
         }
       }
       const response = await input.client.session.reply({
         sessionID: payload.sessionID,
         text: payload.text,
       })
-      return {
-        id: envelope.id,
-        type: "replyNaturalStopResult",
-        payload: normalizeReplyMutationResult(payload.mutationId, response),
-      }
+      return normalizeReplyMutationResult(payload.mutationId, response)
     }
 
     return null
@@ -855,9 +774,6 @@ export function createWechatBridge(input: WechatBridgeInput): WechatBridge {
     collectStatusSnapshot,
     collectNotificationCandidates,
     resyncBrokerState,
-    showFallbackToast: async (payload: ShowFallbackToastPayload) => {
-      await Promise.resolve(input.onFallbackToast?.(payload))
-    },
     handleBrokerEnvelope,
   }
 }
@@ -910,15 +826,17 @@ export async function createWechatBridgeLifecycle(
       && typeof (candidate as { ping?: unknown }).ping === "function"
     }
 
-  const supportsCompatBrokerClient = (candidate: unknown): candidate is {
-    registerInstance: (meta: { instanceID: string; pid: number }) => Promise<unknown>
+  const supportsLegacyInjectedBrokerClient = (candidate: unknown): candidate is {
+    registerInstance: (payload: Record<string, unknown>) => Promise<unknown>
     heartbeat: () => Promise<unknown>
+    close: () => Promise<void>
   } => {
     if (typeof candidate !== "object" || candidate === null) {
       return false
     }
     return typeof (candidate as { registerInstance?: unknown }).registerInstance === "function"
       && typeof (candidate as { heartbeat?: unknown }).heartbeat === "function"
+      && typeof (candidate as { close?: unknown }).close === "function"
   }
 
   function trimAckedBridgeEvents(ackedEventSeq: number) {
@@ -1109,7 +1027,7 @@ export async function createWechatBridgeLifecycle(
       acceptedAt: Date.now(),
     }))
 
-    let result: BrokerEnvelope | null = null
+    let result: ReplyMutationResult | null = null
     try {
       result = await bridge.handleBrokerEnvelope({
         id: command.commandId,
@@ -1128,8 +1046,7 @@ export async function createWechatBridgeLifecycle(
       return
     }
 
-    const payload = result?.payload as Partial<ReplyMutationResult> | undefined
-    const succeeded = payload?.ok === true
+    const succeeded = result?.ok === true
     await sendSequencedEvent(createSequencedEvent("commandResult", {
       commandId: command.commandId,
       status: succeeded ? "completed" : "failed",
@@ -1138,7 +1055,7 @@ export async function createWechatBridgeLifecycle(
         ? {}
         : {
             failure: {
-              message: payload?.errorMessage ?? `${command.type} failed`,
+              message: result?.errorMessage ?? `${command.type} failed`,
             },
           }),
     }))
@@ -1159,40 +1076,39 @@ export async function createWechatBridgeLifecycle(
   async function registerCurrentBrokerClient() {
     try {
       const currentBrokerClient = brokerClient as unknown
-      if (!supportsLiveBrokerClient(currentBrokerClient)) {
-        if (!supportsCompatBrokerClient(currentBrokerClient)) {
-          throw new TypeError("broker client does not support live or compat registration")
-        }
-        await currentBrokerClient.registerInstance({
-          instanceID,
-          pid: process.pid,
+      if (supportsLiveBrokerClient(currentBrokerClient)) {
+        brokerClient.setLiveHandlers({
+          onBrokerControl: (control) => handleBrokerControl(control),
+          onBrokerCommand: (command) => handleBrokerCommand(command),
         })
+
+        const registerResult = await brokerClient.registerHello({
+          protocolVersion: DEFAULT_BRIDGE_PROTOCOL_VERSION,
+          stateGeneration: DEFAULT_BRIDGE_STATE_GENERATION,
+          instanceID,
+          instanceIncarnation,
+          lastSeenBrokerSeq,
+          lastSentEventSeq,
+        })
+        stagedRegisterFullSyncCandidates = registerResult.control?.type === "requestFullSync"
+          ? await bridge.collectNotificationCandidates()
+          : null
+        await processRegisterResult(registerResult)
         return
       }
 
-      brokerClient.setLiveHandlers({
-        onBrokerControl: (control) => handleBrokerControl(control),
-        onBrokerCommand: (command) => handleBrokerCommand(command),
-      })
+      if (supportsLegacyInjectedBrokerClient(currentBrokerClient)) {
+        await currentBrokerClient.registerInstance({
+          instanceID,
+          pid: process.pid,
+          displayName: toInstanceName(projectName, directory),
+          projectDir: directory,
+        })
+        stagedRegisterFullSyncCandidates = null
+        return
+      }
 
-      const registerResult = await brokerClient.registerHello({
-        protocolVersion: DEFAULT_BRIDGE_PROTOCOL_VERSION,
-        stateGeneration: DEFAULT_BRIDGE_STATE_GENERATION,
-        instanceID,
-        instanceIncarnation,
-        lastSeenBrokerSeq,
-        lastSentEventSeq,
-      })
-      stagedRegisterFullSyncCandidates = registerResult.control?.type === "requestFullSync"
-        ? await bridge.collectNotificationCandidates()
-        : null
-      await brokerClient.registerInstance({
-        instanceID,
-        pid: process.pid,
-      }, stagedRegisterFullSyncCandidates
-        ? { notificationCandidates: stagedRegisterFullSyncCandidates }
-        : undefined)
-      await processRegisterResult(registerResult)
+      throw new TypeError("broker client does not support live registration")
     } catch (error) {
       await brokerClient.close().catch(() => {})
       throw error
@@ -1202,16 +1118,16 @@ export async function createWechatBridgeLifecycle(
   if (input.initialBrokerPromise) {
     try {
       const initialBroker = await input.initialBrokerPromise
-      brokerClient = await connectImpl(initialBroker.endpoint, { bridge })
+      brokerClient = await connectImpl(initialBroker.endpoint)
       await registerCurrentBrokerClient()
     } catch {
       const fallbackBroker = await connectOrSpawnBrokerImpl()
-      brokerClient = await connectImpl(fallbackBroker.endpoint, { bridge })
+      brokerClient = await connectImpl(fallbackBroker.endpoint)
       await registerCurrentBrokerClient()
     }
   } else {
     const broker = await connectOrSpawnBrokerImpl()
-    brokerClient = await connectImpl(broker.endpoint, { bridge })
+    brokerClient = await connectImpl(broker.endpoint)
     await registerCurrentBrokerClient()
   }
 
@@ -1235,7 +1151,7 @@ export async function createWechatBridgeLifecycle(
       await previousBrokerClient.close().catch(() => {})
 
       const nextBroker = await connectOrSpawnBrokerImpl()
-      const nextBrokerClient = await connectImpl(nextBroker.endpoint, { bridge })
+      const nextBrokerClient = await connectImpl(nextBroker.endpoint)
       brokerClient = nextBrokerClient
 
       try {
@@ -1258,7 +1174,7 @@ export async function createWechatBridgeLifecycle(
     const currentBrokerClient = brokerClient as unknown
     const heartbeatPromise = supportsLiveBrokerClient(currentBrokerClient)
       ? currentBrokerClient.ping()
-      : supportsCompatBrokerClient(currentBrokerClient)
+      : supportsLegacyInjectedBrokerClient(currentBrokerClient)
         ? currentBrokerClient.heartbeat()
         : Promise.reject(new TypeError("broker client does not support keepalive"))
     void heartbeatPromise.catch(() => reconnectBrokerClient().catch(() => {}))

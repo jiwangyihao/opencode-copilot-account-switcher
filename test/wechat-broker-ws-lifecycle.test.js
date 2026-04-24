@@ -65,6 +65,47 @@ async function waitForAsync(predicate, timeoutMs = 4000, intervalMs = 20) {
   }
 }
 
+async function sendCompatFrameToLiveServer(endpoint, line, protocol) {
+  const target = new URL(endpoint)
+  const socket = net.createConnection(Number(target.port), target.hostname)
+
+  return new Promise((resolve, reject) => {
+    let buffer = ""
+    let settled = false
+
+    const cleanup = () => {
+      socket.removeAllListeners()
+      if (!socket.destroyed) {
+        socket.destroy()
+      }
+    }
+
+    socket.once("connect", () => {
+      socket.write(line)
+    })
+    socket.once("error", (error) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
+      reject(error)
+    })
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8")
+      const newlineIndex = buffer.indexOf("\n")
+      if (newlineIndex === -1 || settled) {
+        return
+      }
+
+      settled = true
+      const responseLine = buffer.slice(0, newlineIndex + 1)
+      cleanup()
+      resolve(protocol.parseEnvelopeLine(responseLine))
+    })
+  })
+}
+
 test("ws lifecycle: broker client 不再让并发 request 共用单 pending 槽", async () => {
   const protocol = await importProtocol("client-multi-pending")
   const brokerClient = await importClient("client-multi-pending")
@@ -97,16 +138,18 @@ test("ws lifecycle: broker client 不再让并发 request 共用单 pending 槽"
           continue
         }
 
-        if (envelope.type === "registerInstance") {
+        if (envelope.type === "hello/register") {
           socket.write(protocol.serializeEnvelope({
             id: `registerAck-${envelope.id}`,
             type: "registerAck",
             instanceID: envelope.instanceID,
             payload: {
-              sessionToken: "session-token-1",
-              registeredAt: 1_700_000_100_000,
-              registrationEpoch: "epoch-1",
-              brokerPid: 4242,
+              protocolVersion: 2,
+              stateGeneration: "wechat-ws-v1",
+              instanceIncarnation: envelope.payload.instanceIncarnation,
+              brokerSeq: 1,
+              needReplay: false,
+              needFullSync: false,
             },
           }))
         }
@@ -121,15 +164,17 @@ test("ws lifecycle: broker client 不再让并发 request 共用单 pending 槽"
   try {
     const [pong, register] = await Promise.all([
       client.ping(),
-      client.registerInstance({
+      client.registerHello({
+        protocolVersion: 2,
+        stateGeneration: "wechat-ws-v1",
         instanceID: "inst-1",
-        pid: 4242,
+        instanceIncarnation: "inc-1",
       }),
     ])
 
     assert.equal(pong.type, "pong")
-    assert.equal(register.sessionToken, "session-token-1")
-    assert.equal(register.registrationEpoch, "epoch-1")
+    assert.equal(register.ack.protocolVersion, 2)
+    assert.equal(register.ack.instanceIncarnation, "inc-1")
   } finally {
     await client.close().catch(() => {})
     for (const socket of sockets) {
@@ -336,6 +381,7 @@ test("ws lifecycle: hello/register 与 registerAck 会按 protocolVersion/stateG
 })
 
 test("ws lifecycle live path: startBrokerServer + broker-client registerHello 会按真实水位返回 fullSync 再 replay", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-live-register-watermark-")
   const serverModule = await importServer("live-register-watermark")
   const brokerClient = await importClient("live-register-watermark")
 
@@ -396,6 +442,7 @@ test("ws lifecycle live path: startBrokerServer + broker-client registerHello �
   } finally {
     await client.close().catch(() => {})
     await server.close()
+    await isolatedStateRoot.restore()
   }
 })
 
@@ -475,9 +522,9 @@ test("ws lifecycle live path: live register 与 bridge event 会持久化 broker
   }
 })
 
-test("ws lifecycle live path: createWechatBridgeLifecycle 在 registerHello 后补齐 compat registerInstance", async () => {
+test("ws lifecycle live path: createWechatBridgeLifecycle 不再调用 compat registerInstance/heartbeat/statusSnapshot/syncWechatNotifications", async () => {
   const bridgeModule = await importBridge("live-compat-register")
-  const callOrder = []
+  const calls = []
   let liveHandlers = null
 
   const lifecycle = await bridgeModule.createWechatBridgeLifecycle(
@@ -502,7 +549,8 @@ test("ws lifecycle live path: createWechatBridgeLifecycle 在 registerHello 后�
           liveHandlers = handlers
         },
         registerHello: async (payload) => {
-          callOrder.push({ type: "hello", payload })
+          void payload
+          calls.push("registerHello")
           return {
             ack: {
               protocolVersion: 2,
@@ -515,14 +563,24 @@ test("ws lifecycle live path: createWechatBridgeLifecycle 在 registerHello 后�
             pendingCommands: [],
           }
         },
-        registerInstance: async (meta) => {
-          callOrder.push({ type: "compat", meta })
+        registerInstance: async () => {
+          calls.push("registerInstance")
           return {
             sessionToken: "session-live-compat",
             registeredAt: 1_700_000_100_000,
             registrationEpoch: "epoch-live-compat",
             brokerPid: 4242,
           }
+        },
+        heartbeat: async () => {
+          calls.push("heartbeat")
+          return { type: "pong", payload: {} }
+        },
+        sendStatusSnapshot: async () => {
+          calls.push("statusSnapshot")
+        },
+        sendSyncWechatNotifications: async () => {
+          calls.push("syncWechatNotifications")
         },
         ping: async () => ({ type: "pong", payload: {} }),
         close: async () => {},
@@ -535,10 +593,88 @@ test("ws lifecycle live path: createWechatBridgeLifecycle 在 registerHello 后�
   try {
     assert.equal(typeof liveHandlers?.onBrokerControl, "function")
     assert.equal(typeof liveHandlers?.onBrokerCommand, "function")
-    assert.deepEqual(callOrder.map((item) => item.type), ["hello", "compat"])
-    assert.equal(callOrder[1]?.meta.instanceID, callOrder[0]?.payload.instanceID)
+    assert.deepEqual(calls, ["registerHello"])
   } finally {
     await lifecycle.close().catch(() => {})
+  }
+})
+
+test("ws lifecycle live path: broker client 只暴露 live API surface", async () => {
+  const brokerClient = await importClient("live-api-surface")
+
+  const server = net.createServer(() => {})
+  const address = await listenTcpServer(server)
+  const endpoint = `tcp://127.0.0.1:${address.port}`
+  const client = await brokerClient.connect(endpoint)
+
+  try {
+    assert.equal(typeof client.registerHello, "function")
+    assert.equal(typeof client.sendBridgeEvent, "function")
+    assert.equal(typeof client.setLiveHandlers, "function")
+    assert.equal(typeof client.ping, "function")
+    assert.equal("registerInstance" in client, false)
+    assert.equal("heartbeat" in client, false)
+    assert.equal("getSessionSnapshot" in client, false)
+  } finally {
+    await client.close().catch(() => {})
+    await closeServer(server)
+  }
+})
+
+test("ws lifecycle live path: startBrokerServer 对 compat heartbeat 返回 legacy path removed", async () => {
+  const serverModule = await importServer("legacy-heartbeat-unsupported")
+  const protocol = await importProtocol("legacy-heartbeat-unsupported")
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+
+  try {
+    const response = await sendCompatFrameToLiveServer(
+      server.endpoint,
+      `${JSON.stringify({ id: "legacy-heartbeat-1", type: "heartbeat", payload: {} })}\n`,
+      protocol,
+    )
+
+    assert.equal(response.type, "error")
+    assert.match(String(response.payload?.message ?? ""), /unsupported|legacy path removed/i)
+  } finally {
+    await server.close().catch(() => {})
+  }
+})
+
+test("ws lifecycle live path: startBrokerServer 对 compat statusSnapshot 返回 legacy path removed", async () => {
+  const serverModule = await importServer("legacy-status-snapshot-unsupported")
+  const protocol = await importProtocol("legacy-status-snapshot-unsupported")
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+
+  try {
+    const response = await sendCompatFrameToLiveServer(
+      server.endpoint,
+      `${JSON.stringify({ id: "legacy-status-1", type: "statusSnapshot", instanceID: "legacy-instance", sessionToken: "legacy-token", payload: { requestId: "collect-1", snapshot: { ok: true } } })}\n`,
+      protocol,
+    )
+
+    assert.equal(response.type, "error")
+    assert.match(String(response.payload?.message ?? ""), /unsupported|legacy path removed/i)
+  } finally {
+    await server.close().catch(() => {})
+  }
+})
+
+test("ws lifecycle live path: startBrokerServer 对 compat syncWechatNotifications 返回 legacy path removed", async () => {
+  const serverModule = await importServer("legacy-sync-notifications-unsupported")
+  const protocol = await importProtocol("legacy-sync-notifications-unsupported")
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+
+  try {
+    const response = await sendCompatFrameToLiveServer(
+      server.endpoint,
+      `${JSON.stringify({ id: "legacy-sync-1", type: "syncWechatNotifications", instanceID: "legacy-instance", sessionToken: "legacy-token", payload: { candidates: [] } })}\n`,
+      protocol,
+    )
+
+    assert.equal(response.type, "error")
+    assert.match(String(response.payload?.message ?? ""), /unsupported|legacy path removed/i)
+  } finally {
+    await server.close().catch(() => {})
   }
 })
 
@@ -723,14 +859,6 @@ test("ws lifecycle: broker ack 后 bridge replay buffer 会裁剪已确认事件
         pendingCommands: [],
       }
     },
-    async registerInstance() {
-      return {
-        sessionToken: "session-trim",
-        registeredAt: 1_700_000_100_000,
-        registrationEpoch: "epoch-trim",
-        brokerPid: 4242,
-      }
-    },
     async sendBridgeEvent(event) {
       sentEventSeqs.push(event.eventSeq)
       return {
@@ -880,90 +1008,17 @@ test("ws lifecycle: 同连接上的 control 与 command push 按到达顺序串�
   }
 })
 
-test("ws lifecycle: 旧兼容 replyNaturalStop 路径仍可达", async () => {
-  const protocol = await importProtocol("compat-reply-natural-stop")
-  const brokerClient = await importClient("compat-reply-natural-stop")
+test("ws lifecycle live path: protocol public parser 不再接受 compat reply result/showFallbackToast 类型", async () => {
+  const protocol = await importProtocol("public-protocol-no-compat")
 
-  let compatResultReceived = false
-  const server = net.createServer((socket) => {
-    let buffer = ""
-
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString("utf8")
-      while (true) {
-        const newlineIndex = buffer.indexOf("\n")
-        if (newlineIndex === -1) {
-          break
-        }
-
-        const line = buffer.slice(0, newlineIndex + 1)
-        buffer = buffer.slice(newlineIndex + 1)
-        const envelope = protocol.parseEnvelopeLine(line)
-
-        if (envelope.type === "registerInstance") {
-          socket.write(protocol.serializeEnvelope({
-            id: `registerAck-${envelope.id}`,
-            type: "registerAck",
-            instanceID: envelope.instanceID,
-            payload: {
-              sessionToken: "compat-session-1",
-              registeredAt: 1_700_000_100_000,
-              registrationEpoch: "compat-epoch-1",
-              brokerPid: 4242,
-            },
-          }))
-          setTimeout(() => {
-            socket.write(protocol.serializeEnvelope({
-              id: "reply-natural-stop-1",
-              type: "replyNaturalStop",
-              payload: {
-                mutationId: "mutation-natural-stop-1",
-                sessionID: "session-natural-stop-1",
-                text: "stop now",
-              },
-            }))
-          }, 10)
-          continue
-        }
-
-        if (envelope.type === "replyNaturalStopResult") {
-          compatResultReceived = true
-        }
-      }
-    })
-  })
-
-  const address = await listenTcpServer(server)
-  const endpoint = `tcp://127.0.0.1:${address.port}`
-  const client = await brokerClient.connect(endpoint, {
-    bridge: {
-      collectStatusSnapshot: async () => ({ instanceID: "inst-compat" }),
-      collectNotificationCandidates: async () => [],
-      handleBrokerEnvelope: async (envelope) => {
-        assert.equal(envelope.type, "replyNaturalStop")
-        return {
-          id: envelope.id,
-          type: "replyNaturalStopResult",
-          payload: {
-            mutationId: "mutation-natural-stop-1",
-            ok: true,
-          },
-        }
-      },
-    },
-  })
-
-  try {
-    await client.registerInstance({
-      instanceID: "inst-compat",
-      pid: 4242,
-    })
-    await delay(80)
-    assert.equal(compatResultReceived, true)
-  } finally {
-    await client.close().catch(() => {})
-    await closeServer(server)
-  }
+  assert.throws(
+    () => protocol.parseEnvelopeLine('{"id":"legacy-reply-result-1","type":"replyNaturalStopResult","payload":{"mutationId":"m1","ok":true}}\n'),
+    /invalid message line/i,
+  )
+  assert.throws(
+    () => protocol.parseEnvelopeLine('{"id":"legacy-toast-1","type":"showFallbackToast","payload":{"message":"legacy"}}\n'),
+    /invalid message line/i,
+  )
 })
 
 test("upgrade: broker 遇到旧状态代际时不会卡死，并能通过 reconnect + full sync 自恢复", async () => {

@@ -242,6 +242,13 @@ function listBrokerViewInstanceIDs(view: BrokerAuthoritativeView): string[] {
     }
   }
 
+  for (const record of Object.values(view.active.retryErrors)) {
+    const candidate = isNonEmptyString(asObject(record).instanceID) ? String(asObject(record).instanceID).trim() : ""
+    if (candidate.length > 0) {
+      ids.add(candidate)
+    }
+  }
+
   return [...ids].sort((left, right) => left.localeCompare(right))
 }
 
@@ -255,9 +262,25 @@ function countActiveItemsBySession(
   )).length
 }
 
+function createRetryStatusHighlights(record: Record<string, unknown>): SessionDigestHighlight[] {
+  const highlights: SessionDigestHighlight[] = []
+
+  if (isNonEmptyString(record.action)) {
+    highlights.push({ kind: "status", text: `动作：${record.action.trim()}` })
+  }
+  if (isNonEmptyString(record.redactedSummary)) {
+    highlights.push({ kind: "status", text: `原因摘要：${record.redactedSummary.trim()}` })
+  }
+  if (isNonEmptyString(record.severityAdvice)) {
+    highlights.push({ kind: "status", text: `处理建议：${record.severityAdvice.trim()}` })
+  }
+
+  return highlights
+}
+
 function buildBrokerViewSnapshot(view: BrokerAuthoritativeView, instanceID: string): WechatInstanceStatusSnapshot {
   const instanceRecord = asObject(view.active.instances[instanceID])
-  const sessions = Object.values(view.active.sessions)
+  const sessions: SessionDigest[] = Object.values(view.active.sessions)
     .map((record) => asObject(record))
     .filter((record) => record.instanceID === instanceID && isNonEmptyString(record.sessionID))
     .map((record) => ({
@@ -288,6 +311,49 @@ function buildBrokerViewSnapshot(view: BrokerAuthoritativeView, instanceID: stri
       ...(Array.isArray(record.todoItems) ? { todoItems: record.todoItems } : {}),
       ...(Array.isArray(record.questionHighlights) ? { questionHighlights: record.questionHighlights } : {}),
     }))
+
+  const sessionByID = new Map(sessions.map((session) => [session.sessionID, session]))
+  let syntheticRetryIndex = 0
+
+  for (const retryRecord of Object.values(view.active.retryErrors)) {
+    const record = asObject(retryRecord)
+    if (record.instanceID !== instanceID) {
+      continue
+    }
+
+    const retrySessionID = isNonEmptyString(record.sessionID)
+      ? record.sessionID.trim()
+      : `retry-${syntheticRetryIndex + 1}`
+    let session = sessionByID.get(retrySessionID)
+    if (!session) {
+      syntheticRetryIndex += 1
+      session = {
+        sessionID: retrySessionID,
+        title: isNonEmptyString(record.sessionID) ? record.sessionID.trim() : "通知投递异常",
+        directory: "",
+        updatedAt: toFiniteNumber(record.updatedAt),
+        status: "retry",
+        pendingQuestionCount: 0,
+        pendingPermissionCount: 0,
+        todoSummary: {
+          total: 0,
+          inProgress: 0,
+          completed: 0,
+        },
+        unavailable: [],
+        highlights: [],
+      }
+      sessions.push(session)
+      sessionByID.set(retrySessionID, session)
+    }
+
+    session.status = "retry"
+    session.updatedAt = Math.max(session.updatedAt, toFiniteNumber(record.updatedAt, session.updatedAt))
+    session.highlights = [
+      ...sortHighlights(Array.isArray(session.highlights) ? session.highlights : []),
+      ...createRetryStatusHighlights(record),
+    ]
+  }
 
   return {
     instanceID,
@@ -385,7 +451,7 @@ export function formatAggregatedStatusReply(input: AggregatedStatusReplyInput): 
       }
 
       for (const highlight of sortHighlights(session.highlights)) {
-        if (highlight.kind !== "todo" && highlight.kind !== "question" && highlight.kind !== "status") {
+        if (highlight.kind !== "todo" && highlight.kind !== "question" && (highlight.kind !== "status" || session.status === "retry")) {
           sections.push(highlight.text)
         }
       }
@@ -400,15 +466,12 @@ export function formatAggregatedStatusReply(input: AggregatedStatusReplyInput): 
   return sections.join("\n")
 }
 
-export function formatAggregatedStatusReplyFromBrokerView(view: BrokerAuthoritativeView | undefined): string {
+export function buildAggregatedStatusInstancesFromBrokerView(view: BrokerAuthoritativeView | undefined): AggregatedStatusInstance[] {
   if (!view) {
-    return formatAggregatedStatusReply({
-      requestId: "broker-authoritative-view",
-      instances: [],
-    })
+    return []
   }
 
-  const instances = listBrokerViewInstanceIDs(view).map((instanceID) => {
+  return listBrokerViewInstanceIDs(view).map((instanceID) => {
     const instanceRecord = asObject(view.active.instances[instanceID])
     const connectionGroup = view.connections[instanceID]
     const isOnline = Object.values(connectionGroup ?? {}).some((connection) => connection.online)
@@ -427,9 +490,11 @@ export function formatAggregatedStatusReplyFromBrokerView(view: BrokerAuthoritat
       snapshot: buildBrokerViewSnapshot(view, instanceID),
     }
   })
+}
 
+export function formatAggregatedStatusReplyFromBrokerView(view: BrokerAuthoritativeView | undefined): string {
   return formatAggregatedStatusReply({
     requestId: "broker-authoritative-view",
-    instances,
+    instances: buildAggregatedStatusInstancesFromBrokerView(view),
   })
 }

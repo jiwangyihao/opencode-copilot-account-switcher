@@ -9,8 +9,7 @@ import {
 import { formatWechatNotificationText } from "./notification-format.js"
 import type { NotificationKind } from "./notification-types.js"
 import type { NotificationRecord } from "./notification-types.js"
-import { findRequestByRouteKey } from "./request-store.js"
-import { isLiveTokenState, readTokenState } from "./token-store.js"
+import { readBrokerDeliveryToken, readBrokerIndexedRequest } from "./broker-state-store.js"
 
 export type WechatNotificationSendInput = {
   to: string
@@ -117,8 +116,11 @@ async function shouldSuppressPendingNotification(record: {
   routeKey?: string
 }): Promise<boolean> {
   if (record.kind === "sessionError") {
-    const tokenState = await readTokenState(record.wechatAccountId, record.userId).catch(() => undefined)
-    return isLiveTokenState(tokenState) && tokenState.updatedAt > record.createdAt
+    const tokenState = await readBrokerDeliveryToken({
+      wechatAccountId: record.wechatAccountId,
+      userId: record.userId,
+    }).catch(() => undefined)
+    return Boolean(tokenState && !tokenState.staleReason && tokenState.updatedAt > record.createdAt)
   }
   if (record.kind === "requestTerminal") {
     return false
@@ -130,7 +132,7 @@ async function shouldSuppressPendingNotification(record: {
     return false
   }
 
-  const request = await findRequestByRouteKey({
+  const request = await readBrokerIndexedRequest({
     kind: record.kind,
     routeKey: record.routeKey,
   })
@@ -230,8 +232,11 @@ export function createWechatNotificationDispatcher(
             continue
           }
 
-          const tokenState = await readTokenState(record.wechatAccountId, record.userId).catch(() => undefined)
-          if (tokenState && !isLiveTokenState(tokenState)) {
+          const tokenState = await readBrokerDeliveryToken({
+            wechatAccountId: record.wechatAccountId,
+            userId: record.userId,
+          }).catch(() => undefined)
+          if (tokenState && tokenState.staleReason) {
             continue
           }
 
@@ -239,7 +244,7 @@ export function createWechatNotificationDispatcher(
             await input.sendMessage({
               to: targetUserId,
               text: formatWechatNotificationText(record),
-              ...(isLiveTokenState(tokenState) ? { contextToken: tokenState.contextToken } : {}),
+              ...(tokenState && !tokenState.staleReason ? { contextToken: tokenState.contextToken } : {}),
             })
           } catch (error) {
             let markFailedError: unknown

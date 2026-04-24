@@ -85,39 +85,32 @@ export type BrokerAckEnvelope = {
 
 export type BrokerImplementedMessageType =
   | "hello/register"
-  | "registerInstance"
   | "registerAck"
   | "ack"
-  | "heartbeat"
   | "ping"
   | "pong"
-  | "statusSnapshot"
-  | "syncWechatNotifications"
   | "error"
 
 export type BrokerFutureMessageType =
-  | "collectStatus"
   | BrokerToBridgeControlType
   | BridgeToBrokerEventType
   | "replyQuestion"
-  | "replyQuestionResult"
   | "replyNaturalStop"
-  | "replyNaturalStopResult"
   | "rejectQuestion"
   | "replyPermission"
+
+export type LegacyRemovedBrokerMessageType =
+  | "collectStatus"
+  | "registerInstance"
+  | "heartbeat"
+  | "statusSnapshot"
+  | "syncWechatNotifications"
+  | "replyQuestionResult"
+  | "replyNaturalStopResult"
   | "replyPermissionResult"
   | "showFallbackToast"
 
-export type BrokerMessageType = BrokerImplementedMessageType | BrokerFutureMessageType
-
-export type CollectStatusPayload = {
-  requestId: string
-}
-
-export type StatusSnapshotPayload = {
-  requestId: string
-  snapshot: unknown
-}
+export type BrokerMessageType = BrokerImplementedMessageType | BrokerFutureMessageType | LegacyRemovedBrokerMessageType
 
 export const SHOW_FALLBACK_TOAST_DELIVERY_FAILED_REASON = "deliveryFailed"
 
@@ -351,16 +344,11 @@ export function createBrokerAckEnvelope(payload: BrokerAckPayload): BrokerAckEnv
 function isMessageType(value: unknown): value is BrokerMessageType {
   return (
     value === "hello/register" ||
-    value === "registerInstance" ||
     value === "registerAck" ||
     value === "ack" ||
-    value === "heartbeat" ||
     value === "ping" ||
     value === "pong" ||
-    value === "statusSnapshot" ||
-    value === "syncWechatNotifications" ||
     value === "error" ||
-    value === "collectStatus" ||
     value === "requestReplay" ||
     value === "requestFullSync" ||
     value === "instanceOnline" ||
@@ -379,13 +367,9 @@ function isMessageType(value: unknown): value is BrokerMessageType {
     value === "commandResult" ||
     value === "fullSyncCompleted" ||
     value === "replyQuestion" ||
-    value === "replyQuestionResult" ||
     value === "replyNaturalStop" ||
-    value === "replyNaturalStopResult" ||
     value === "rejectQuestion" ||
-    value === "replyPermission" ||
-    value === "replyPermissionResult" ||
-    value === "showFallbackToast"
+    value === "replyPermission"
   )
 }
 

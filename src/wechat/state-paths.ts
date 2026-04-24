@@ -105,7 +105,6 @@ async function ensureDir(dirPath: string) {
 
 export async function ensureWechatStateLayout() {
   await ensureDir(wechatStateRoot())
-  await ensureDir(instancesDir())
   await ensureDir(tokensDir())
   await ensureDir(notificationsDir())
   await ensureDir(wechatDeadLetterKindDir("question"))

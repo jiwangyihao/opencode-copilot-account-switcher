@@ -67,8 +67,8 @@ test("ensureWechatStateLayout 会创建完整目录树", async () => {
 
   const requiredDirs = [
     statePaths.wechatStateRoot(),
-    statePaths.instancesDir(),
     statePaths.tokensDir(),
+    statePaths.notificationsDir(),
     statePaths.wechatDeadLetterKindDir("question"),
     statePaths.wechatDeadLetterKindDir("permission"),
     statePaths.requestKindDir("question"),
@@ -79,6 +79,11 @@ test("ensureWechatStateLayout 会创建完整目录树", async () => {
     const info = await stat(dirPath)
     assert.equal(info.isDirectory(), true)
   }
+
+  await assert.rejects(
+    () => stat(statePaths.instancesDir()),
+    (error) => error?.code === "ENOENT",
+  )
 })
 
 test("权限边界策略在 POSIX/Windows 下可识别", async () => {
@@ -95,8 +100,8 @@ test("权限边界策略在 POSIX/Windows 下可识别", async () => {
 
   const dirs = [
     statePaths.wechatStateRoot(),
-    statePaths.instancesDir(),
     statePaths.tokensDir(),
+    statePaths.notificationsDir(),
     statePaths.wechatDeadLetterKindDir("question"),
     statePaths.wechatDeadLetterKindDir("permission"),
     statePaths.requestKindDir("question"),

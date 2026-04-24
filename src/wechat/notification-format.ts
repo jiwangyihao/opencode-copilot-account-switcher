@@ -1,25 +1,6 @@
 import type { NaturalStopTerminalReason, NotificationRecord } from "./notification-types.js"
+import type { BrokerLegacyHandleClosure } from "./broker-state-store.js"
 import type { RequestTerminalReason } from "./request-store.js"
-import {
-  SHOW_FALLBACK_TOAST_DELIVERY_FAILED_REASON,
-  type ShowFallbackToastPayload,
-} from "./protocol.js"
-
-export const WECHAT_FALLBACK_TOAST_MESSAGE = "微信会话可能已失效，请在微信发送 /status 重新激活"
-
-export function createDeliveryFailedFallbackToastPayload(input: {
-  wechatAccountId: string
-  userId: string
-  registrationEpoch: string
-}): ShowFallbackToastPayload {
-  return {
-    wechatAccountId: input.wechatAccountId,
-    userId: input.userId,
-    message: WECHAT_FALLBACK_TOAST_MESSAGE,
-    reason: SHOW_FALLBACK_TOAST_DELIVERY_FAILED_REASON,
-    registrationEpoch: input.registrationEpoch,
-  }
-}
 
 function formatHandle(handle: string | undefined, fallback: string): string {
   if (typeof handle === "string" && handle.trim().length > 0) {
@@ -83,6 +64,20 @@ function formatNaturalStopTerminalReasonLabel(reason: NaturalStopTerminalReason 
   if (reason === "continued") return "已在电脑端继续处理"
   if (reason === "expired") return "已过期"
   return "已结束"
+}
+
+function toRequestTerminalReason(reason: string | undefined): RequestTerminalReason | undefined {
+  if (reason === "answered" || reason === "rejected" || reason === "expired" || reason === "replaced") {
+    return reason
+  }
+  return undefined
+}
+
+function toNaturalStopTerminalReason(reason: string | undefined): NaturalStopTerminalReason | undefined {
+  if (reason === "replied" || reason === "continued" || reason === "expired") {
+    return reason
+  }
+  return undefined
 }
 
 export function formatNaturalStopClosedText(input: {
@@ -151,6 +146,26 @@ export function formatTerminalRequestClosedText(input: {
       : []),
   ]
   return lines.join("\n")
+}
+
+export function formatBrokerLegacyHandleClosureText(input: Pick<BrokerLegacyHandleClosure, "kind" | "handle" | "reason" | "message" | "replacementHandle">): string {
+  if (typeof input.message === "string" && input.message.trim().length > 0) {
+    return input.message.trim()
+  }
+
+  if (input.kind === "naturalStop") {
+    return formatNaturalStopClosedText({
+      handle: input.handle,
+      terminalReason: toNaturalStopTerminalReason(input.reason),
+    })
+  }
+
+  return formatTerminalRequestClosedText({
+    requestKind: input.kind,
+    handle: input.handle,
+    terminalReason: toRequestTerminalReason(input.reason),
+    replacementHandle: input.replacementHandle,
+  })
 }
 
 export function formatWechatNotificationText(record: NotificationRecord): string {
