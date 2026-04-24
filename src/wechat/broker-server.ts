@@ -725,6 +725,18 @@ async function handleMessage(envelope: IncomingBrokerEnvelope, socket: net.Socke
   const requestId = getRequestId(envelope)
 
   if (envelope.type === "ping") {
+    const liveRegistration = liveBridgeBySocket.get(socket)
+    if (liveRegistration) {
+      await queueBrokerMutation("ping", async () => {
+        markBrokerConnectionObserved(liveWsCoordinator.getState(), {
+          instanceID: liveRegistration.instanceID,
+          instanceIncarnation: liveRegistration.instanceIncarnation,
+          observedAt: Date.now(),
+        })
+        await persistBrokerStateStoreSnapshot(liveWsCoordinator.getState())
+      }).catch(() => {})
+    }
+
     writeEnvelope(socket, {
       id: `pong-${requestId}`,
       type: "pong",

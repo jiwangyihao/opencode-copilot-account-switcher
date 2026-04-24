@@ -678,6 +678,78 @@ test("ws lifecycle live path: startBrokerServer 对 compat syncWechatNotificatio
   }
 })
 
+test("ws lifecycle live path: ping 会更新 broker 观察时间并避免活连接被误判 stale", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-ping-observed-")
+  const serverModule = await importServer("live-ping-observed")
+  const brokerClient = await importClient("live-ping-observed")
+  const statePaths = await importStatePaths("live-ping-observed")
+  const previousHeartbeatTimeoutMs = process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
+  const previousHeartbeatScanIntervalMs = process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS
+
+  process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = "80"
+  process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS = "20"
+
+  const server = await serverModule.startBrokerServer("tcp://127.0.0.1:0")
+  const client = await brokerClient.connect(server.endpoint)
+
+  try {
+    const registerResult = await client.registerHello({
+      protocolVersion: serverModule.WECHAT_BROKER_WS_PROTOCOL_VERSION,
+      stateGeneration: serverModule.WECHAT_BROKER_WS_STATE_GENERATION,
+      instanceID: "inst-ping-observed-1",
+      instanceIncarnation: "inc-ping-observed-1",
+      lastSeenBrokerSeq: 0,
+      lastSentEventSeq: 0,
+    })
+
+    await client.sendBridgeEvent({
+      type: "instanceOnline",
+      eventSeq: 1,
+      instanceIncarnation: "inc-ping-observed-1",
+      payload: {
+        instanceID: "inst-ping-observed-1",
+        connectedAt: 1_700_001_400_000,
+      },
+    }, {
+      instanceID: "inst-ping-observed-1",
+      controlId: registerResult.control?.controlId,
+    })
+
+    await waitForAsync(async () => {
+      const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      return raw.connections?.["inst-ping-observed-1"]?.["inc-ping-observed-1"]?.online === true
+    }, 5_000)
+
+    await delay(60)
+    await client.ping()
+    await delay(60)
+
+    const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+    const connection = raw.connections?.["inst-ping-observed-1"]?.["inc-ping-observed-1"]
+
+    assert.equal(connection?.online, true)
+    assert.equal(typeof connection?.lastObservedAt, "number")
+    assert.equal("disconnectedAt" in connection, false)
+    assert.equal("disconnectReason" in connection, false)
+  } finally {
+    if (previousHeartbeatTimeoutMs === undefined) {
+      delete process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
+    } else {
+      process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = previousHeartbeatTimeoutMs
+    }
+
+    if (previousHeartbeatScanIntervalMs === undefined) {
+      delete process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS
+    } else {
+      process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS = previousHeartbeatScanIntervalMs
+    }
+
+    await client.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedStateRoot.restore()
+  }
+})
+
 test("ws lifecycle live path: createWechatBridgeLifecycle steady keepalive 会继续采样内容变化，但不会重复触发 full sync", async () => {
   const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-live-lifecycle-")
   const serverModule = await importServer("live-bridge-lifecycle")
