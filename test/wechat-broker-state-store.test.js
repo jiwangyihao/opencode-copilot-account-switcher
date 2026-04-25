@@ -147,6 +147,87 @@ test("broker state store: full sync 只替换活状态域，不清 terminal meta
   assert.equal(state.active.sessions["session-2"].sessionID, "session-2")
 })
 
+test("broker state store: full sync handle 去重不抢占非目标 scope 的既有 handle", async () => {
+  const store = await importStore("full-sync-handle-preserve")
+  const state = store.createEmptyBrokerState()
+
+  state.active.questions["route-existing"] = {
+    instanceID: "inst-existing",
+    instanceIncarnation: "inc-existing",
+    routeKey: "route-existing",
+    requestID: "request-existing",
+    handle: "q1",
+    createdAt: 1_700_000_200_000,
+  }
+
+  store.applyFullSyncSnapshot(
+    state,
+    {
+      instanceID: "inst-incoming",
+      instanceIncarnation: "inc-incoming",
+    },
+    {
+      active: {
+        instances: {},
+        sessions: {},
+        questions: {
+          "route-incoming": {
+            routeKey: "route-incoming",
+            requestID: "request-incoming",
+            handle: "q1",
+            createdAt: 1_700_000_100_000,
+          },
+        },
+        permissions: {},
+        naturalStops: {},
+        retryErrors: {},
+      },
+    },
+  )
+
+  assert.equal(state.active.questions["route-existing"].handle, "q1")
+  assert.equal(state.active.questions["route-incoming"].handle, "q2")
+})
+
+test("broker state store: close event 保留 canonical handle 与已发送终态标记", async () => {
+  const store = await importStore("close-preserve-terminal-sent")
+  const state = store.createEmptyBrokerState()
+  const routeKey = "permission-close-preserve"
+
+  state.active.permissions[routeKey] = {
+    instanceID: "inst-close-preserve",
+    instanceIncarnation: "inc-close-preserve",
+    routeKey,
+    requestID: "permission-close-preserve-request",
+    handle: "p2",
+    scopeKey: "inst-close-preserve",
+    createdAt: 1_700_000_300_000,
+  }
+  state.terminalMetadata[routeKey] = {
+    reason: "answered",
+    handle: "p2",
+    scopeKey: "inst-close-preserve",
+    terminalResultSent: true,
+  }
+
+  store.applyBridgeEvent(state, {
+    type: "permissionClosed",
+    eventSeq: 10,
+    instanceIncarnation: "inc-close-preserve",
+    payload: {
+      routeKey,
+      handle: "p1",
+      reason: "handled",
+      updatedAt: 1_700_000_300_500,
+    },
+  })
+
+  assert.equal(state.terminalMetadata[routeKey].handle, "p2")
+  assert.equal(state.terminalMetadata[routeKey].terminalResultSent, true)
+  assert.equal(state.legacyHandleClosures.p2?.reason, "handled")
+  assert.equal(state.legacyHandleClosures.p1, undefined)
+})
+
 test("broker state store: command ledger 保存 queued/delivered/accepted/completed/failed", async () => {
   const store = await importStore("command-ledger")
   const state = store.createEmptyBrokerState()

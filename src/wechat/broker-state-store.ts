@@ -1,5 +1,6 @@
 import path from "node:path"
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import { createHandle, normalizeHandle } from "./handle.js"
 import type {
   BrokerAckPayload,
   BrokerCommandStatus,
@@ -1020,6 +1021,9 @@ export function applyBridgeEvent<TPayload = unknown>(
         ...(instanceID ? { instanceID } : {}),
         instanceIncarnation: event.instanceIncarnation,
       }
+      state.active.questions = ensureUniqueBrokerRequestHandles(state.active.questions, "question", {
+        updatedRouteKey: routeKey,
+      })
       const handle = getStringField(payload, "handle")
       if (handle) {
         delete state.legacyHandleClosures[handle]
@@ -1032,16 +1036,24 @@ export function applyBridgeEvent<TPayload = unknown>(
         throw new Error("invalid question payload")
       }
       const currentQuestion = isRecord(state.active.questions[routeKey]) ? state.active.questions[routeKey] : undefined
+      const previousTerminal = state.terminalMetadata[routeKey]
       delete state.active.questions[routeKey]
       const reason = getStringField(payload, "reason")
       if (reason) {
-        const handle = getStringField(payload, "handle") ?? (currentQuestion ? getStringField(currentQuestion, "handle") : undefined)
-        const requestID = getStringField(payload, "requestID") ?? (currentQuestion ? getStringField(currentQuestion, "requestID") : undefined)
-        const scopeKey = getStringField(payload, "scopeKey") ?? (currentQuestion ? readBrokerScopeKey(currentQuestion) : undefined)
-        const wechatAccountId = getStringField(payload, "wechatAccountId") ?? (currentQuestion ? getStringField(currentQuestion, "wechatAccountId") : undefined)
-        const userId = getStringField(payload, "userId") ?? (currentQuestion ? getStringField(currentQuestion, "userId") : undefined)
-        const createdAt = getNumberField(payload, "createdAt") ?? (currentQuestion ? getNumberField(currentQuestion, "createdAt") : undefined)
+        const handle = (currentQuestion ? getStringField(currentQuestion, "handle") : undefined)
+          ?? (isNonEmptyString(previousTerminal?.handle) ? previousTerminal.handle : undefined)
+          ?? getStringField(payload, "handle")
+        const requestID = getStringField(payload, "requestID") ?? (currentQuestion ? getStringField(currentQuestion, "requestID") : undefined) ?? previousTerminal?.requestID
+        const scopeKey = getStringField(payload, "scopeKey") ?? (currentQuestion ? readBrokerScopeKey(currentQuestion) : undefined) ?? previousTerminal?.scopeKey
+        const wechatAccountId = getStringField(payload, "wechatAccountId") ?? (currentQuestion ? getStringField(currentQuestion, "wechatAccountId") : undefined) ?? previousTerminal?.wechatAccountId
+        const userId = getStringField(payload, "userId") ?? (currentQuestion ? getStringField(currentQuestion, "userId") : undefined) ?? previousTerminal?.userId
+        const createdAt = getNumberField(payload, "createdAt") ?? (currentQuestion ? getNumberField(currentQuestion, "createdAt") : undefined) ?? previousTerminal?.createdAt
         const terminalAt = getNumberField(payload, "updatedAt") ?? (currentQuestion ? getNumberField(currentQuestion, "updatedAt") : undefined)
+        const terminalResultSent = previousTerminal?.terminalResultSent === true || payload.terminalResultSent === true
+          ? true
+          : payload.terminalResultSent === false
+            ? false
+            : undefined
         state.terminalMetadata[routeKey] = {
           reason,
           ...(handle ? { handle } : {}),
@@ -1055,8 +1067,8 @@ export function applyBridgeEvent<TPayload = unknown>(
           ...(reason === "rejected" && terminalAt !== undefined ? { rejectedAt: terminalAt } : {}),
           ...(reason === "expired" && terminalAt !== undefined ? { expiredAt: terminalAt } : {}),
           ...(isNonEmptyString(payload.replacementHandle) ? { replacementHandle: payload.replacementHandle } : {}),
-          ...(typeof payload.terminalResultSent === "boolean"
-            ? { terminalResultSent: payload.terminalResultSent }
+          ...(typeof terminalResultSent === "boolean"
+            ? { terminalResultSent }
             : {}),
           ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
         }
@@ -1086,6 +1098,9 @@ export function applyBridgeEvent<TPayload = unknown>(
         ...(instanceID ? { instanceID } : {}),
         instanceIncarnation: event.instanceIncarnation,
       }
+      state.active.permissions = ensureUniqueBrokerRequestHandles(state.active.permissions, "permission", {
+        updatedRouteKey: routeKey,
+      })
       const handle = getStringField(payload, "handle")
       if (handle) {
         delete state.legacyHandleClosures[handle]
@@ -1098,16 +1113,24 @@ export function applyBridgeEvent<TPayload = unknown>(
         throw new Error("invalid permission payload")
       }
       const currentPermission = isRecord(state.active.permissions[routeKey]) ? state.active.permissions[routeKey] : undefined
+      const previousTerminal = state.terminalMetadata[routeKey]
       delete state.active.permissions[routeKey]
       const reason = getStringField(payload, "reason")
       if (reason) {
-        const handle = getStringField(payload, "handle") ?? (currentPermission ? getStringField(currentPermission, "handle") : undefined)
-        const requestID = getStringField(payload, "requestID") ?? (currentPermission ? getStringField(currentPermission, "requestID") : undefined)
-        const scopeKey = getStringField(payload, "scopeKey") ?? (currentPermission ? readBrokerScopeKey(currentPermission) : undefined)
-        const wechatAccountId = getStringField(payload, "wechatAccountId") ?? (currentPermission ? getStringField(currentPermission, "wechatAccountId") : undefined)
-        const userId = getStringField(payload, "userId") ?? (currentPermission ? getStringField(currentPermission, "userId") : undefined)
-        const createdAt = getNumberField(payload, "createdAt") ?? (currentPermission ? getNumberField(currentPermission, "createdAt") : undefined)
+        const handle = (currentPermission ? getStringField(currentPermission, "handle") : undefined)
+          ?? (isNonEmptyString(previousTerminal?.handle) ? previousTerminal.handle : undefined)
+          ?? getStringField(payload, "handle")
+        const requestID = getStringField(payload, "requestID") ?? (currentPermission ? getStringField(currentPermission, "requestID") : undefined) ?? previousTerminal?.requestID
+        const scopeKey = getStringField(payload, "scopeKey") ?? (currentPermission ? readBrokerScopeKey(currentPermission) : undefined) ?? previousTerminal?.scopeKey
+        const wechatAccountId = getStringField(payload, "wechatAccountId") ?? (currentPermission ? getStringField(currentPermission, "wechatAccountId") : undefined) ?? previousTerminal?.wechatAccountId
+        const userId = getStringField(payload, "userId") ?? (currentPermission ? getStringField(currentPermission, "userId") : undefined) ?? previousTerminal?.userId
+        const createdAt = getNumberField(payload, "createdAt") ?? (currentPermission ? getNumberField(currentPermission, "createdAt") : undefined) ?? previousTerminal?.createdAt
         const terminalAt = getNumberField(payload, "updatedAt") ?? (currentPermission ? getNumberField(currentPermission, "updatedAt") : undefined)
+        const terminalResultSent = previousTerminal?.terminalResultSent === true || payload.terminalResultSent === true
+          ? true
+          : payload.terminalResultSent === false
+            ? false
+            : undefined
         state.terminalMetadata[routeKey] = {
           reason,
           ...(handle ? { handle } : {}),
@@ -1121,8 +1144,8 @@ export function applyBridgeEvent<TPayload = unknown>(
           ...(reason === "rejected" && terminalAt !== undefined ? { rejectedAt: terminalAt } : {}),
           ...(reason === "expired" && terminalAt !== undefined ? { expiredAt: terminalAt } : {}),
           ...(isNonEmptyString(payload.replacementHandle) ? { replacementHandle: payload.replacementHandle } : {}),
-          ...(typeof payload.terminalResultSent === "boolean"
-            ? { terminalResultSent: payload.terminalResultSent }
+          ...(typeof terminalResultSent === "boolean"
+            ? { terminalResultSent }
             : {}),
           ...(isSafeInteger(payload.retainedUntil) ? { retainedUntil: payload.retainedUntil } : {}),
         }
@@ -1294,8 +1317,16 @@ export function applyFullSyncSnapshot(
   state.active = {
     instances: replaceScopedActiveRecords(state.active.instances, snapshot.active.instances, scope),
     sessions: replaceScopedActiveRecords(state.active.sessions, snapshot.active.sessions, scope),
-    questions: replaceScopedActiveRecords(state.active.questions, snapshot.active.questions, scope),
-    permissions: replaceScopedActiveRecords(state.active.permissions, snapshot.active.permissions, scope),
+    questions: ensureUniqueBrokerRequestHandles(
+      replaceScopedActiveRecords(state.active.questions, snapshot.active.questions, scope),
+      "question",
+      { updatedScope: scope },
+    ),
+    permissions: ensureUniqueBrokerRequestHandles(
+      replaceScopedActiveRecords(state.active.permissions, snapshot.active.permissions, scope),
+      "permission",
+      { updatedScope: scope },
+    ),
     naturalStops: replaceScopedActiveRecords(state.active.naturalStops, snapshot.active.naturalStops, scope),
     retryErrors: replaceScopedActiveRecords(state.active.retryErrors, snapshot.active.retryErrors, scope),
   }
@@ -1373,6 +1404,89 @@ function createBrokerDeliveryTokenKey(input: Pick<BrokerDeliveryTokenState, "wec
 
 function readBrokerScopeKey(record: Record<string, unknown>): string | undefined {
   return getStringField(record, "scopeKey") ?? getStringField(record, "instanceID")
+}
+
+function normalizeHandleOrUndefined(value: string | undefined): string | undefined {
+  if (!isNonEmptyString(value)) {
+    return undefined
+  }
+  try {
+    return normalizeHandle(value)
+  } catch {
+    return undefined
+  }
+}
+
+function brokerHandleIdentityKey(value: string | undefined): string | undefined {
+  if (!isNonEmptyString(value)) {
+    return undefined
+  }
+  return normalizeHandleOrUndefined(value) ?? value.trim().toLowerCase()
+}
+
+function sortBrokerRequestRecords(left: [string, UnknownRecord], right: [string, UnknownRecord]): number {
+  const leftCreated = getNumberField(left[1], "createdAt") ?? 0
+  const rightCreated = getNumberField(right[1], "createdAt") ?? 0
+  if (leftCreated !== rightCreated) {
+    return leftCreated - rightCreated
+  }
+  return left[0].localeCompare(right[0])
+}
+
+type EnsureUniqueBrokerRequestHandleOptions = {
+  updatedRouteKey?: string
+  updatedScope?: BrokerConnectionScope
+}
+
+function orderBrokerRequestRecordsForHandleAllocation(
+  records: Record<string, UnknownRecord>,
+  options: EnsureUniqueBrokerRequestHandleOptions,
+): Array<[string, UnknownRecord]> {
+  const entries = Object.entries(records)
+  if (isNonEmptyString(options.updatedRouteKey)) {
+    const retained = entries.filter(([routeKey]) => routeKey !== options.updatedRouteKey).sort(sortBrokerRequestRecords)
+    const updated = entries.filter(([routeKey]) => routeKey === options.updatedRouteKey)
+    return [...retained, ...updated]
+  }
+
+  if (options.updatedScope) {
+    const retained = entries
+      .filter(([, record]) => !matchesActiveScope(record, options.updatedScope as BrokerConnectionScope))
+      .sort(sortBrokerRequestRecords)
+    const updated = entries
+      .filter(([, record]) => matchesActiveScope(record, options.updatedScope as BrokerConnectionScope))
+      .sort(sortBrokerRequestRecords)
+    return [...retained, ...updated]
+  }
+
+  return entries.sort(sortBrokerRequestRecords)
+}
+
+function ensureUniqueBrokerRequestHandles(
+  records: Record<string, UnknownRecord>,
+  kind: "question" | "permission",
+  options: EnsureUniqueBrokerRequestHandleOptions = {},
+): Record<string, UnknownRecord> {
+  const usedHandles: string[] = []
+  const usedIdentityKeys = new Set<string>()
+  const nextEntries: Array<[string, UnknownRecord]> = []
+
+  for (const [routeKey, record] of orderBrokerRequestRecordsForHandleAllocation(records, options)) {
+    const rawHandle = getStringField(record, "handle")
+    const requestedHandle = normalizeHandleOrUndefined(rawHandle) ?? rawHandle?.trim()
+    const requestedKey = brokerHandleIdentityKey(requestedHandle)
+    const handle = requestedHandle && requestedKey && !usedIdentityKeys.has(requestedKey)
+      ? requestedHandle
+      : createHandle(kind, usedHandles)
+    usedHandles.push(handle)
+    const handleKey = brokerHandleIdentityKey(handle)
+    if (handleKey) {
+      usedIdentityKeys.add(handleKey)
+    }
+    nextEntries.push([routeKey, { ...record, handle }])
+  }
+
+  return Object.fromEntries(nextEntries)
 }
 
 function toBrokerIndexedRequestRecord(input: BrokerIndexedRequestRecord): BrokerIndexedRequestRecord {

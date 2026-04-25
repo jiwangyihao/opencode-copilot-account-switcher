@@ -1139,7 +1139,7 @@ test("bridge live snapshot: 读取 session/status/question/permission/todo/messa
     { id: "s-older", title: "older", directory: "/repo", time: { updated: 10 } },
     { id: "s-1", title: "s1", directory: "/repo", time: { updated: 100 } },
     { id: "s-2", title: "s2", directory: "/repo", time: { updated: 300 } },
-    { id: "s-3", title: "s3", directory: "/repo", time: { updated: 200 } },
+    { id: "s-3", parentID: "s-2", title: "s3", directory: "/repo", time: { updated: 200 } },
   ]
 
   const bridge = bridgeModule.createWechatBridge({
@@ -1212,6 +1212,7 @@ test("bridge live snapshot: 读取 session/status/question/permission/todo/messa
   assert.equal(calls.includes("session.messages:s-1"), true)
   assert.equal(calls.includes("session.messages:s-older"), false)
   assert.equal(snapshot.sessions.find((item) => item.sessionID === "s-2")?.status, "idle")
+  assert.equal(snapshot.sessions.find((item) => item.sessionID === "s-3")?.parentID, "s-2")
   assert.equal(snapshot.sessions.find((item) => item.sessionID === "s-1")?.pendingPermissionCount, 1)
   assert.equal(snapshot.sessions.find((item) => item.sessionID === "s-2")?.pendingQuestionCount, 1)
 })
@@ -6170,9 +6171,310 @@ test("broker-entry slash handler: /allow p1 always safe 命中 open permission �
 
   const persistedPermission = await readPersistedBrokerRequest(brokerStateStore, { kind: "permission", routeKey })
   assert.equal(persistedPermission?.status, "answered")
+  assert.equal(persistedPermission?.terminalResultSent, true)
   const persistedPermissionState = await readPersistedBrokerState(brokerStateStore)
   assert.equal(persistedPermissionState?.terminalMetadata[routeKey]?.reason, "answered")
+  assert.equal(persistedPermissionState?.terminalMetadata[routeKey]?.terminalResultSent, true)
   assert.equal(persistedPermissionState?.legacyHandleClosures.p1?.reason, "answered")
+})
+
+test("broker 聚合输出：/status 只展示每个实例的主会话，不展示子代理会话", async () => {
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-status-main-session-only`)
+  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-status-main-session-only`)
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-flow-main-session-only-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+
+  const server = await brokerServer.startBrokerServer(endpoint)
+  let bridge = null
+
+  try {
+    bridge = await connectLiveBridge({
+      brokerClient,
+      endpoint,
+      instanceID: "main-session-instance",
+      events: [
+        {
+          type: "instanceOnline",
+          payload: {
+            instanceID: "main-session-instance",
+            displayName: "Main Session Instance",
+            connectedAt: Date.now(),
+            pid: 222,
+            projectDir: "/repo/main-session",
+          },
+        },
+        {
+          type: "sessionSnapshotChanged",
+          payload: {
+            instanceID: "main-session-instance",
+            sessionID: "main-session-root",
+            title: "真正主会话",
+            directory: "/repo/main-session",
+            updatedAt: 100,
+            status: "busy",
+            pendingQuestionCount: 0,
+            pendingPermissionCount: 0,
+            todoSummary: { total: 1, inProgress: 1, completed: 0 },
+            highlights: [{ kind: "status", text: "status: busy" }],
+          },
+        },
+        {
+          type: "sessionSnapshotChanged",
+          payload: {
+            instanceID: "main-session-instance",
+            sessionID: "main-session-child-review",
+            parentID: "main-session-root",
+            title: "审查实现细节 (@general subagent)",
+            directory: "/repo/main-session",
+            updatedAt: 300,
+            status: "busy",
+            pendingQuestionCount: 0,
+            pendingPermissionCount: 0,
+            todoSummary: { total: 5, inProgress: 0, completed: 5 },
+            highlights: [{ kind: "status", text: "status: busy" }],
+          },
+        },
+        {
+          type: "sessionSnapshotChanged",
+          payload: {
+            instanceID: "main-session-instance",
+            sessionID: "main-session-child-verify",
+            parentID: "main-session-root",
+            title: "验证风险 (@general subagent)",
+            directory: "/repo/main-session",
+            updatedAt: 200,
+            status: "busy",
+            pendingQuestionCount: 0,
+            pendingPermissionCount: 0,
+            todoSummary: { total: 3, inProgress: 1, completed: 2 },
+            highlights: [{ kind: "status", text: "status: busy" }],
+          },
+        },
+      ],
+    })
+
+    const result = await server.collectStatus()
+
+    assert.match(result.reply, /真正主会话/)
+    assert.doesNotMatch(result.reply, /审查实现细节|验证风险|@general subagent/)
+  } finally {
+    if (bridge) {
+      await bridge.client.close().catch(() => {})
+    }
+    await server.close()
+  }
+})
+
+test("bridge lifecycle: /status 使用真实 session snapshot 的 parentID 过滤子会话", async () => {
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-lifecycle-parent-session`)
+  const bridgeModule = await import(`${DIST_BRIDGE_MODULE}?reload=${Date.now()}-lifecycle-parent-session`)
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-flow-lifecycle-parent-session-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+
+  const server = await brokerServer.startBrokerServer(endpoint)
+  const lifecycle = await bridgeModule.createWechatBridgeLifecycle({
+    statusCollectionEnabled: true,
+    heartbeatIntervalMs: 1_000,
+    initialBrokerPromise: Promise.resolve({ endpoint }),
+    instanceName: "Lifecycle Parent Session",
+    projectName: "project-lifecycle-parent",
+    directory: "/repo/lifecycle-parent",
+    client: {
+      session: {
+        list: async () => [
+          {
+            id: "lifecycle-root-session",
+            title: "真正主会话",
+            directory: "/repo/lifecycle-parent",
+            time: { updated: 100 },
+          },
+          {
+            id: "lifecycle-child-session",
+            parentID: "lifecycle-root-session",
+            title: "子任务实现细节",
+            directory: "/repo/lifecycle-parent",
+            time: { updated: 300 },
+          },
+        ],
+        status: async () => ({
+          "lifecycle-root-session": { type: "busy" },
+          "lifecycle-child-session": { type: "busy" },
+        }),
+        todo: async () => [],
+        messages: async () => [],
+      },
+      question: { list: async () => [] },
+      permission: { list: async () => [] },
+    },
+  })
+
+  try {
+    await waitForAsync(async () => {
+      const result = await server.collectStatus()
+      return /真正主会话/.test(result.reply)
+    })
+
+    const result = await server.collectStatus()
+
+    assert.match(result.reply, /真正主会话/)
+    assert.doesNotMatch(result.reply, /子任务实现细节/)
+  } finally {
+    await lifecycle.close().catch(() => {})
+    await server.close()
+  }
+})
+
+test("broker live path: 多实例同时有权限和问题时，微信回复 handle 必须全局唯一", async () => {
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-live-unique-handles`)
+  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-live-unique-handles`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-live-unique-handles`)
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-flow-live-unique-handles-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+
+  const server = await brokerServer.startBrokerServer(endpoint)
+  let first = null
+  let second = null
+
+  try {
+    first = await connectLiveBridge({
+      brokerClient,
+      endpoint,
+      instanceID: "unique-handle-instance-a",
+      events: [
+        {
+          type: "questionOpened",
+          payload: {
+            instanceID: "unique-handle-instance-a",
+            routeKey: "question-unique-a",
+            requestID: "question-request-a",
+            handle: "q1",
+            scopeKey: "unique-handle-instance-a",
+            createdAt: 1_701_600_000_000,
+            updatedAt: 1_701_600_000_000,
+          },
+        },
+        {
+          type: "permissionOpened",
+          payload: {
+            instanceID: "unique-handle-instance-a",
+            routeKey: "permission-unique-a",
+            requestID: "permission-request-a",
+            handle: "p1",
+            scopeKey: "unique-handle-instance-a",
+            createdAt: 1_701_600_000_001,
+            updatedAt: 1_701_600_000_001,
+          },
+        },
+      ],
+    })
+
+    second = await connectLiveBridge({
+      brokerClient,
+      endpoint,
+      instanceID: "unique-handle-instance-b",
+      events: [
+        {
+          type: "questionOpened",
+          payload: {
+            instanceID: "unique-handle-instance-b",
+            routeKey: "question-unique-b",
+            requestID: "question-request-b",
+            handle: "q1",
+            scopeKey: "unique-handle-instance-b",
+            createdAt: 1_701_600_000_002,
+            updatedAt: 1_701_600_000_002,
+          },
+        },
+        {
+          type: "permissionOpened",
+          payload: {
+            instanceID: "unique-handle-instance-b",
+            routeKey: "permission-unique-b",
+            requestID: "permission-request-b",
+            handle: "p1",
+            scopeKey: "unique-handle-instance-b",
+            createdAt: 1_701_600_000_003,
+            updatedAt: 1_701_600_000_003,
+          },
+        },
+      ],
+    })
+
+    const persisted = await brokerStateStore.loadBrokerStateStoreSnapshot()
+    const questionHandles = Object.values(persisted.active.questions).map((record) => record.handle).sort()
+    const permissionHandles = Object.values(persisted.active.permissions).map((record) => record.handle).sort()
+
+  assert.deepEqual(questionHandles, ["q1", "q2"])
+  assert.deepEqual(permissionHandles, ["p1", "p2"])
+} finally {
+    if (first) {
+      await first.client.close().catch(() => {})
+    }
+    if (second) {
+      await second.client.close().catch(() => {})
+    }
+    await server.close()
+  }
+})
+
+test("broker live path: 已发送终态结果后 close event 不再生成 requestTerminal 通知", async () => {
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-terminal-sent-close`)
+  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-terminal-sent-close`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-terminal-sent-close`)
+  const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-terminal-sent-close`)
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-terminal-sent-close`)
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-flow-terminal-sent-close-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+  const routeKey = "permission-terminal-sent-close"
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-terminal-sent-close",
+    userId: "u-terminal-sent-close",
+    boundAt: 1_701_600_100_000,
+  })
+
+  const state = brokerStateStore.createEmptyBrokerState()
+  state.terminalMetadata[routeKey] = {
+    reason: "answered",
+    handle: "p1",
+    scopeKey: "terminal-sent-close-instance",
+    terminalResultSent: true,
+  }
+  await brokerStateStore.persistBrokerStateStoreSnapshot(state)
+
+  const server = await brokerServer.startBrokerServer(endpoint)
+  let bridge = null
+
+  try {
+    bridge = await connectLiveBridge({
+      brokerClient,
+      endpoint,
+      instanceID: "terminal-sent-close-instance",
+      events: [
+        {
+          type: "permissionClosed",
+          payload: {
+            routeKey,
+            handle: "p1",
+            scopeKey: "terminal-sent-close-instance",
+            reason: "handled",
+            updatedAt: 1_701_600_100_100,
+          },
+        },
+      ],
+    })
+
+    const persisted = await brokerStateStore.loadBrokerStateStoreSnapshot()
+    const pending = await notificationStore.listPendingNotifications()
+
+    assert.equal(persisted.terminalMetadata[routeKey]?.terminalResultSent, true)
+    assert.equal(pending.some((record) => record.kind === "requestTerminal" && record.routeKey === routeKey), false)
+  } finally {
+    if (bridge) {
+      await bridge.client.close().catch(() => {})
+    }
+    await server.close()
+  }
 })
 
 test("broker-entry slash handler: /allow p1 reject no 会回写 rejected + resolved", async () => {

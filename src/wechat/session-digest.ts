@@ -24,6 +24,7 @@ export type SessionDigestTodoItem = {
 
 export type SessionDigest = {
   sessionID: string
+  parentID?: string
   title: string
   directory: string
   updatedAt: number
@@ -42,7 +43,7 @@ export type SessionDigest = {
 }
 
 export type BuildSessionDigestInput = {
-  session: Pick<Session, "id" | "title" | "directory" | "time">
+  session: Pick<Session, "id" | "title" | "directory" | "time"> & { parentID?: string }
   statusBySession: Record<string, SessionStatus | undefined>
   questionsBySession: Map<string, QuestionRequest[]>
   permissionsBySession: Map<string, PermissionRequest[]>
@@ -231,6 +232,9 @@ export function buildSessionDigest(input: BuildSessionDigestInput): SessionDiges
 
   return {
     sessionID,
+    ...(typeof input.session.parentID === "string" && input.session.parentID.trim().length > 0
+      ? { parentID: input.session.parentID.trim() }
+      : {}),
     title: input.session.title ?? "",
     directory: input.session.directory ?? "",
     updatedAt: toUpdatedAt(input.session),

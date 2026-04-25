@@ -579,6 +579,28 @@ function buildNotificationIdempotencyKeyFromEvent(event: BridgeToBrokerEvent, in
   return undefined
 }
 
+function resolveCanonicalRequestHandle(kind: "question" | "permission", routeKey: string, requestedHandle: unknown): string | undefined {
+  const records = kind === "question"
+    ? liveWsCoordinator.getState().active.questions
+    : liveWsCoordinator.getState().active.permissions
+  const current = asObject(records[routeKey])
+  const currentHandle = readNonEmptyString(current.handle)
+  if (currentHandle) {
+    return currentHandle
+  }
+
+  const existingHandles = Object.entries(records)
+    .filter(([key]) => key !== routeKey)
+    .map(([, record]) => readNonEmptyString(asObject(record).handle))
+    .filter((item): item is string => typeof item === "string")
+  const requested = readNonEmptyString(requestedHandle)
+  const existing = new Set(existingHandles.map((item) => item.trim().toLowerCase()))
+  if (requested && !existing.has(requested.trim().toLowerCase())) {
+    return requested
+  }
+  return createHandle(kind, existingHandles)
+}
+
 async function projectNotificationFromLiveBridgeEvent(event: BridgeToBrokerEvent, instanceID: string): Promise<void> {
   const binding = await readOperatorBinding().catch(() => undefined)
   if (!binding) {
@@ -593,7 +615,7 @@ async function projectNotificationFromLiveBridgeEvent(event: BridgeToBrokerEvent
 
   if (event.type === "questionOpened" || event.type === "questionUpdated") {
     const routeKey = readNonEmptyString(payload.routeKey)
-    const handle = readNonEmptyString(payload.handle)
+    const handle = routeKey ? resolveCanonicalRequestHandle("question", routeKey, payload.handle) : undefined
     if (!routeKey || !handle) {
       return
     }
@@ -613,7 +635,7 @@ async function projectNotificationFromLiveBridgeEvent(event: BridgeToBrokerEvent
 
   if (event.type === "permissionOpened" || event.type === "permissionUpdated") {
     const routeKey = readNonEmptyString(payload.routeKey)
-    const handle = readNonEmptyString(payload.handle)
+    const handle = routeKey ? resolveCanonicalRequestHandle("permission", routeKey, payload.handle) : undefined
     if (!routeKey || !handle) {
       return
     }
@@ -675,14 +697,20 @@ async function projectNotificationFromLiveBridgeEvent(event: BridgeToBrokerEvent
 
   if (event.type === "questionClosed" || event.type === "permissionClosed") {
     const routeKey = readNonEmptyString(payload.routeKey)
-    const handle = readNonEmptyString(payload.handle)
     const reason = readNonEmptyString(payload.reason)
     const requestTerminalReason = reason === "answered" || reason === "handled" || reason === "rejected" || reason === "expired" || reason === "replaced"
       ? reason
       : undefined
+    const terminalMetadata = routeKey ? asObject(liveWsCoordinator.getState().terminalMetadata[routeKey]) : {}
+    if (terminalMetadata.terminalResultSent === true) {
+      return
+    }
+    const handle = readNonEmptyString(terminalMetadata.handle) ?? readNonEmptyString(payload.handle)
     if (!routeKey || !handle || !requestTerminalReason) {
       return
     }
+    const scopeKey = readNonEmptyString(terminalMetadata.scopeKey) ?? readNonEmptyString(payload.scopeKey) ?? instanceID
+    const replacementHandle = readNonEmptyString(terminalMetadata.replacementHandle) ?? readNonEmptyString(payload.replacementHandle)
     await upsertNotification({
       idempotencyKey,
       kind: "requestTerminal",
@@ -691,9 +719,9 @@ async function projectNotificationFromLiveBridgeEvent(event: BridgeToBrokerEvent
       requestKind: event.type === "questionClosed" ? "question" : "permission",
       routeKey,
       handle,
-      ...(readNonEmptyString(payload.scopeKey) ? { scopeKey: readNonEmptyString(payload.scopeKey) } : { scopeKey: instanceID }),
+      scopeKey,
       terminalReason: requestTerminalReason,
-      ...(readNonEmptyString(payload.replacementHandle) ? { replacementHandle: readNonEmptyString(payload.replacementHandle) } : {}),
+      ...(replacementHandle ? { replacementHandle } : {}),
       createdAt: readNotificationEventTimestamp(payload),
     })
   }

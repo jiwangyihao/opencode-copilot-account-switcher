@@ -114,6 +114,7 @@ function normalizeSessionDigest(value: unknown): SessionDigest | null {
 
   return {
     sessionID: record.sessionID,
+    ...(isNonEmptyString(record.parentID) ? { parentID: record.parentID } : {}),
     title: isNonEmptyString(record.title) ? record.title : "",
     directory: isNonEmptyString(record.directory) ? record.directory : "",
     updatedAt: toFiniteNumber(record.updatedAt),
@@ -187,7 +188,11 @@ function sortHighlights(highlights: SessionDigestHighlight[]): SessionDigestHigh
 }
 
 function pickTopSessions(sessions: SessionDigest[]): SessionDigest[] {
-  return [...sessions]
+  const hasChildOrSubagent = sessions.some((session) => isChildOrSubagentSession(session))
+  const mainSessions = sessions.filter((session) => !isChildOrSubagentSession(session))
+  const candidates = hasChildOrSubagent ? mainSessions : sessions
+  const limit = hasChildOrSubagent ? 1 : 3
+  return [...candidates]
     .sort((a, b) => {
       const ua = typeof a.updatedAt === "number" && Number.isFinite(a.updatedAt) ? a.updatedAt : 0
       const ub = typeof b.updatedAt === "number" && Number.isFinite(b.updatedAt) ? b.updatedAt : 0
@@ -196,7 +201,15 @@ function pickTopSessions(sessions: SessionDigest[]): SessionDigest[] {
       }
       return a.sessionID.localeCompare(b.sessionID)
     })
-    .slice(0, 3)
+    .slice(0, limit)
+}
+
+function isLikelySubagentTitle(title: unknown): boolean {
+  return typeof title === "string" && /\(@[^)]*\bsubagent\)/i.test(title)
+}
+
+function isChildOrSubagentSession(session: Pick<SessionDigest, "parentID" | "title">): boolean {
+  return isNonEmptyString(session.parentID) || isLikelySubagentTitle(session.title)
 }
 
 function formatSessionTags(session: SessionDigest): string {
@@ -285,6 +298,7 @@ function buildBrokerViewSnapshot(view: BrokerAuthoritativeView, instanceID: stri
     .filter((record) => record.instanceID === instanceID && isNonEmptyString(record.sessionID))
     .map((record) => ({
       sessionID: String(record.sessionID).trim(),
+      ...(isNonEmptyString(record.parentID) ? { parentID: record.parentID } : {}),
       title: isNonEmptyString(record.title) ? record.title : "",
       directory: isNonEmptyString(record.directory) ? record.directory : "",
       updatedAt: toFiniteNumber(record.updatedAt),

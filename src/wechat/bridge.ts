@@ -67,7 +67,7 @@ function indexNaturalStopCandidates(candidates: WechatNotificationCandidate[]) {
   return indexed
 }
 
-type SessionLite = Pick<Session, "id" | "title" | "directory" | "time">
+type SessionLite = Pick<Session, "id" | "title" | "directory" | "time"> & { parentID?: string }
 
 type SdkFieldsResult<T> = {
   data: T | undefined
@@ -1054,6 +1054,7 @@ export async function createWechatBridgeLifecycle(
     for (const session of snapshot.sessions) {
       await sendSequencedEvent(createSequencedEvent("sessionSnapshotChanged", {
         sessionID: session.sessionID,
+        ...(isNonEmptyString(session.parentID) ? { parentID: session.parentID } : {}),
         title: session.title,
         directory: session.directory,
         updatedAt: session.updatedAt,
@@ -1109,6 +1110,7 @@ export async function createWechatBridgeLifecycle(
         for (const session of snapshot.sessions) {
           await sendSequencedEvent(createSequencedEvent("sessionSnapshotChanged", {
             sessionID: session.sessionID,
+            ...(isNonEmptyString(session.parentID) ? { parentID: session.parentID } : {}),
             title: session.title,
             directory: session.directory,
             updatedAt: session.updatedAt,

@@ -576,7 +576,7 @@ export function createBrokerWechatSlashCommandHandler(input: {
       createdAt,
       ...(input.status === "answered" ? { answeredAt: finalizedAt } : { rejectedAt: finalizedAt }),
       terminalReason: input.status,
-      terminalResultSent: current?.terminalResultSent === true,
+      terminalResultSent: true,
     })
     await persistBrokerStateStoreSnapshot(brokerState)
   }
