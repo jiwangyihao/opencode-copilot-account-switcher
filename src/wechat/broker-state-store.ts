@@ -1,5 +1,6 @@
 import path from "node:path"
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { createHandle, normalizeHandle } from "./handle.js"
 import type {
   BrokerAckPayload,
@@ -13,12 +14,15 @@ import {
   brokerStateStorePath,
   notificationsDir,
   requestKindDir,
+  WECHAT_FILE_MODE,
 } from "./state-paths.js"
 
 type UnknownRecord = Record<string, unknown>
 
 export const BROKER_STATE_SCHEMA_MARKER_KIND = "wechat-broker-state-store"
 export const LEGACY_STATE_RESET_UPGRADE_CLOSE_REASON = "legacy-state-reset-awaiting-full-sync"
+const BROKER_STATE_REPLACE_MAX_ATTEMPTS = 50
+const BROKER_STATE_REPLACE_RETRY_DELAY_MS = 10
 
 export type BrokerStateSchemaMarker = {
   kind?: string
@@ -479,6 +483,50 @@ async function listJsonFiles(dirPath: string): Promise<string[]> {
   }
 }
 
+function delay(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve()
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function isRetryableBrokerStateReplaceError(error: unknown): boolean {
+  const issue = error as NodeJS.ErrnoException
+  return issue?.code === "EPERM" || issue?.code === "EBUSY"
+}
+
+async function replaceBrokerStateFile(tempPath: string, filePath: string): Promise<void> {
+  let lastError: unknown = undefined
+
+  for (let attempt = 0; attempt < BROKER_STATE_REPLACE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await rename(tempPath, filePath)
+      return
+    } catch (error) {
+      lastError = error
+      if (attempt === BROKER_STATE_REPLACE_MAX_ATTEMPTS - 1 || !isRetryableBrokerStateReplaceError(error)) {
+        throw error
+      }
+
+      await delay(BROKER_STATE_REPLACE_RETRY_DELAY_MS)
+    }
+  }
+
+  if (lastError) throw lastError
+}
+
+async function writeJsonFileAtomically(filePath: string, value: unknown): Promise<void> {
+  const dirPath = path.dirname(filePath)
+  const tempPath = path.join(dirPath, `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`)
+  await mkdir(dirPath, { recursive: true })
+
+  try {
+    await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: WECHAT_FILE_MODE })
+    await replaceBrokerStateFile(tempPath, filePath)
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
 async function collectHandleClosuresFromJsonFiles(
   filePaths: string[],
   predicate?: (record: UnknownRecord) => boolean,
@@ -577,9 +625,7 @@ function restorePersistedBrokerState(raw: unknown, options: { track?: boolean } 
 }
 
 async function writeBrokerStateStoreSnapshot(state: BrokerState): Promise<void> {
-  const filePath = brokerStateStorePath()
-  await mkdir(path.dirname(filePath), { recursive: true })
-  await writeFile(filePath, JSON.stringify(state, null, 2), "utf8")
+  await writeJsonFileAtomically(brokerStateStorePath(), state)
 }
 
 export async function persistBrokerStateStoreSnapshot(state: BrokerState): Promise<void> {
@@ -645,9 +691,7 @@ export async function writeBrokerStateSchemaMarker(input: BrokerStateSchemaMarke
       : {}),
   }
 
-  const filePath = brokerStateSchemaPath()
-  await mkdir(path.dirname(filePath), { recursive: true })
-  await writeFile(filePath, JSON.stringify(marker, null, 2), "utf8")
+  await writeJsonFileAtomically(brokerStateSchemaPath(), marker)
   return marker
 }
 

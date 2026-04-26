@@ -3,7 +3,8 @@ import assert from "node:assert/strict"
 import os from "node:os"
 import path from "node:path"
 import net from "node:net"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import fsPromises, { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { syncBuiltinESMExports } from "node:module"
 import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
 const test = (name, fn) => baseTest(name, { concurrency: false }, fn)
@@ -683,6 +684,256 @@ test("broker-server.close 会主动断开客户端连接，避免 close 卡住",
   } finally {
     if (client) {
       await client.client.close().catch(() => {})
+    }
+  }
+})
+
+test("broker-server.close 会主动断开未注册 socket，避免 close 卡住", async () => {
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-close-unregistered`)
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-flow-close-unregistered-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+  const server = await brokerServer.startBrokerServer(endpoint)
+  const socket = net.createConnection(endpoint)
+
+  try {
+    await new Promise((resolve, reject) => {
+      socket.once("connect", resolve)
+      socket.once("error", reject)
+    })
+
+    const closePromise = server.close()
+    await assert.doesNotReject(() =>
+      Promise.race([
+        closePromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("broker close timeout for unregistered socket")), 500)),
+      ]),
+    )
+  } finally {
+    socket.destroy()
+    await server.close().catch(() => {})
+    await rm(tempDir, { recursive: true, force: true })
+  }
+})
+
+test("broker-server.close 会等待已收 socket 消息处理完成后再清理连接状态", async () => {
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-close-message-chain`)
+  const protocol = await import(`../dist/wechat/protocol.js?reload=${Date.now()}-close-message-chain`)
+  const statePaths = await import(`../dist/wechat/state-paths.js?reload=${Date.now()}-close-message-chain`)
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-flow-close-message-chain-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+
+  const server = await brokerServer.startBrokerServer(endpoint)
+  const socket = net.createConnection(endpoint)
+  const instanceID = "close-message-chain-instance"
+  const instanceIncarnation = "close-message-chain-incarnation"
+  const received = []
+  let buffer = ""
+
+  socket.on("data", (chunk) => {
+    buffer += chunk.toString("utf8")
+    while (true) {
+      const newlineIndex = buffer.indexOf("\n")
+      if (newlineIndex === -1) break
+      const line = buffer.slice(0, newlineIndex + 1)
+      buffer = buffer.slice(newlineIndex + 1)
+      received.push(protocol.parseEnvelopeLine(line))
+    }
+  })
+
+  try {
+    await new Promise((resolve, reject) => {
+      socket.once("connect", resolve)
+      socket.once("error", reject)
+    })
+
+    socket.write(protocol.serializeEnvelope({
+      id: "hello-close-message-chain",
+      type: "hello/register",
+      instanceID,
+      payload: {
+        protocolVersion: 2,
+        stateGeneration: "wechat-ws-v1",
+        instanceID,
+        instanceIncarnation,
+        lastSeenBrokerSeq: 0,
+        lastSentEventSeq: 0,
+      },
+    }))
+
+    await waitFor(() => received.some((frame) => frame.type === "registerAck"), 10_000)
+    await mkdir(path.dirname(statePaths.notificationStatePath("slow-visible-reservation")), { recursive: true })
+    await writeFile(statePaths.notificationStatePath("slow-visible-reservation"), "{", "utf8")
+
+    socket.write([
+      protocol.serializeEnvelope({
+        id: "q1-close-message-chain",
+        type: "questionOpened",
+        instanceID,
+        payload: {
+          type: "questionOpened",
+          eventSeq: 1,
+          instanceIncarnation,
+          payload: {
+            instanceID,
+            requestID: "question-close-message-chain-1",
+            routeKey: "question-close-message-chain-1",
+            handle: "q1",
+            updatedAt: 1_700_300_000_000,
+          },
+        },
+      }),
+      protocol.serializeEnvelope({
+        id: "q2-close-message-chain",
+        type: "questionOpened",
+        instanceID,
+        payload: {
+          type: "questionOpened",
+          eventSeq: 2,
+          instanceIncarnation,
+          payload: {
+            instanceID,
+            requestID: "question-close-message-chain-2",
+            routeKey: "question-close-message-chain-2",
+            handle: "q2",
+            updatedAt: 1_700_300_000_100,
+          },
+        },
+      }),
+    ].join(""))
+
+    await server.close()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const raw = JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+    assert.deepEqual(raw.active?.questions ?? {}, {})
+    assert.deepEqual(raw.connections?.[instanceID] ?? {}, {})
+  } finally {
+    socket.destroy()
+    await server.close().catch(() => {})
+    await rm(tempDir, { recursive: true, force: true })
+  }
+})
+
+test("broker-server.close 会等待已启动维护任务完成", async () => {
+  const statePaths = await import(`../dist/wechat/state-paths.js?reload=${Date.now()}-close-maintenance`)
+  const originalRename = fsPromises.rename
+  const originalHeartbeatTimeoutMs = process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
+  const originalHeartbeatScanIntervalMs = process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS
+  let releaseRename = () => {}
+  const renameRelease = new Promise((resolve) => {
+    releaseRename = resolve
+  })
+  let signalRenameStarted = () => {}
+  const renameStarted = new Promise((resolve) => {
+    signalRenameStarted = resolve
+  })
+  let shouldDelayBrokerStateRename = false
+  let delayedBrokerStateRename = false
+  let tempDir = null
+
+  fsPromises.rename = async (fromPath, toPath) => {
+    const isBrokerStateReplace = typeof toPath === "string" && toPath === statePaths.brokerStateStorePath()
+    if (shouldDelayBrokerStateRename && isBrokerStateReplace && !delayedBrokerStateRename) {
+      delayedBrokerStateRename = true
+      signalRenameStarted()
+      await renameRelease
+    }
+    return originalRename(fromPath, toPath)
+  }
+  syncBuiltinESMExports()
+
+  let server = null
+  let live = null
+  let lateSocket = null
+  try {
+    process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = "1000"
+    process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS = "10"
+    const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-close-maintenance`)
+    const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-close-maintenance`)
+    tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-flow-close-maintenance-"))
+    const endpoint = createBrokerEndpoint(tempDir)
+    server = await brokerServer.startBrokerServer(endpoint)
+    live = await connectLiveBridge({
+      brokerClient,
+      endpoint,
+      instanceID: "close-maintenance-instance",
+      events: [{
+        type: "instanceOnline",
+        payload: {
+          instanceID: "close-maintenance-instance",
+          displayName: "Close Maintenance",
+          connectedAt: Date.now(),
+          pid: process.pid,
+          projectDir: "/repo/close-maintenance",
+        },
+      }],
+    })
+
+    shouldDelayBrokerStateRename = true
+    let observeTimer = null
+    try {
+      await Promise.race([
+        renameStarted,
+        new Promise((_, reject) => {
+          observeTimer = setTimeout(() => reject(new Error("maintenance persist was not observed")), 10_000)
+        }),
+      ])
+    } finally {
+      if (observeTimer) clearTimeout(observeTimer)
+    }
+
+    let closeResolved = false
+    const closePromise = server.close().then(() => {
+      closeResolved = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(closeResolved, false)
+
+    lateSocket = net.createConnection(endpoint)
+    let lateConnected = false
+    let lateClosed = false
+    let lateErrored = false
+    lateSocket.once("connect", () => {
+      lateConnected = true
+    })
+    lateSocket.once("close", () => {
+      lateClosed = true
+    })
+    lateSocket.once("error", () => {
+      lateErrored = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(lateConnected && !lateClosed && !lateErrored, false)
+    lateSocket.destroy()
+    lateSocket = null
+
+    releaseRename()
+    await closePromise
+  } finally {
+    releaseRename()
+    if (live) {
+      await live.client.close().catch(() => {})
+    }
+    if (lateSocket) {
+      lateSocket.destroy()
+    }
+    if (server) {
+      await server.close().catch(() => {})
+    }
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+    fsPromises.rename = originalRename
+    syncBuiltinESMExports()
+    if (originalHeartbeatTimeoutMs === undefined) {
+      delete process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS
+    } else {
+      process.env.WECHAT_BROKER_HEARTBEAT_TIMEOUT_MS = originalHeartbeatTimeoutMs
+    }
+    if (originalHeartbeatScanIntervalMs === undefined) {
+      delete process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS
+    } else {
+      process.env.WECHAT_BROKER_HEARTBEAT_SCAN_INTERVAL_MS = originalHeartbeatScanIntervalMs
     }
   }
 })

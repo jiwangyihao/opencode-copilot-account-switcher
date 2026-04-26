@@ -102,6 +102,7 @@ function toError(value: unknown): Error {
 
 export type BrokerMutationQueue = {
   enqueue: <T>(mutationType: string, task: () => Promise<T>) => Promise<T>
+  drain: () => Promise<void>
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -116,6 +117,9 @@ export function createBrokerMutationQueue(): BrokerMutationQueue {
       const next = chain.then(task)
       chain = next.then(() => undefined, () => undefined)
       return next
+    },
+    drain(): Promise<void> {
+      return chain
     },
   }
 }

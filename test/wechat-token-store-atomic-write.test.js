@@ -123,17 +123,19 @@ test("upsertInboundToken() 覆盖已有 token 文件时会重试瞬时 EPERM", a
   await writeFile(filePath, JSON.stringify(oldState, null, 2))
 
   const originalRename = fsPromises.rename
-  let renameAttempts = 0
+  let tokenRenameAttempts = 0
   fsPromises.rename = async (fromPath, toPath) => {
     const isTokenReplace = typeof toPath === "string" && toPath === filePath
-    if (isTokenReplace && renameAttempts < 2) {
-      renameAttempts += 1
+    if (isTokenReplace && tokenRenameAttempts < 2) {
+      tokenRenameAttempts += 1
       const error = new Error("target is temporarily locked")
       error.code = "EPERM"
       throw error
     }
 
-    renameAttempts += 1
+    if (isTokenReplace) {
+      tokenRenameAttempts += 1
+    }
     return originalRename(fromPath, toPath)
   }
   syncBuiltinESMExports()
@@ -155,7 +157,7 @@ test("upsertInboundToken() 覆盖已有 token 文件时会重试瞬时 EPERM", a
       source: "permission",
       sourceRef: "p-new",
     })
-    assert.equal(renameAttempts, 3)
+    assert.equal(tokenRenameAttempts, 3)
 
     const stored = await tokenStore.readTokenState(wechatAccountId, userId)
     assert.deepEqual(stored, latest)

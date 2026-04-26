@@ -751,6 +751,54 @@ test("broker state store: mutation loader 只复用显式注册的 live state，
   }
 })
 
+test("broker state store: 快照写入不会让并发读取看到半截 JSON", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-broker-state-atomic-write-")
+  const store = await importStore("atomic-write")
+  const statePaths = await importStatePaths("atomic-write")
+
+  function createLargeState(label) {
+    const state = store.createEmptyBrokerState()
+    for (let index = 0; index < 8_000; index += 1) {
+      state.active.sessions[`${label}-session-${index}`] = {
+        instanceID: `inst-${label}`,
+        sessionID: `${label}-session-${index}`,
+        title: `${label}-${"x".repeat(256)}`,
+        updatedAt: 1_700_010_000_000 + index,
+      }
+    }
+    return state
+  }
+
+  try {
+    await store.persistBrokerStateStoreSnapshot(store.createEmptyBrokerState())
+
+    let writesFinished = false
+    const writes = Promise.all([
+      store.persistBrokerStateStoreSnapshot(createLargeState("a")),
+      store.persistBrokerStateStoreSnapshot(createLargeState("b")),
+      store.persistBrokerStateStoreSnapshot(createLargeState("c")),
+    ]).finally(() => {
+      writesFinished = true
+    })
+
+    const parseErrors = []
+    while (!writesFinished) {
+      try {
+        JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+      } catch (error) {
+        parseErrors.push(error instanceof Error ? error.message : String(error))
+      }
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    await writes
+
+    assert.deepEqual(parseErrors, [])
+    JSON.parse(await readFile(statePaths.brokerStateStorePath(), "utf8"))
+  } finally {
+    await isolatedStateRoot.restore()
+  }
+})
+
 test("broker state store: retained terminal metadata / s* occupancy / legacy close reason 可由权威视图独立承接", async () => {
   const store = await importStore("authoritative-handle-closures")
   const state = store.createEmptyBrokerState()

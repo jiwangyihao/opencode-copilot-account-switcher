@@ -1230,20 +1230,60 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     process.env.WECHAT_BROKER_DEAD_LETTER_SCAN_INTERVAL_MS,
     DEFAULT_DEAD_LETTER_SCAN_INTERVAL_MS,
   )
+  const maintenanceTasks = new Set<Promise<void>>()
+
+  const trackMaintenanceTask = (task: Promise<void>) => {
+    maintenanceTasks.add(task)
+    void task.finally(() => {
+      maintenanceTasks.delete(task)
+    })
+  }
+
+  const socketMessageChains = new Set<Promise<void>>()
+  const allSockets = new Set<net.Socket>()
+  let closed = false
+  let closePromise: Promise<void> | undefined = undefined
+
   const server = net.createServer((socket) => {
+    if (closed) {
+      socket.destroy()
+      return
+    }
+
+    allSockets.add(socket)
     let buffer = ""
     let messageChain: Promise<void> = Promise.resolve()
 
+    const trackSocketMessageChain = (chain: Promise<void>) => {
+      socketMessageChains.add(chain)
+      void chain.finally(() => {
+        socketMessageChains.delete(chain)
+      })
+    }
+
+    const enqueueSocketTask = (task: () => Promise<void>) => {
+      const next = messageChain.then(task).catch(() => {
+        // errors are converted to response envelopes in handleMessage
+      })
+      messageChain = next
+      trackSocketMessageChain(next)
+    }
+
+    const enqueueSocketCleanup = (reason: string) => {
+      enqueueSocketTask(async () => {
+        await queueBrokerMutation("cleanupSocketRegistrations", async () => {
+          await cleanupSocketRegistrations(socket, reason)
+        }).catch(() => {})
+      })
+    }
+
     socket.on("close", () => {
-      void queueBrokerMutation("cleanupSocketRegistrations", async () => {
-        await cleanupSocketRegistrations(socket, "socketClosed")
-      }).catch(() => {})
+      allSockets.delete(socket)
+      enqueueSocketCleanup("socketClosed")
     })
 
     socket.on("error", () => {
-      void queueBrokerMutation("cleanupSocketRegistrations", async () => {
-        await cleanupSocketRegistrations(socket, "socketError")
-      }).catch(() => {})
+      enqueueSocketCleanup("socketError")
     })
 
     socket.on("data", (chunk) => {
@@ -1260,9 +1300,7 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
 
         try {
           const envelope = parseIncomingEnvelopeLine(`${line}\n`)
-          messageChain = messageChain.then(() => handleMessage(envelope, socket)).catch(() => {
-            // errors are converted to response envelopes in handleMessage
-          })
+          enqueueSocketTask(() => handleMessage(envelope, socket))
         } catch {
           writeError(socket, "invalidMessage", "invalid message line", "unknown")
         }
@@ -1287,22 +1325,26 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
   await cleanupDeadLetters(Date.now(), deadLetterRetentionMs)
 
   const staleConnectionTimer = setInterval(() => {
-    void markAuthoritativeStaleConnections(Date.now(), heartbeatTimeoutMs).catch((error) => {
-      console.error("[wechat-broker] failed to mark stale authoritative connections", error)
-    })
+    trackMaintenanceTask(
+      markAuthoritativeStaleConnections(Date.now(), heartbeatTimeoutMs).catch((error) => {
+        console.error("[wechat-broker] failed to mark stale authoritative connections", error)
+      }),
+    )
   }, heartbeatScanIntervalMs)
   const requestCleanupTimer = setInterval(() => {
-    void cleanupTerminalRequests(Date.now(), requestCleanAfterMs, requestPurgeRetentionMs).catch((error) => {
-      console.error("[wechat-broker] failed to clean terminal requests", error)
-    })
+    trackMaintenanceTask(
+      cleanupTerminalRequests(Date.now(), requestCleanAfterMs, requestPurgeRetentionMs).catch((error) => {
+        console.error("[wechat-broker] failed to clean terminal requests", error)
+      }),
+    )
   }, requestCleanupScanIntervalMs)
   const deadLetterCleanupTimer = setInterval(() => {
-    void cleanupDeadLetters(Date.now(), deadLetterRetentionMs).catch((error) => {
-      console.error("[wechat-broker] failed to purge dead letters", error)
-    })
+    trackMaintenanceTask(
+      cleanupDeadLetters(Date.now(), deadLetterRetentionMs).catch((error) => {
+        console.error("[wechat-broker] failed to purge dead letters", error)
+      }),
+    )
   }, deadLetterScanIntervalMs)
-
-  let closed = false
 
   const collectStatus = async (): Promise<CollectStatusResult> => {
     const requestId = `collect-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -1523,30 +1565,57 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
   }
 
   const close = async () => {
-    if (closed) {
-      return
+    if (closePromise) {
+      return closePromise
     }
-    closed = true
 
-    clearInterval(staleConnectionTimer)
-    clearInterval(requestCleanupTimer)
-    clearInterval(deadLetterCleanupTimer)
+    closePromise = (async () => {
+      closed = true
 
-    for (const record of liveBridgeByInstanceID.values()) {
-      if (!record.socket.destroyed) {
-        record.socket.destroy()
+      clearInterval(staleConnectionTimer)
+      clearInterval(requestCleanupTimer)
+      clearInterval(deadLetterCleanupTimer)
+
+      const serverClosed = new Promise<void>((resolve) => {
+        server.close(() => resolve())
+      })
+
+      while (maintenanceTasks.size > 0) {
+        await Promise.allSettled([...maintenanceTasks])
       }
-    }
 
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve())
-    })
+      const sockets = [...allSockets]
+      const socketClosePromises = sockets.map((socket) => {
+        if (socket.destroyed) {
+          return Promise.resolve()
+        }
 
-    if (process.platform !== "win32" && !isTcpBrokerEndpoint(endpoint)) {
-      await rm(endpoint, { force: true })
-    }
+        return new Promise<void>((resolve) => {
+          socket.once("close", () => resolve())
+        })
+      })
 
-    clearRuntimeState()
+      for (const socket of sockets) {
+        if (!socket.destroyed) {
+          socket.destroy()
+        }
+      }
+      await Promise.allSettled(socketClosePromises)
+      await serverClosed
+
+      while (socketMessageChains.size > 0) {
+        await Promise.allSettled([...socketMessageChains])
+      }
+      await brokerMutationQueue.drain()
+
+      if (process.platform !== "win32" && !isTcpBrokerEndpoint(endpoint)) {
+        await rm(endpoint, { force: true })
+      }
+
+      clearRuntimeState()
+    })()
+
+    return closePromise
   }
 
   const hasBlockingActivity = async () => {
