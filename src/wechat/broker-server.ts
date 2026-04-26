@@ -44,6 +44,7 @@ import {
   persistBrokerStateStoreSnapshot,
   readBrokerAuthoritativeView,
   readBrokerControlRecord,
+  reconcileBrokerActiveRequestHandlesWithVisibleNotifications,
   setBrokerStateMutationTarget,
   requestBrokerFullSync,
   requestBrokerReplay,
@@ -810,6 +811,14 @@ function readFiniteNumber(value: unknown): number | undefined {
   return isFiniteNumber(value) ? value : undefined
 }
 
+function shouldReconcileVisibleRequestHandles(eventType: BridgeToBrokerEventType): boolean {
+  return eventType === "questionOpened"
+    || eventType === "questionUpdated"
+    || eventType === "permissionOpened"
+    || eventType === "permissionUpdated"
+    || eventType === "fullSyncCompleted"
+}
+
 export function setBrokerServerTestHooks(hooks: BrokerServerTestHooks | undefined): void {
   brokerServerTestHooks = hooks
 }
@@ -1027,6 +1036,9 @@ async function handleMessage(envelope: IncomingBrokerEnvelope, socket: net.Socke
         instanceID,
         controlId: event.controlId,
       })
+      if (shouldReconcileVisibleRequestHandles(event.type)) {
+        await reconcileBrokerActiveRequestHandlesWithVisibleNotifications(liveWsCoordinator.getState())
+      }
       const currentConnection = liveWsCoordinator.getState().connections[instanceID]?.[event.instanceIncarnation]
       if (currentConnection?.online !== false) {
         markBrokerConnectionObserved(liveWsCoordinator.getState(), {
@@ -1177,6 +1189,7 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
     reconcileBrokerDisconnectedScopes(persistedBrokerState, {
       disconnectedAt: Date.now(),
     })
+    await reconcileBrokerActiveRequestHandlesWithVisibleNotifications(persistedBrokerState)
     await persistBrokerStateStoreSnapshot(persistedBrokerState)
   }
   liveWsCoordinator = createBrokerWsCoordinator({

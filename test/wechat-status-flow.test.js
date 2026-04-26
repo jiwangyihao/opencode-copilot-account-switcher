@@ -6417,6 +6417,110 @@ test("broker live path: 多实例同时有权限和问题时，微信回复 hand
   }
 })
 
+test("broker live path: 已发送未解决通知的 handle 不会被新 open request 复用", async () => {
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-sent-handle-reservation`)
+  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-sent-handle-reservation`)
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-sent-handle-reservation`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-sent-handle-reservation`)
+  const notificationStore = await import(`../dist/wechat/notification-store.js?reload=${Date.now()}-sent-handle-reservation`)
+  const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-sent-handle-reservation`)
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-status-flow-sent-handle-reservation-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+  const oldRouteKey = "question-sent-visible-old"
+  const newRouteKey = "question-sent-visible-new"
+
+  const seedState = brokerStateStore.createEmptyBrokerState()
+  brokerStateStore.upsertBrokerIndexedRequest(seedState, {
+    kind: "question",
+    routeKey: oldRouteKey,
+    requestID: "question-sent-visible-old-request",
+    handle: "q1",
+    scopeKey: "sent-visible-old-instance",
+    wechatAccountId: "wx-sent-visible",
+    userId: "u-sent-visible",
+    status: "open",
+    createdAt: 1_701_600_200_000,
+  })
+  await brokerStateStore.persistBrokerStateStoreSnapshot(seedState)
+
+  const server = await brokerServer.startBrokerServer(endpoint)
+  let bridge = null
+
+  try {
+    await operatorStore.rebindOperator({
+      wechatAccountId: "wx-sent-visible",
+      userId: "u-sent-visible",
+      boundAt: 1_701_600_200_015,
+    })
+    await notificationStore.upsertNotification({
+      idempotencyKey: "question-sent-visible-old",
+      kind: "question",
+      wechatAccountId: "wx-sent-visible",
+      userId: "u-sent-visible",
+      routeKey: oldRouteKey,
+      handle: "q6",
+      scopeKey: "sent-visible-old-instance",
+      createdAt: 1_701_600_200_010,
+    })
+    await notificationStore.markNotificationSent({
+      idempotencyKey: "question-sent-visible-old",
+      sentAt: 1_701_600_200_020,
+    })
+
+    bridge = await connectLiveBridge({
+      brokerClient,
+      endpoint,
+      instanceID: "sent-visible-new-instance",
+      events: [
+        {
+          type: "questionOpened",
+          payload: {
+            instanceID: "sent-visible-new-instance",
+            routeKey: newRouteKey,
+            requestID: "question-sent-visible-new-request",
+            handle: "q6",
+            scopeKey: "sent-visible-new-instance",
+            wechatAccountId: "wx-sent-visible",
+            userId: "u-sent-visible",
+            createdAt: 1_701_600_200_100,
+            updatedAt: 1_701_600_200_100,
+          },
+        },
+      ],
+    })
+
+    const persisted = await brokerStateStore.loadBrokerStateStoreSnapshot()
+    assert.equal(persisted.active.questions[oldRouteKey].handle, "q6")
+    assert.notEqual(persisted.active.questions[newRouteKey].handle, "q6")
+    assert.equal(new Set(Object.values(persisted.active.questions).map((record) => record.handle)).size, Object.values(persisted.active.questions).length)
+
+    const newNotification = (await notificationStore.listPendingNotifications())
+      .find((record) => record.kind === "question" && record.routeKey === newRouteKey)
+    assert.equal(newNotification?.handle, persisted.active.questions[newRouteKey].handle)
+
+    const replyCalls = []
+    const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+      readBrokerAuthoritativeView: () => brokerStateStore.readBrokerAuthoritativeView(persisted),
+      readBrokerCommandStateByAction: (action) => brokerStateStore.readBrokerCommandStateByAction(action, persisted),
+      sendReplyQuestionRpc: async (input) => {
+        replyCalls.push(input)
+        return { mutationId: input.mutationId, ok: true }
+      },
+    })
+    const replyResult = await handler({ type: "reply", handle: "q6", text: "old answer" })
+    assert.equal(replyResult, "已回复问题：q6")
+    assert.equal(replyCalls[0].requestID, "question-sent-visible-old-request")
+    const finalized = await brokerStateStore.loadBrokerStateStoreSnapshot()
+    assert.equal(finalized.terminalMetadata[oldRouteKey].handle, "q6")
+    assert.equal(finalized.legacyHandleClosures.q6?.reason, "answered")
+  } finally {
+    if (bridge) {
+      await bridge.client.close().catch(() => {})
+    }
+    await server.close()
+  }
+})
+
 test("broker live path: 已发送终态结果后 close event 不再生成 requestTerminal 通知", async () => {
   const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-terminal-sent-close`)
   const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-terminal-sent-close`)

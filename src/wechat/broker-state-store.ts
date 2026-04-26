@@ -1438,6 +1438,120 @@ type EnsureUniqueBrokerRequestHandleOptions = {
   updatedScope?: BrokerConnectionScope
 }
 
+type BrokerRequestHandleReservation = {
+  kind: "question" | "permission"
+  routeKey: string
+  handle: string
+  createdAt: number
+  sentAt?: number
+}
+
+const VISIBLE_REQUEST_RESERVATION_READ_RETRIES = 3
+const VISIBLE_REQUEST_RESERVATION_READ_RETRY_DELAY_MS = 5
+
+function isVisibleRequestNotificationStatus(value: unknown): boolean {
+  return value === "pending" || value === "sent"
+}
+
+function toRequestHandleReservation(record: UnknownRecord): BrokerRequestHandleReservation | undefined {
+  const kind = record.kind === "question" || record.kind === "permission" ? record.kind : undefined
+  const routeKey = getStringField(record, "routeKey")
+  const handle = normalizeHandleOrUndefined(getStringField(record, "handle"))
+  const createdAt = getNumberField(record, "createdAt")
+  if (!kind || !routeKey || !handle || createdAt === undefined || !isVisibleRequestNotificationStatus(record.status)) {
+    return undefined
+  }
+
+  const sentAt = getNumberField(record, "sentAt")
+  return {
+    kind,
+    routeKey,
+    handle,
+    createdAt,
+    ...(sentAt !== undefined ? { sentAt } : {}),
+  }
+}
+
+function waitForVisibleRequestReservationRetry(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, VISIBLE_REQUEST_RESERVATION_READ_RETRY_DELAY_MS))
+}
+
+async function readJsonFileForVisibleRequestReservation(filePath: string): Promise<unknown | undefined> {
+  for (let attempt = 0; attempt < VISIBLE_REQUEST_RESERVATION_READ_RETRIES; attempt += 1) {
+    try {
+      const raw = await readFile(filePath, "utf8")
+      return JSON.parse(raw) as unknown
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return undefined
+      }
+      if (attempt < VISIBLE_REQUEST_RESERVATION_READ_RETRIES - 1) {
+        await waitForVisibleRequestReservationRetry()
+      }
+    }
+  }
+  return undefined
+}
+
+async function listVisibleRequestHandleReservations(): Promise<BrokerRequestHandleReservation[]> {
+  const notificationFiles = await listJsonFiles(notificationsDir())
+  const reservations: BrokerRequestHandleReservation[] = []
+  for (const filePath of notificationFiles) {
+    const raw = await readJsonFileForVisibleRequestReservation(filePath)
+    if (!isRecord(raw)) {
+      continue
+    }
+    const reservation = toRequestHandleReservation(raw)
+    if (reservation) {
+      reservations.push(reservation)
+    }
+  }
+  return reservations.sort((left, right) => {
+    const leftAt = left.sentAt ?? left.createdAt
+    const rightAt = right.sentAt ?? right.createdAt
+    if (leftAt !== rightAt) return leftAt - rightAt
+    return left.routeKey.localeCompare(right.routeKey)
+  })
+}
+
+function selectVisibleRequestHandlesByRoute(
+  records: Record<string, UnknownRecord>,
+  kind: "question" | "permission",
+  reservations: BrokerRequestHandleReservation[],
+): Map<string, string> {
+  const activeRoutes = new Set(Object.keys(records))
+  const byRoute = new Map<string, string>()
+  for (const reservation of reservations) {
+    if (reservation.kind !== kind || !activeRoutes.has(reservation.routeKey)) {
+      continue
+    }
+    byRoute.set(reservation.routeKey, reservation.handle)
+  }
+  return byRoute
+}
+
+function isReservedForAnotherRoute(routeKey: string, handleKey: string, routeReservations: Map<string, string>): boolean {
+  for (const [reservedRouteKey, reservedHandle] of routeReservations) {
+    if (reservedRouteKey === routeKey) {
+      continue
+    }
+    if (brokerHandleIdentityKey(reservedHandle) === handleKey) {
+      return true
+    }
+  }
+  return false
+}
+
+function listReservedHandlesForOtherRoutes(routeKey: string, routeReservations: Map<string, string>): string[] {
+  const handles: string[] = []
+  for (const [reservedRouteKey, reservedHandle] of routeReservations) {
+    if (reservedRouteKey !== routeKey) {
+      handles.push(reservedHandle)
+    }
+  }
+  return handles
+}
+
 function orderBrokerRequestRecordsForHandleAllocation(
   records: Record<string, UnknownRecord>,
   options: EnsureUniqueBrokerRequestHandleOptions,
@@ -1487,6 +1601,97 @@ function ensureUniqueBrokerRequestHandles(
   }
 
   return Object.fromEntries(nextEntries)
+}
+
+function ensureUniqueBrokerRequestHandlesWithVisibleReservations(
+  records: Record<string, UnknownRecord>,
+  kind: "question" | "permission",
+  routeReservations: Map<string, string>,
+): Record<string, UnknownRecord> {
+  if (routeReservations.size === 0) {
+    return records
+  }
+
+  const usedHandles: string[] = []
+  const usedIdentityKeys = new Set<string>()
+  const nextEntries: Array<[string, UnknownRecord]> = []
+
+  for (const [routeKey, record] of orderBrokerRequestRecordsForHandleAllocation(records, {})) {
+    const reservedHandle = routeReservations.get(routeKey)
+    const reservedKey = brokerHandleIdentityKey(reservedHandle)
+    const rawHandle = getStringField(record, "handle")
+    const requestedHandle = normalizeHandleOrUndefined(rawHandle) ?? rawHandle?.trim()
+    const requestedKey = brokerHandleIdentityKey(requestedHandle)
+    let handle: string
+
+    if (reservedHandle && reservedKey && !usedIdentityKeys.has(reservedKey)) {
+      handle = reservedHandle
+    } else if (
+      requestedHandle
+      && requestedKey
+      && !usedIdentityKeys.has(requestedKey)
+      && !isReservedForAnotherRoute(routeKey, requestedKey, routeReservations)
+    ) {
+      handle = requestedHandle
+    } else {
+      handle = createHandle(kind, [
+        ...usedHandles,
+        ...listReservedHandlesForOtherRoutes(routeKey, routeReservations),
+      ])
+    }
+
+    usedHandles.push(handle)
+    const handleKey = brokerHandleIdentityKey(handle)
+    if (handleKey) {
+      usedIdentityKeys.add(handleKey)
+    }
+    nextEntries.push([routeKey, { ...record, handle }])
+  }
+
+  return Object.fromEntries(nextEntries)
+}
+
+function syncOpenRequestIndexHandlesWithActive(
+  state: BrokerState,
+  kind: "question" | "permission",
+  activeRecords: Record<string, UnknownRecord>,
+): void {
+  for (const [routeKey, activeRecord] of Object.entries(activeRecords)) {
+    const handle = getStringField(activeRecord, "handle")
+    if (!handle) {
+      continue
+    }
+    const indexKey = createBrokerRequestIndexKey({ kind, routeKey })
+    const indexed = state.requestIndex[indexKey]
+    if (indexed?.status === "open" && indexed.handle !== handle) {
+      state.requestIndex[indexKey] = {
+        ...indexed,
+        handle,
+      }
+    }
+  }
+}
+
+export async function reconcileBrokerActiveRequestHandlesWithVisibleNotifications(state: BrokerState): Promise<BrokerState> {
+  rememberBrokerState(state)
+  const reservations = await listVisibleRequestHandleReservations()
+  if (reservations.length === 0) {
+    return state
+  }
+
+  state.active.questions = ensureUniqueBrokerRequestHandlesWithVisibleReservations(
+    state.active.questions,
+    "question",
+    selectVisibleRequestHandlesByRoute(state.active.questions, "question", reservations),
+  )
+  state.active.permissions = ensureUniqueBrokerRequestHandlesWithVisibleReservations(
+    state.active.permissions,
+    "permission",
+    selectVisibleRequestHandlesByRoute(state.active.permissions, "permission", reservations),
+  )
+  syncOpenRequestIndexHandlesWithActive(state, "question", state.active.questions)
+  syncOpenRequestIndexHandlesWithActive(state, "permission", state.active.permissions)
+  return state
 }
 
 function toBrokerIndexedRequestRecord(input: BrokerIndexedRequestRecord): BrokerIndexedRequestRecord {
