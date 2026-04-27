@@ -555,6 +555,15 @@ function readNotificationEventTimestamp(payload: Record<string, unknown>): numbe
     ?? Date.now()
 }
 
+function readNaturalStopSessionID(payload: Record<string, unknown>): string | undefined {
+  const directSessionID = readNonEmptyString(payload.sessionID)
+  if (directSessionID) {
+    return directSessionID
+  }
+
+  return readNonEmptyString(asObject(payload.replyTarget).sessionID)
+}
+
 function buildNotificationIdempotencyKeyFromEvent(event: BridgeToBrokerEvent, instanceID: string): string | undefined {
   const payload = asObject(event.payload)
   if (isNonEmptyString(payload.idempotencyKey)) {
@@ -566,8 +575,11 @@ function buildNotificationIdempotencyKeyFromEvent(event: BridgeToBrokerEvent, in
   if ((event.type === "permissionOpened" || event.type === "permissionUpdated") && isNonEmptyString(payload.requestID)) {
     return `permission-${toIdempotencyPart(instanceID)}-${toIdempotencyPart(payload.requestID)}`
   }
-  if (event.type === "naturalStopOpened" && isNonEmptyString(payload.sessionID)) {
-    return `natural-stop-${toIdempotencyPart(instanceID)}-${toIdempotencyPart(payload.sessionID)}`
+  if (event.type === "naturalStopOpened") {
+    const sessionID = readNaturalStopSessionID(payload)
+    if (sessionID) {
+      return `natural-stop-${toIdempotencyPart(instanceID)}-${toIdempotencyPart(sessionID)}`
+    }
   }
   if (event.type === "retryErrorUpdated") {
     const retryIdentity = readNonEmptyString(payload.sessionID) ?? instanceID
@@ -655,11 +667,18 @@ async function projectNotificationFromLiveBridgeEvent(event: BridgeToBrokerEvent
   }
 
   if (event.type === "naturalStopOpened") {
-    if (!isNonEmptyString(payload.handle) || !isNonEmptyString(payload.sessionID) || payload.replyTarget === null || typeof payload.replyTarget !== "object") {
+    if (!isNonEmptyString(payload.handle) || payload.replyTarget === null || typeof payload.replyTarget !== "object") {
       return
     }
     const replyTarget = payload.replyTarget as { instanceID?: unknown; sessionID?: unknown }
-    if (!isNonEmptyString(replyTarget.instanceID) || !isNonEmptyString(replyTarget.sessionID)) {
+    const replyTargetInstanceID = readNonEmptyString(replyTarget.instanceID)
+    const replyTargetSessionID = readNonEmptyString(replyTarget.sessionID)
+    const sessionID = readNaturalStopSessionID(payload)
+    const directSessionID = readNonEmptyString(payload.sessionID)
+    if (!replyTargetInstanceID || !replyTargetSessionID || !sessionID) {
+      return
+    }
+    if (replyTargetInstanceID !== instanceID || (directSessionID && directSessionID !== replyTargetSessionID)) {
       return
     }
     await upsertNotification({
@@ -668,11 +687,11 @@ async function projectNotificationFromLiveBridgeEvent(event: BridgeToBrokerEvent
       wechatAccountId: binding.wechatAccountId,
       userId: binding.userId,
       handle: payload.handle,
-      scopeKey: replyTarget.instanceID,
-      sessionID: payload.sessionID,
+      scopeKey: replyTargetInstanceID,
+      sessionID,
       replyTarget: {
-        instanceID: replyTarget.instanceID,
-        sessionID: replyTarget.sessionID,
+        instanceID: replyTargetInstanceID,
+        sessionID: replyTargetSessionID,
       },
       redactedSummary: readNonEmptyString(payload.redactedSummary) ?? "任务已停止",
       severityAdvice: readNonEmptyString(payload.severityAdvice) ?? "已停止并等待你的回复",

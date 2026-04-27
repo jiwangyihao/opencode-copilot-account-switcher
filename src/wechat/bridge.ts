@@ -995,6 +995,7 @@ export async function createWechatBridgeLifecycle(
     if (candidate.kind === "naturalStop") {
       return createSequencedEvent("naturalStopOpened", {
         idempotencyKey: candidate.idempotencyKey,
+        sessionID: candidate.sessionID,
         handle: candidate.handle,
         replyTarget: candidate.replyTarget,
         redactedSummary: candidate.redactedSummary,

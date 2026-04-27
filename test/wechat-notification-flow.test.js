@@ -606,6 +606,148 @@ test("通知同步：live questionOpened event 会生成 pending question notifi
   }
 })
 
+test("通知同步：旧 naturalStopOpened 事件缺少顶层 sessionID 时仍生成通知", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-legacy-natural-stop-opened-")
+
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-legacy-natural-stop-opened-server`)
+  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-legacy-natural-stop-opened-client`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-legacy-natural-stop-opened-notification`)
+  const operatorStore = await import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}-legacy-natural-stop-opened-operator`)
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-legacy-natural-stop-opened",
+    userId: "u-legacy-natural-stop-opened",
+    boundAt: Date.now(),
+  })
+
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-legacy-natural-stop-opened-endpoint-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+  const server = await brokerServer.startBrokerServer(endpoint)
+  const client = await brokerClient.connect(endpoint)
+  const notificationKey = "natural-stop-legacy-opened-1"
+
+  try {
+    const register = await client.registerHello({
+      protocolVersion: 2,
+      stateGeneration: "wechat-ws-v1",
+      instanceID: "instance-legacy-natural-stop-opened",
+      instanceIncarnation: "inc-legacy-natural-stop-opened",
+      lastSeenBrokerSeq: 0,
+      lastSentEventSeq: 0,
+    })
+    assert.equal(register.control?.type, "requestFullSync")
+
+    await client.sendBridgeEvent({
+      type: "naturalStopOpened",
+      eventSeq: 1,
+      instanceIncarnation: "inc-legacy-natural-stop-opened",
+      payload: {
+        instanceID: "instance-legacy-natural-stop-opened",
+        idempotencyKey: notificationKey,
+        handle: "s1",
+        replyTarget: {
+          instanceID: "instance-legacy-natural-stop-opened",
+          sessionID: "session-legacy-natural-stop-opened",
+        },
+        redactedSummary: "旧 bridge natural-stop 事件",
+        severityAdvice: "已停止并等待你的回复",
+        createdAt: 1_700_900_100_010,
+        updatedAt: 1_700_900_100_010,
+      },
+    }, { instanceID: "instance-legacy-natural-stop-opened" })
+
+    await waitFor(async () => {
+      const pending = await notificationStore.listPendingNotifications()
+      const record = pending.find((item) => item.idempotencyKey === notificationKey && item.kind === "naturalStop")
+      assert.equal(record?.sessionID, "session-legacy-natural-stop-opened")
+      assert.equal(record?.replyTarget?.sessionID, "session-legacy-natural-stop-opened")
+    }, 10_000)
+  } finally {
+    await client.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
+test("通知同步：naturalStopOpened 的 replyTarget 与连接实例或 session 不一致时不生成通知", async () => {
+  const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-natural-stop-target-mismatch-")
+
+  const brokerServer = await import(`${DIST_BROKER_SERVER_MODULE}?reload=${Date.now()}-natural-stop-target-mismatch-server`)
+  const brokerClient = await import(`${DIST_BROKER_CLIENT_MODULE}?reload=${Date.now()}-natural-stop-target-mismatch-client`)
+  const notificationStore = await import(`${DIST_NOTIFICATION_STORE_MODULE}?reload=${Date.now()}-natural-stop-target-mismatch-notification`)
+  const operatorStore = await import(`${DIST_OPERATOR_STORE_MODULE}?reload=${Date.now()}-natural-stop-target-mismatch-operator`)
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-natural-stop-target-mismatch",
+    userId: "u-natural-stop-target-mismatch",
+    boundAt: Date.now(),
+  })
+
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "wechat-notification-natural-stop-target-mismatch-endpoint-"))
+  const endpoint = createBrokerEndpoint(tempDir)
+  const server = await brokerServer.startBrokerServer(endpoint)
+  const client = await brokerClient.connect(endpoint)
+
+  try {
+    await client.registerHello({
+      protocolVersion: 2,
+      stateGeneration: "wechat-ws-v1",
+      instanceID: "instance-natural-stop-target-mismatch",
+      instanceIncarnation: "inc-natural-stop-target-mismatch",
+      lastSeenBrokerSeq: 0,
+      lastSentEventSeq: 0,
+    })
+
+    await client.sendBridgeEvent({
+      type: "naturalStopOpened",
+      eventSeq: 1,
+      instanceIncarnation: "inc-natural-stop-target-mismatch",
+      payload: {
+        instanceID: "instance-natural-stop-target-mismatch",
+        idempotencyKey: "natural-stop-session-target-mismatch",
+        sessionID: "session-natural-stop-canonical",
+        handle: "s1",
+        replyTarget: {
+          instanceID: "instance-natural-stop-target-mismatch",
+          sessionID: "session-natural-stop-other",
+        },
+        redactedSummary: "session mismatch",
+        severityAdvice: "已停止并等待你的回复",
+        createdAt: 1_700_900_200_010,
+        updatedAt: 1_700_900_200_010,
+      },
+    }, { instanceID: "instance-natural-stop-target-mismatch" })
+
+    await client.sendBridgeEvent({
+      type: "naturalStopOpened",
+      eventSeq: 2,
+      instanceIncarnation: "inc-natural-stop-target-mismatch",
+      payload: {
+        instanceID: "instance-natural-stop-target-mismatch",
+        idempotencyKey: "natural-stop-instance-target-mismatch",
+        sessionID: "session-natural-stop-canonical",
+        handle: "s2",
+        replyTarget: {
+          instanceID: "instance-natural-stop-other",
+          sessionID: "session-natural-stop-canonical",
+        },
+        redactedSummary: "instance mismatch",
+        severityAdvice: "已停止并等待你的回复",
+        createdAt: 1_700_900_200_020,
+        updatedAt: 1_700_900_200_020,
+      },
+    }, { instanceID: "instance-natural-stop-target-mismatch" })
+
+    const pending = await notificationStore.listPendingNotifications()
+    assert.equal(pending.some((item) => item.idempotencyKey === "natural-stop-session-target-mismatch"), false)
+    assert.equal(pending.some((item) => item.idempotencyKey === "natural-stop-instance-target-mismatch"), false)
+  } finally {
+    await client.close().catch(() => {})
+    await server.close().catch(() => {})
+    await isolatedWechatStateRoot.restore()
+  }
+})
+
 test("通知候选：ordinary retry/error 不分配 handle，只带动作/摘要/严重度", async () => {
   const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-notification-retry-summary-")
 

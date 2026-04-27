@@ -1555,6 +1555,97 @@ test("ws lifecycle: broker ack 后 bridge replay buffer 会裁剪已确认事件
   }
 })
 
+test("ws lifecycle: naturalStopOpened 事件携带 sessionID 供 broker 生成通知", async () => {
+  const isolatedStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-natural-stop-session-id-")
+  const bridgeModule = await importBridge("natural-stop-session-id")
+  const operatorStore = await import(`../dist/wechat/operator-store.js?reload=${Date.now()}-natural-stop-session-id`)
+
+  await operatorStore.rebindOperator({
+    wechatAccountId: "wx-natural-stop-session-id",
+    userId: "u-natural-stop-session-id",
+    boundAt: 1_701_700_000_000,
+  })
+
+  const sentEvents = []
+  const fakeClient = {
+    async registerHello() {
+      return {
+        ack: {
+          protocolVersion: 2,
+          stateGeneration: "wechat-ws-v1",
+          instanceIncarnation: "inc-natural-stop-session-id",
+          brokerSeq: 1,
+          needReplay: false,
+          needFullSync: true,
+        },
+        control: {
+          brokerSeq: 1,
+          controlId: "ctl-natural-stop-session-id",
+          type: "requestFullSync",
+          payload: {
+            instanceID: "inst-natural-stop-session-id",
+            instanceIncarnation: "inc-natural-stop-session-id",
+            reason: "state-missing",
+          },
+        },
+        pendingCommands: [],
+      }
+    },
+    async sendBridgeEvent(event) {
+      sentEvents.push(event)
+      return {
+        ackedEventSeq: event.eventSeq,
+        instanceIncarnation: event.instanceIncarnation,
+      }
+    },
+    setLiveHandlers() {},
+    async ping() {
+      return { type: "pong" }
+    },
+    async close() {},
+  }
+
+  const lifecycle = await bridgeModule.createWechatBridgeLifecycle(
+    {
+      statusCollectionEnabled: true,
+      initialBrokerPromise: Promise.resolve({ endpoint: "tcp://127.0.0.1:0" }),
+      client: {
+        session: {
+          list: async () => [{
+            id: "session-natural-stop-session-id",
+            title: "自然结束会话",
+            directory: "/repo/natural-stop-session-id",
+            time: { updated: 100 },
+          }],
+          status: async () => ({
+            "session-natural-stop-session-id": {
+              type: "natural-stop",
+              message: "任务自然结束，等待补充说明",
+            },
+          }),
+          todo: async () => [],
+          messages: async () => [],
+        },
+        question: { list: async () => [] },
+        permission: { list: async () => [] },
+      },
+    },
+    {
+      connectImpl: async () => fakeClient,
+      setIntervalImpl: () => ({}),
+      clearIntervalImpl: () => {},
+    },
+  )
+
+  try {
+    const naturalStopEvent = sentEvents.find((event) => event.type === "naturalStopOpened")
+    assert.equal(naturalStopEvent?.payload?.sessionID, "session-natural-stop-session-id")
+  } finally {
+    await lifecycle.close().catch(() => {})
+    await isolatedStateRoot.restore()
+  }
+})
+
 test("ws lifecycle: 同连接上的 control 与 command push 按到达顺序串行处理", async () => {
   const protocol = await importProtocol("client-serial-push")
   const brokerClient = await importClient("client-serial-push")
