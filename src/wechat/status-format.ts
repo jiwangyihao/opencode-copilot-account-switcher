@@ -13,9 +13,30 @@ export type AggregatedStatusInstance =
       status: "timeout/unreachable"
     }
 
+type ActiveQuestionTodoItem = {
+  handle: string
+  summary: string
+  instanceID?: string
+  createdAt?: number
+}
+
+type ActivePermissionTodoItem = {
+  handle: string
+  summary: string
+  createdAt?: number
+}
+
+type ActiveNaturalStopTodoItem = {
+  handle: string
+  summary: string
+  severityAdvice?: string
+  createdAt?: number
+}
+
 export type AggregatedStatusReplyInput = {
   requestId: string
   instances: AggregatedStatusInstance[]
+  activeQuestions?: ActiveQuestionTodoItem[]
 }
 
 const HIGHLIGHT_ORDER: Record<SessionDigestHighlight["kind"], number> = {
@@ -233,6 +254,145 @@ function formatTodoItem(todo: SessionDigestTodoItem): string {
   return `${prefix} ${todo.content}`
 }
 
+function formatInstanceTitle(snapshot: Pick<WechatInstanceStatusSnapshot, "instanceName" | "instanceID">, fallback: string): string {
+  const name = isNonEmptyString(snapshot.instanceName) ? snapshot.instanceName.trim() : fallback
+  return `## 实例：${name || "未命名实例"}`
+}
+
+function formatSessionTitle(session: SessionDigest): string {
+  const title = isNonEmptyString(session.title) ? session.title.trim() : "未命名会话"
+  return `### 会话：${title}`
+}
+
+function formatQuestionSummary(prompt: unknown): string {
+  const record = asObject(prompt)
+  if (isNonEmptyString(record.title)) {
+    return record.title.trim()
+  }
+  if (isNonEmptyString(record.body)) {
+    return record.body.trim()
+  }
+  return "待回复问题"
+}
+
+function formatPermissionSummary(prompt: unknown): string {
+  const record = asObject(prompt)
+  const title = isNonEmptyString(record.title) ? record.title.trim() : ""
+  const description = isNonEmptyString(record.description) ? record.description.trim() : ""
+  if (title && description) {
+    return `${title}：${description}`
+  }
+  if (title) {
+    return title
+  }
+  if (description) {
+    return description
+  }
+  return "待处理权限请求"
+}
+
+function formatNaturalStopSummary(record: Record<string, unknown>): string {
+  return isNonEmptyString(record.redactedSummary)
+    ? record.redactedSummary.trim()
+    : "需要补充自然中止说明"
+}
+
+function sortActionItems<T extends { handle: string; createdAt?: number }>(items: T[]): T[] {
+  return [...items].sort((left, right) => {
+    const leftHasCreatedAt = typeof left.createdAt === "number" && Number.isFinite(left.createdAt)
+    const rightHasCreatedAt = typeof right.createdAt === "number" && Number.isFinite(right.createdAt)
+    if (leftHasCreatedAt && rightHasCreatedAt && left.createdAt !== right.createdAt) {
+      return left.createdAt! - right.createdAt!
+    }
+    if (leftHasCreatedAt !== rightHasCreatedAt) {
+      return leftHasCreatedAt ? -1 : 1
+    }
+    return left.handle.localeCompare(right.handle)
+  })
+}
+
+function listActiveQuestionTodoItems(view: BrokerAuthoritativeView | undefined): ActiveQuestionTodoItem[] {
+  if (!view) {
+    return []
+  }
+
+  const items = Object.values(view.active.questions)
+    .map((value) => asObject(value))
+    .map((record) => {
+      const handle = isNonEmptyString(record.handle) ? record.handle.trim() : ""
+      if (!handle) {
+        return null
+      }
+      const instanceID = isNonEmptyString(record.scopeKey)
+        ? record.scopeKey.trim()
+        : isNonEmptyString(record.instanceID)
+          ? record.instanceID.trim()
+          : undefined
+      return {
+        handle,
+        summary: formatQuestionSummary(record.prompt),
+        ...(instanceID ? { instanceID } : {}),
+        ...(typeof record.createdAt === "number" && Number.isFinite(record.createdAt) ? { createdAt: record.createdAt } : {}),
+      }
+    })
+    .filter((item): item is ActiveQuestionTodoItem => item !== null)
+  return sortActionItems(items)
+}
+
+function listActivePermissionTodoItems(view: BrokerAuthoritativeView | undefined): ActivePermissionTodoItem[] {
+  if (!view) {
+    return []
+  }
+
+  const items = Object.values(view.active.permissions)
+    .map((value) => asObject(value))
+    .map((record) => {
+      const handle = isNonEmptyString(record.handle) ? record.handle.trim() : ""
+      if (!handle) {
+        return null
+      }
+      return {
+        handle,
+        summary: formatPermissionSummary(record.prompt),
+        ...(typeof record.createdAt === "number" && Number.isFinite(record.createdAt) ? { createdAt: record.createdAt } : {}),
+      }
+    })
+    .filter((item): item is ActivePermissionTodoItem => item !== null)
+  return sortActionItems(items)
+}
+
+function listActiveNaturalStopTodoItems(view: BrokerAuthoritativeView | undefined): ActiveNaturalStopTodoItem[] {
+  if (!view) {
+    return []
+  }
+
+  const items = Object.values(view.active.naturalStops)
+    .map((value) => asObject(value))
+    .map((record) => {
+      const handle = isNonEmptyString(record.handle) ? record.handle.trim() : ""
+      if (!handle) {
+        return null
+      }
+      return {
+        handle,
+        summary: formatNaturalStopSummary(record),
+        ...(isNonEmptyString(record.severityAdvice) ? { severityAdvice: record.severityAdvice.trim() } : {}),
+        ...(typeof record.createdAt === "number" && Number.isFinite(record.createdAt) ? { createdAt: record.createdAt } : {}),
+      }
+    })
+    .filter((item): item is ActiveNaturalStopTodoItem => item !== null)
+  return sortActionItems(items)
+}
+
+function formatStatusQuestionItem(item: ActiveQuestionTodoItem): string[] {
+  return [
+    "待回复问题",
+    `QID：${item.handle}`,
+    `摘要：${item.summary}`,
+    `回复：/reply ${item.handle} 你的回复`,
+  ]
+}
+
 function listBrokerViewInstanceIDs(view: BrokerAuthoritativeView): string[] {
   const ids = new Set<string>()
 
@@ -343,7 +503,7 @@ function buildBrokerViewSnapshot(view: BrokerAuthoritativeView, instanceID: stri
       syntheticRetryIndex += 1
       session = {
         sessionID: retrySessionID,
-        title: isNonEmptyString(record.sessionID) ? record.sessionID.trim() : "通知投递异常",
+        title: "通知投递异常",
         directory: "",
         updatedAt: toFiniteNumber(record.updatedAt),
         status: "retry",
@@ -427,53 +587,92 @@ export function formatInstanceStatusSnapshot(snapshotInput: unknown): string {
 }
 
 export function formatAggregatedStatusReply(input: AggregatedStatusReplyInput): string {
-  if (!Array.isArray(input.instances) || input.instances.length === 0) {
+  const instances = Array.isArray(input.instances) ? input.instances : []
+  const activeQuestions = Array.isArray(input.activeQuestions) ? input.activeQuestions : []
+  if (instances.length === 0 && activeQuestions.length === 0) {
     return "wechat status: no online instances"
   }
 
   const sections: string[] = []
   sections.push("wechat status")
 
-  for (const instance of input.instances) {
+  const questionsByInstance = new Map<string, ActiveQuestionTodoItem[]>()
+  for (const item of activeQuestions) {
+    if (!item.instanceID) {
+      continue
+    }
+    const existing = questionsByInstance.get(item.instanceID) ?? []
+    existing.push(item)
+    questionsByInstance.set(item.instanceID, existing)
+  }
+  const renderedQuestionHandles = new Set<string>()
+
+  const renderQuestions = (questions: ActiveQuestionTodoItem[]) => {
+    for (const question of questions) {
+      if (renderedQuestionHandles.has(question.handle)) {
+        continue
+      }
+      sections.push(...formatStatusQuestionItem(question))
+      renderedQuestionHandles.add(question.handle)
+    }
+  }
+
+  for (const instance of instances) {
     if (instance.status === "timeout/unreachable") {
-      sections.push("实例状态")
+      sections.push("## 实例：timeout/unreachable")
+      sections.push("---")
       sections.push("timeout/unreachable")
+      renderQuestions(questionsByInstance.get(instance.instanceID) ?? [])
       continue
     }
 
     const snapshot = normalizeSnapshot(instance.snapshot)
+    sections.push(formatInstanceTitle(snapshot, "未命名实例"))
+    sections.push("---")
+
     const sessions = pickTopSessions(snapshot.sessions)
     if (sessions.length === 0) {
-      sections.push(snapshot.instanceName || "未命名实例")
       sections.push("- no active sessions")
-      continue
-    }
+    } else {
+      for (const session of sessions) {
+        sections.push(formatSessionTitle(session))
+        sections.push(formatSessionTags(session))
+        for (const todo of session.todoItems ?? []) {
+          sections.push(formatTodoItem(todo))
+        }
+        for (const question of session.questionHighlights ?? []) {
+          sections.push(question)
+        }
 
-    for (const session of sessions) {
-      sections.push(session.title || "未命名会话")
-      sections.push(formatSessionTags(session))
-      for (const todo of session.todoItems ?? []) {
-        sections.push(formatTodoItem(todo))
-      }
-      for (const question of session.questionHighlights ?? []) {
-        sections.push(question)
-      }
+        const sessionUnavailable = toSessionUnavailable(session.unavailable)
+        if (sessionUnavailable.length > 0) {
+          sections.push(`session unavailable: ${sessionUnavailable.join(", ")}`)
+        }
 
-      const sessionUnavailable = toSessionUnavailable(session.unavailable)
-      if (sessionUnavailable.length > 0) {
-        sections.push(`session unavailable: ${sessionUnavailable.join(", ")}`)
-      }
-
-      for (const highlight of sortHighlights(session.highlights)) {
-        if (highlight.kind !== "todo" && highlight.kind !== "question" && (highlight.kind !== "status" || session.status === "retry")) {
-          sections.push(highlight.text)
+        for (const highlight of sortHighlights(session.highlights)) {
+          if (highlight.kind !== "todo" && highlight.kind !== "question" && (highlight.kind !== "status" || session.status === "retry")) {
+            sections.push(highlight.text)
+          }
         }
       }
     }
 
+    renderQuestions(questionsByInstance.get(instance.instanceID) ?? [])
+
     const instanceUnavailable = toInstanceUnavailable(snapshot.unavailable)
     if (instanceUnavailable.length > 0) {
       sections.push(`instance unavailable: ${instanceUnavailable.join(", ")}`)
+    }
+  }
+
+  const remainingQuestions = activeQuestions
+    .filter((item) => !renderedQuestionHandles.has(item.handle))
+    .filter((item, index, array) => array.findIndex((candidate) => candidate.handle === item.handle) === index)
+  if (remainingQuestions.length > 0) {
+    sections.push("## 实例：未知实例")
+    sections.push("---")
+    for (const question of remainingQuestions) {
+      sections.push(...formatStatusQuestionItem(question))
     }
   }
 
@@ -510,5 +709,52 @@ export function formatAggregatedStatusReplyFromBrokerView(view: BrokerAuthoritat
   return formatAggregatedStatusReply({
     requestId: "broker-authoritative-view",
     instances: buildAggregatedStatusInstancesFromBrokerView(view),
+    activeQuestions: listActiveQuestionTodoItems(view),
   })
+}
+
+export function formatTodoReplyFromBrokerView(view: BrokerAuthoritativeView | undefined): string {
+  const questions = listActiveQuestionTodoItems(view)
+  const permissions = listActivePermissionTodoItems(view)
+  const naturalStops = listActiveNaturalStopTodoItems(view)
+
+  if (questions.length === 0 && permissions.length === 0 && naturalStops.length === 0) {
+    return "当前没有待回复或待处理事项"
+  }
+
+  const lines: string[] = ["待处理事项"]
+
+  if (questions.length > 0) {
+    lines.push("", "【问题】")
+    for (const item of questions) {
+      lines.push(`- QID：${item.handle}`)
+      lines.push(`  摘要：${item.summary}`)
+      lines.push(`  回复：/reply ${item.handle} 你的回复`)
+    }
+  }
+
+  if (permissions.length > 0) {
+    lines.push("", "【权限】")
+    for (const item of permissions) {
+      lines.push(`- PID：${item.handle}`)
+      lines.push(`  摘要：${item.summary}`)
+      lines.push(`  允许一次：/allow ${item.handle} once`)
+      lines.push(`  始终允许：/allow ${item.handle} always`)
+      lines.push(`  拒绝：/allow ${item.handle} reject`)
+    }
+  }
+
+  if (naturalStops.length > 0) {
+    lines.push("", "【自然结束】")
+    for (const item of naturalStops) {
+      lines.push(`- SID：${item.handle}`)
+      lines.push(`  摘要：${item.summary}`)
+      if (item.severityAdvice) {
+        lines.push(`  建议：${item.severityAdvice}`)
+      }
+      lines.push(`  回复：/reply ${item.handle} 继续处理`)
+    }
+  }
+
+  return lines.join("\n")
 }

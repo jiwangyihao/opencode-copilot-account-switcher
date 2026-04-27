@@ -63,7 +63,7 @@ import {
 } from "./broker-mutation-queue.js"
 import { buildQuestionAnswersFromReply } from "./question-interaction.js"
 import { formatBrokerLegacyHandleClosureText } from "./notification-format.js"
-import { formatAggregatedStatusReplyFromBrokerView } from "./status-format.js"
+import { formatAggregatedStatusReplyFromBrokerView, formatTodoReplyFromBrokerView } from "./status-format.js"
 
 type ReplyMutationResult = {
   mutationId: string
@@ -843,6 +843,11 @@ export function createBrokerWechatSlashCommandHandler(input: {
       return handleStatusCommand()
     }
 
+    if (command.type === "todo") {
+      const brokerView = await readBrokerAuthoritativeView()
+      return formatTodoReplyFromBrokerView(brokerView)
+    }
+
     if (command.type === "reply") {
       const openQuestion = await findActiveRequestByHandle("question", command.handle)
       if (!openQuestion) {
@@ -1088,6 +1093,10 @@ export function createBrokerWechatSlashCommandHandler(input: {
         return result.message
       }
       return `已恢复请求：${result.recovered.handle}`
+    }
+
+    if (command.type !== "allow") {
+      return "未知命令"
     }
 
     const openPermission = await findActiveRequestByHandle("permission", command.handle)

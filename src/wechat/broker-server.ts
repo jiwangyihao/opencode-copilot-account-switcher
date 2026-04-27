@@ -60,7 +60,11 @@ import {
   WECHAT_FILE_MODE,
   wechatBrokerDiagnosticsPath,
 } from "./state-paths.js"
-import { buildAggregatedStatusInstancesFromBrokerView, formatAggregatedStatusReplyFromBrokerView } from "./status-format.js"
+import {
+  buildAggregatedStatusInstancesFromBrokerView,
+  formatAggregatedStatusReplyFromBrokerView,
+  formatTodoReplyFromBrokerView,
+} from "./status-format.js"
 import type { WechatSlashCommand } from "./command-parser.js"
 import {
   findActiveNaturalStopByReplyTarget,
@@ -1383,11 +1387,20 @@ export async function startBrokerServer(endpoint: string): Promise<BrokerServerH
       return result.reply
     }
 
+    if (command.type === "todo") {
+      const view = readBrokerAuthoritativeView(liveWsCoordinator.getState())
+      return formatTodoReplyFromBrokerView(view)
+    }
+
     if (command.type === "reply") {
       return "命令暂未实现：/reply"
     }
 
-    return "命令暂未实现：/allow"
+    if (command.type === "allow") {
+      return "命令暂未实现：/allow"
+    }
+
+    return "未知命令"
   }
 
   const handleNotificationDeliveryFailure = async (input: {

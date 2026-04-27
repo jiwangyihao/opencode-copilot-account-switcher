@@ -2126,6 +2126,30 @@ test("/status 文案边界：标题分段、inline code tag、checklist todo 优
         },
       },
       {
+        instanceID: "internal-instance-second-789",
+        status: "ok",
+        snapshot: {
+          instanceID: "internal-instance-second-789",
+          instanceName: "Second runtime label",
+          pid: 202,
+          directory: "/repo-second",
+          collectedAt: 456,
+          sessions: [
+            {
+              sessionID: "second-session-hidden-1",
+              title: "第二实例会话",
+              directory: "/repo-second",
+              updatedAt: 500,
+              status: "idle",
+              pendingQuestionCount: 0,
+              pendingPermissionCount: 0,
+              todoSummary: { total: 0, inProgress: 0, completed: 0 },
+              highlights: [{ kind: "status", text: "status: idle" }],
+            },
+          ],
+        },
+      },
+      {
         instanceID: "internal-timeout-456",
         status: "timeout/unreachable",
       },
@@ -2145,10 +2169,39 @@ test("/status 文案边界：标题分段、inline code tag、checklist todo 优
   assert.match(reply, /instance unavailable: permissionList/i)
   assert.match(reply, /timeout\/unreachable/i)
 
+  assert.match(reply, /^wechat status\n/)
+  assert.match(reply, /## 实例：Rich hidden runtime label/)
+  assert.match(reply, /## 实例：Second runtime label/)
+  assert.match(reply, /### 会话：发布主线/)
+  assert.match(reply, /### 会话：new-2/)
+  assert.match(reply, /### 会话：new-3/)
+  assert.match(reply, /### 会话：第二实例会话/)
+  assert.equal((reply.match(/^---$/gm) ?? []).length, 3)
+
+  const firstInstanceIndex = reply.indexOf("## 实例：Rich hidden runtime label")
+  const secondInstanceIndex = reply.indexOf("## 实例：Second runtime label")
+  const timeoutIndex = reply.indexOf("## 实例：timeout/unreachable")
+  assert.equal(firstInstanceIndex >= 0, true)
+  assert.equal(secondInstanceIndex > firstInstanceIndex, true)
+  assert.equal(timeoutIndex > secondInstanceIndex, true)
+
+  const mainSessionIndex = reply.indexOf("### 会话：发布主线")
+  const new2Index = reply.indexOf("### 会话：new-2")
+  const new3Index = reply.indexOf("### 会话：new-3")
+  const secondInstanceSessionIndex = reply.indexOf("### 会话：第二实例会话")
+  assert.equal(mainSessionIndex > firstInstanceIndex, true)
+  assert.equal(new2Index > mainSessionIndex, true)
+  assert.equal(new3Index > new2Index, true)
+  assert.equal(new3Index < secondInstanceIndex, true)
+  assert.equal(secondInstanceSessionIndex > secondInstanceIndex, true)
+  assert.equal(secondInstanceSessionIndex < timeoutIndex, true)
+
+  assert.doesNotMatch(reply, /internal-instance-second-789|second-session-hidden-1/)
+
   assert.match(reply, /new-2/)
   assert.match(reply, /new-3/)
   assert.doesNotMatch(reply, /old-hide|s-old-should-hide/)
-  assert.doesNotMatch(reply, /internal-instance-rich-123|session-hidden-123|internal-timeout-456|instanceID|sessionID|createdAt/)
+  assert.doesNotMatch(reply, /internal-instance-rich-123|session-hidden-123|internal-timeout-456|internal-instance-second-789|second-session-hidden-1|instanceID|sessionID|createdAt/)
   assert.doesNotMatch(reply, /\/status|slash command|recent command/i)
 
   const titleIndex = reply.indexOf("发布主线")
@@ -2163,10 +2216,212 @@ test("/status 文案边界：标题分段、inline code tag、checklist todo 优
   assert.equal(runningIndex > questionIndex, true)
 })
 
-test("command parser: 识别 /status /reply /allow /recover", async () => {
+test("/status formatter: bridge 摘要没有 authoritative handle 时不伪造 QID", async () => {
+  const statusFormat = await import(`../dist/wechat/status-format.js?reload=${Date.now()}-status-no-qid`)
+
+  const reply = statusFormat.formatAggregatedStatusReply({
+    requestId: "req-no-active-qid",
+    instances: [{
+      instanceID: "internal-no-active-qid",
+      status: "ok",
+      snapshot: {
+        instanceID: "internal-no-active-qid",
+        instanceName: "无 active handle 实例",
+        pid: 101,
+        directory: "/repo",
+        collectedAt: 123,
+        sessions: [{
+          sessionID: "session-no-active-qid",
+          title: "只有摘要的会话",
+          directory: "/repo",
+          updatedAt: 400,
+          status: "busy",
+          pendingQuestionCount: 1,
+          pendingPermissionCount: 0,
+          todoSummary: { total: 0, inProgress: 0, completed: 0 },
+          questionHighlights: ["问题：这只是 bridge 摘要"],
+          highlights: [{ kind: "question", text: "pending question: 1" }],
+        }],
+      },
+    }],
+  })
+
+  assert.match(reply, /问题：这只是 bridge 摘要/)
+  assert.doesNotMatch(reply, /QID：/)
+  assert.doesNotMatch(reply, /\/reply q/)
+})
+
+test("/todo formatter: 无 active 待处理事项时返回精确空状态", async () => {
+  const statusFormat = await import(`../dist/wechat/status-format.js?reload=${Date.now()}-todo-empty`)
+
+  assert.equal(statusFormat.formatTodoReplyFromBrokerView(undefined), "当前没有待回复或待处理事项")
+  assert.equal(statusFormat.formatTodoReplyFromBrokerView({
+    connections: {},
+    active: {
+      instances: {},
+      sessions: {},
+      questions: {},
+      permissions: {},
+      naturalStops: {},
+      retryErrors: {},
+    },
+    terminalMetadata: {},
+    retainedOccupancy: {},
+    commandLedger: {},
+    legacyHandleClosures: {},
+  }), "当前没有待回复或待处理事项")
+})
+
+test("/todo formatter: 三类 active 事项按类型分组、稳定排序且不泄露内部 ID", async () => {
+  const statusFormat = await import(`../dist/wechat/status-format.js?reload=${Date.now()}-todo-full`)
+  const view = {
+    connections: {},
+    active: {
+      instances: {},
+      sessions: {
+        "session-normal-todo": {
+          instanceID: "instance-normal-todo",
+          sessionID: "session-normal-todo",
+          title: "普通 todo 会话",
+          todoItems: [{ status: "pending", content: "普通 session todo 不应进入 /todo" }],
+        },
+      },
+      questions: {
+        "route-question-late": {
+          routeKey: "route-question-late",
+          handle: "q2",
+          requestID: "request-question-late",
+          scopeKey: "instance-question-late",
+          instanceID: "instance-question-late",
+          createdAt: 10,
+          prompt: { body: "第二个问题正文", mode: "text" },
+        },
+        "route-question-early": {
+          routeKey: "route-question-early",
+          handle: "q1",
+          requestID: "request-question-early",
+          scopeKey: "instance-question-early",
+          instanceID: "instance-question-early",
+          createdAt: 10,
+          prompt: { title: "第一个问题标题", body: "第一个问题正文", mode: "text" },
+        },
+        "route-question-newer": {
+          routeKey: "route-question-newer",
+          handle: "q3",
+          requestID: "request-question-newer",
+          scopeKey: "instance-question-newer",
+          instanceID: "instance-question-newer",
+          createdAt: 20,
+          prompt: { title: "第三个问题标题", mode: "text" },
+        },
+      },
+      permissions: {
+        "route-permission-b": {
+          routeKey: "route-permission-b",
+          handle: "p2",
+          requestID: "request-permission-b",
+          scopeKey: "instance-permission-b",
+          instanceID: "instance-permission-b",
+          prompt: { title: "权限 B", type: "tool", description: "npm test" },
+        },
+        "route-permission-a": {
+          routeKey: "route-permission-a",
+          handle: "p1",
+          requestID: "request-permission-a",
+          scopeKey: "instance-permission-a",
+          instanceID: "instance-permission-a",
+          createdAt: 5,
+          prompt: { description: "bash: npm run build" },
+        },
+      },
+      naturalStops: {
+        s2: {
+          handle: "s2",
+          scopeKey: "instance-natural-b",
+          instanceID: "instance-natural-b",
+          sessionID: "session-natural-b",
+          replyTarget: { instanceID: "instance-natural-b", sessionID: "session-natural-b" },
+          redactedSummary: "第二个自然结束",
+        },
+        s0: {
+          handle: "s0",
+          scopeKey: "instance-natural-zero",
+          instanceID: "instance-natural-zero",
+          sessionID: "session-natural-zero",
+          replyTarget: { instanceID: "instance-natural-zero", sessionID: "session-natural-zero" },
+          redactedSummary: "无时间自然结束",
+        },
+        s1: {
+          handle: "s1",
+          scopeKey: "instance-natural-a",
+          instanceID: "instance-natural-a",
+          sessionID: "session-natural-a",
+          replyTarget: { instanceID: "instance-natural-a", sessionID: "session-natural-a" },
+          createdAt: 1,
+          redactedSummary: "需要补充自然中止说明",
+          severityAdvice: "已停止并等待你的回复",
+        },
+      },
+      retryErrors: {},
+    },
+    terminalMetadata: {
+      "route-terminal-old": { handle: "sold", reason: "continued" },
+    },
+    retainedOccupancy: {
+      "old-natural": { handle: "sretained" },
+    },
+    commandLedger: {},
+    legacyHandleClosures: {
+      slegacy: { kind: "naturalStop", handle: "slegacy", reason: "continued" },
+    },
+  }
+
+  const reply = statusFormat.formatTodoReplyFromBrokerView(view)
+
+  assert.match(reply, /^待处理事项\n/)
+  assert.match(reply, /【问题】/)
+  assert.match(reply, /【权限】/)
+  assert.match(reply, /【自然结束】/)
+  assert.match(reply, /QID：q1/)
+  assert.match(reply, /摘要：第一个问题标题/)
+  assert.match(reply, /回复：\/reply q1 你的回复/)
+  assert.match(reply, /QID：q2/)
+  assert.match(reply, /摘要：第二个问题正文/)
+  assert.match(reply, /QID：q3/)
+  assert.match(reply, /摘要：第三个问题标题/)
+  assert.match(reply, /PID：p1/)
+  assert.match(reply, /摘要：bash: npm run build/)
+  assert.match(reply, /允许一次：\/allow p1 once/)
+  assert.match(reply, /始终允许：\/allow p1 always/)
+  assert.match(reply, /拒绝：\/allow p1 reject/)
+  assert.match(reply, /PID：p2/)
+  assert.match(reply, /摘要：权限 B：npm test/)
+  assert.match(reply, /SID：s1/)
+  assert.match(reply, /建议：已停止并等待你的回复/)
+  assert.match(reply, /回复：\/reply s1 继续处理/)
+  assert.match(reply, /SID：s0/)
+  assert.match(reply, /SID：s2/)
+
+  assert.equal(reply.indexOf("QID：q1") < reply.indexOf("QID：q2"), true)
+  assert.equal(reply.indexOf("QID：q2") < reply.indexOf("QID：q3"), true)
+  assert.equal(reply.indexOf("PID：p1") < reply.indexOf("PID：p2"), true)
+  assert.equal(reply.indexOf("SID：s1") < reply.indexOf("SID：s0"), true)
+  assert.equal(reply.indexOf("SID：s0") < reply.indexOf("SID：s2"), true)
+  assert.equal(reply.indexOf("SID：s1") < reply.indexOf("SID：s2"), true)
+  assert.equal(reply.indexOf("【问题】") < reply.indexOf("【权限】"), true)
+  assert.equal(reply.indexOf("【权限】") < reply.indexOf("【自然结束】"), true)
+
+  assert.doesNotMatch(reply, /普通 session todo 不应进入 \/todo/)
+  assert.doesNotMatch(reply, /slegacy|sretained|sold/)
+  assert.doesNotMatch(reply, /legacyHandleClosures|retainedOccupancy|terminalMetadata|todoItems/)
+  assert.doesNotMatch(reply, /request-question|route-question|request-permission|route-permission|instance-question|instance-permission|instance-natural|session-natural|instanceID|sessionID|requestID|routeKey/)
+})
+
+test("command parser: 识别 /status /todo /reply /allow /recover", async () => {
   const parser = await import(`../dist/wechat/command-parser.js?reload=${Date.now()}`)
 
   assert.deepEqual(parser.parseWechatSlashCommand("/status"), { type: "status" })
+  assert.deepEqual(parser.parseWechatSlashCommand("/todo"), { type: "todo" })
   assert.deepEqual(parser.parseWechatSlashCommand("/reply q1 done"), { type: "reply", handle: "q1", text: "done" })
   assert.deepEqual(parser.parseWechatSlashCommand("/allow p1 once approved"), {
     type: "allow",
@@ -2190,6 +2445,8 @@ test("command parser: 识别 /status /reply /allow /recover", async () => {
     type: "recover",
     handle: "q1",
   })
+  assert.equal(parser.parseWechatSlashCommand("/todox"), null)
+  assert.equal(parser.parseWechatSlashCommand("/todo extra"), null)
   assert.equal(parser.parseWechatSlashCommand("/replyq1 done"), null)
   assert.equal(parser.parseWechatSlashCommand("/allowp1 once ok"), null)
   assert.equal(parser.parseWechatSlashCommand("/recoverq1"), null)
@@ -2266,6 +2523,10 @@ test("broker slash handler: /status 走 collectStatus formatter，其它 slash �
     assert.match(statusReply, /timeout\/unreachable/i)
     assert.doesNotMatch(statusReply, /slash-instance-hidden-1|slash-session-hidden-1|instanceID|sessionID|createdAt/)
 
+    assert.equal(
+      await server.handleWechatSlashCommand({ type: "todo" }),
+      "当前没有待回复或待处理事项",
+    )
     assert.equal(
       await server.handleWechatSlashCommand({ type: "reply", handle: "q1", text: "hi" }),
       "命令暂未实现：/reply",
@@ -2410,7 +2671,9 @@ test("status formatter: 过滤畸形 snapshot，避免输出 undefined 文案", 
     ],
   })
 
-  assert.match(reply, /^wechat status\nok$/m)
+  assert.match(reply, /^wechat status\n/)
+  assert.match(reply, /## 实例：Malformed/)
+  assert.match(reply, /### 会话：ok/)
   assert.match(reply, /`#unknown` `#todo:1` `#question:0` `#permission:0`/)
   assert.match(reply, /\[ \] 保留的事项/)
   assert.match(reply, /session unavailable: messages, todo/)
@@ -4378,6 +4641,19 @@ test("broker-entry slash handler: /status 直接读 broker 权威视图，不再
       { kind: "status", text: "status: busy" },
     ],
   }
+  state.active.questions["route-status-authoritative-q1"] = {
+    routeKey: "route-status-authoritative-q1",
+    handle: "qstatus1",
+    requestID: "request-status-authoritative-q1",
+    scopeKey: "instance-status-authoritative",
+    instanceID: "instance-status-authoritative",
+    createdAt: 1_701_100_000_120,
+    prompt: {
+      title: "是否直接读取 broker 视图",
+      body: "请确认是否继续",
+      mode: "text",
+    },
+  }
 
   const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
     readBrokerAuthoritativeView: () => brokerStateStore.readBrokerAuthoritativeView(state),
@@ -4389,9 +4665,122 @@ test("broker-entry slash handler: /status 直接读 broker 权威视图，不再
   assert.match(result, /`#busy` `#todo:1` `#question:1` `#permission:0`/)
   assert.match(result, /\[ \] 收敛 slash 状态来源/)
   assert.match(result, /问题：是否直接读取 broker 视图/)
+  assert.match(result, /待回复问题/)
+  assert.match(result, /QID：qstatus1/)
+  assert.match(result, /摘要：是否直接读取 broker 视图/)
+  assert.match(result, /回复：\/reply qstatus1 你的回复/)
   assert.match(result, /instance unavailable: permissionList/)
   assert.match(result, /timeout\/unreachable/i)
+  assert.doesNotMatch(result, /request-status-authoritative-q1|route-status-authoritative-q1/)
   assert.doesNotMatch(result, /instance-status-authoritative|session-status-authoritative|instance-status-timeout|instanceID|sessionID/)
+})
+
+test("broker-entry slash handler: /status 即使 active question 不在 top sessions 中也显示 QID", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-status-qid-truncation`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-status-qid-truncation-store`)
+  const state = brokerStateStore.createEmptyBrokerState()
+
+  state.connections["instance-qid-truncation"] = {
+    "inc-qid-truncation": {
+      instanceID: "instance-qid-truncation",
+      instanceIncarnation: "inc-qid-truncation",
+      online: true,
+      lastEventSeq: 1,
+      lastAckedEventSeq: 1,
+      lastSentBrokerSeq: 1,
+      connectedAt: 1,
+    },
+  }
+  state.active.instances["instance-qid-truncation"] = {
+    instanceID: "instance-qid-truncation",
+    instanceIncarnation: "inc-qid-truncation",
+    displayName: "QID 裁剪实例",
+    online: true,
+  }
+  for (let index = 1; index <= 4; index += 1) {
+    state.active.sessions[`session-qid-truncation-${index}`] = {
+      instanceID: "instance-qid-truncation",
+      sessionID: `session-qid-truncation-${index}`,
+      title: `裁剪会话 ${index}`,
+      directory: "/repo",
+      updatedAt: 1_701_100_000_000 + index,
+      status: "idle",
+      pendingQuestionCount: index === 1 ? 1 : 0,
+      pendingPermissionCount: 0,
+      todoSummary: { total: 0, inProgress: 0, completed: 0 },
+      questionHighlights: index === 1 ? ["问题：低更新时间会话里的问题"] : [],
+      highlights: [],
+    }
+  }
+  state.active.questions["route-qid-truncation-hidden"] = {
+    routeKey: "route-qid-truncation-hidden",
+    handle: "qhidden1",
+    requestID: "request-qid-truncation-hidden",
+    scopeKey: "instance-qid-truncation",
+    instanceID: "instance-qid-truncation",
+    createdAt: 1_701_100_000_010,
+    prompt: { title: "低更新时间会话里的问题", mode: "text" },
+  }
+
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    readBrokerAuthoritativeView: () => brokerStateStore.readBrokerAuthoritativeView(state),
+  })
+  const reply = await handler({ type: "status" })
+
+  assert.match(reply, /QID：qhidden1/)
+  assert.match(reply, /回复：\/reply qhidden1 你的回复/)
+  assert.doesNotMatch(reply, /request-qid-truncation-hidden|route-qid-truncation-hidden|instance-qid-truncation|session-qid-truncation/)
+})
+
+test("broker-entry slash handler: /status 只有 active question 且无实例时仍显示 QID", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-status-orphan-qid`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-status-orphan-qid-store`)
+  const state = brokerStateStore.createEmptyBrokerState()
+
+  state.active.questions["route-orphan-qid"] = {
+    routeKey: "route-orphan-qid",
+    handle: "qorphan1",
+    requestID: "request-orphan-qid",
+    createdAt: 1_701_100_000_010,
+    prompt: { title: "无实例问题", mode: "text" },
+  }
+
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    readBrokerAuthoritativeView: () => brokerStateStore.readBrokerAuthoritativeView(state),
+  })
+  const reply = await handler({ type: "status" })
+
+  assert.match(reply, /^wechat status\n/)
+  assert.match(reply, /## 实例：未知实例/)
+  assert.match(reply, /QID：qorphan1/)
+  assert.match(reply, /摘要：无实例问题/)
+  assert.match(reply, /回复：\/reply qorphan1 你的回复/)
+  assert.doesNotMatch(reply, /request-orphan-qid|route-orphan-qid|instanceID|sessionID|requestID|routeKey/)
+})
+
+test("broker-entry slash handler: /todo 无 active 事项时返回精确空状态", async () => {
+  const brokerEntry = await import(`../dist/wechat/broker-entry.js?reload=${Date.now()}-todo-empty-entry`)
+  const brokerStateStore = await import(`../dist/wechat/broker-state-store.js?reload=${Date.now()}-todo-empty-store`)
+  const state = brokerStateStore.createEmptyBrokerState()
+  state.active.sessions["session-normal-todo-only"] = {
+    instanceID: "instance-normal-todo-only",
+    sessionID: "session-normal-todo-only",
+    title: "只有普通 todo 的会话",
+    directory: "/repo",
+    updatedAt: 1,
+    status: "busy",
+    pendingQuestionCount: 0,
+    pendingPermissionCount: 0,
+    todoSummary: { total: 1, inProgress: 0, completed: 0 },
+    todoItems: [{ status: "pending", content: "普通 session todo" }],
+    highlights: [],
+  }
+
+  const handler = brokerEntry.createBrokerWechatSlashCommandHandler({
+    readBrokerAuthoritativeView: () => brokerStateStore.readBrokerAuthoritativeView(state),
+  })
+
+  assert.equal(await handler({ type: "todo" }), "当前没有待回复或待处理事项")
 })
 
 function primeBrokerCommandState(store, state, input) {
@@ -4664,6 +5053,24 @@ test("broker-entry slash handler: 只读 broker-state-store 的 active question/
   assert.equal(await handler({ type: "reply", handle: "qbroker1", text: "done" }), "命令已被实例接受，正在处理中")
   assert.equal(await handler({ type: "allow", handle: "pbroker1", reply: "once", message: "approved" }), "命令已被实例接受，正在处理中")
   assert.equal(await handler({ type: "reply", handle: "sbroker1", text: "继续处理" }), "命令已被实例接受，正在处理中")
+
+  const todoReply = await handler({ type: "todo" })
+  assert.match(todoReply, /^待处理事项\n/)
+  assert.match(todoReply, /【问题】/)
+  assert.match(todoReply, /QID：qbroker1/)
+  assert.match(todoReply, /摘要：补充说明/)
+  assert.match(todoReply, /回复：\/reply qbroker1 你的回复/)
+  assert.match(todoReply, /【权限】/)
+  assert.match(todoReply, /PID：pbroker1/)
+  assert.match(todoReply, /允许一次：\/allow pbroker1 once/)
+  assert.match(todoReply, /始终允许：\/allow pbroker1 always/)
+  assert.match(todoReply, /拒绝：\/allow pbroker1 reject/)
+  assert.match(todoReply, /【自然结束】/)
+  assert.match(todoReply, /SID：sbroker1/)
+  assert.match(todoReply, /摘要：需要补充自然中止说明/)
+  assert.match(todoReply, /建议：已停止并等待你的回复/)
+  assert.match(todoReply, /回复：\/reply sbroker1 继续处理/)
+  assert.doesNotMatch(todoReply, /route-broker-only|q-broker-only|p-broker-only|instance-broker-only|session-broker-only|requestID|routeKey|instanceID|sessionID/)
 })
 
 test("broker-entry slash handler: seed 冲突的旧 request/notification/token/instance 数据时，/status 与旧 handle 文案仍只受 broker-state-store 驱动", async () => {

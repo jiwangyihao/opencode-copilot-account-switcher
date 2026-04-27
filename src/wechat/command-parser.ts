@@ -1,6 +1,8 @@
 export type WechatSlashCommand = {
   type: "status"
 } | {
+  type: "todo"
+} | {
   type: "reply"
   handle: string
   text: string
@@ -22,6 +24,9 @@ export function parseWechatSlashCommand(input: string): WechatSlashCommand | nul
   const normalized = input.trim()
   if (normalized === "/status") {
     return { type: "status" }
+  }
+  if (normalized === "/todo") {
+    return { type: "todo" }
   }
 
   const parts = normalized.split(/\s+/)
