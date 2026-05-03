@@ -16,6 +16,13 @@ function createContext() {
   }
 }
 
+test("wait tool description directs unattended waits away from question", () => {
+  const wait = createWaitTool()
+
+  assert.match(wait.description ?? "", /unattended|background/i)
+  assert.match(wait.description ?? "", /do not require user confirmation|without user confirmation/i)
+})
+
 test("wait tool enforces minimum 30 seconds", async () => {
   let sleptMs = 0
   const wait = createWaitTool({

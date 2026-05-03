@@ -22,7 +22,7 @@ export function createWaitTool(input: WaitToolInput = {}) {
   const sleep = input.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
 
   return tool({
-    description: "Wait in background for long-running tasks.",
+    description: "Wait in background for unattended tasks that do not require user confirmation, including long-running work, cooldowns, or expected non-user events.",
     args: {
       seconds: tool.schema.number().optional().describe("How long to wait in seconds (minimum 30)."),
     },
