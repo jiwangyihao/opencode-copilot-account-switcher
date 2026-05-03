@@ -175,7 +175,7 @@ opencode auth login --provider github-copilot
 - **删除账号**
 - **全部删除**
 
-Guided Loop Safety 现在默认开启。实际使用中，它可以让一次 request 更容易连续工作好几个小时：当 `question` 工具在当前会话中可用且被允许时，所有需要你介入的强交互内容（决策、缺失输入、等待态、最终交接、无安全工作可继续）必须通过它完成；纯进度、阶段切换和“仍在工作中”状态优先通过 `notify` 发送，若 `notify` 不可用则静默继续，避免把纯进度错误升级成打断式提问；若路由不确定则默认使用 `question`。另外，策略层要求用户可见交互仅走 `question/notify`，避免普通 assistant 直出文本打断流程。
+Guided Loop Safety 现在默认开启。实际使用中，它可以让一次 request 更容易连续工作好几个小时：当 `question` 工具在当前会话中可用且被允许时，所有需要你介入的强交互内容（决策、缺失输入、用户确认、最终交接、无安全工作可继续）必须通过它完成；所有无需用户确认、等待后可自动继续的等待类任务（长时间工具、外部作业、冷却、预期通知）必须使用 `wait`，避免把无人值守等待升级成必须用户亲自回复的停点；纯进度、阶段切换和“仍在工作中”状态优先通过 `notify` 发送，若 `notify` 不可用则静默继续，避免把纯进度错误升级成打断式提问；若不确定是否需要用户输入则默认使用 `question`，若只是等待时间流逝或等待预期的非用户事件则使用 `wait`。另外，策略层要求用户可见交互仅走 `question/notify`，避免普通 assistant 直出文本打断流程。
 
 ## 实验性 `/copilot-inject`
 
@@ -442,7 +442,7 @@ You will see an interactive menu. Use the built-in language switch action if you
 - **Delete account**
 - **Delete all**
 
-Guided Loop Safety is enabled by default. In practice, this can keep one request productive for hours: when `question` is available and permitted, all strong-interaction content (decisions, missing required input, explicit waiting states, final handoff, and no-safe-work-left states) must use it. Pure progress updates and phase changes should use `notify`; if `notify` is unavailable, pure progress stays silent and work continues instead of being escalated into interrupting questions. If routing is uncertain, default to `question`. The policy also constrains user-visible interaction channels to `question/notify`, avoiding ordinary plain-text assistant interruptions.
+Guided Loop Safety is enabled by default. In practice, this can keep one request productive for hours: when `question` is available and permitted, all strong-interaction content that needs the user (decisions, missing required input, user confirmation, final handoff, and no-safe-work-left states) must use it. Any unattended wait that does not require user confirmation and can resume automatically after time passes or an expected non-user event arrives must use `wait`, so background work is not converted into a blocking user-reply stop. Pure progress updates and phase changes should use `notify`; if `notify` is unavailable, pure progress stays silent and work continues instead of being escalated into interrupting questions. If it is uncertain whether user input is required, default to `question`; if the only need is time passing or an expected non-user event, use `wait`. The policy also constrains user-visible interaction channels to `question/notify`, avoiding ordinary plain-text assistant interruptions.
 
 ## Experimental `/copilot-inject`
 
