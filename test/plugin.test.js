@@ -627,7 +627,23 @@ test("tool.definition rewrites question description with wait and uncertainty se
   const output = { description: "original", parameters: {} }
   await plugin["tool.definition"]?.({ toolID: "question" }, output)
 
-  assert.match(output.description, /required user response|explicit wait|final handoff|uncertain/i)
+  assert.match(output.description, /required user response|user confirmation|final handoff|uncertain/i)
+  assert.match(output.description, /do not use.*unattended.*wait|use wait/i)
+  assert.doesNotMatch(output.description, /explicit wait state/i)
+})
+
+test("tool.definition rewrites wait description for unattended non-user waits", async () => {
+  const plugin = buildPluginHooks({
+    auth: { provider: "github-copilot", methods: [] },
+    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
+  })
+
+  const output = { description: "original", parameters: {} }
+  await plugin["tool.definition"]?.({ toolID: "wait" }, output)
+
+  assert.match(output.description, /unattended|background/i)
+  assert.match(output.description, /do not require user confirmation|without user confirmation/i)
+  assert.match(output.description, /long-running|external jobs|expected notifications/i)
 })
 
 test("tool.definition rewrites notify description as non-blocking progress channel", async () => {
