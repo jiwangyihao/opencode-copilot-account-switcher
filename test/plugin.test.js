@@ -644,6 +644,7 @@ test("tool.definition rewrites wait description for unattended non-user waits", 
   assert.match(output.description, /unattended|background/i)
   assert.match(output.description, /do not require user confirmation|without user confirmation/i)
   assert.match(output.description, /long-running|external jobs|expected notifications/i)
+  assert.match(output.description, /new user message|plugin-synthesized/i)
 })
 
 test("tool.definition rewrites notify description as non-blocking progress channel", async () => {

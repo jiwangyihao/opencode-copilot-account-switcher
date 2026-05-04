@@ -2108,7 +2108,9 @@ export function buildPluginHooks(input: {
       notify: createNotifyTool({
         client: input.client,
       }),
-      wait: createWaitTool(),
+      wait: createWaitTool({
+        client: input.client,
+      }),
     },
     "tool.definition": async (hookInput, output) => {
       if (hookInput.toolID === "question") {
@@ -2118,7 +2120,7 @@ export function buildPluginHooks(input: {
         output.description = "Use for non-blocking progress and phase updates only; do not require immediate user response."
       }
       if (hookInput.toolID === "wait") {
-        output.description = "Use for unattended/background waits that do not require user confirmation, including long-running tasks, external jobs, cooldowns, or expected notifications; resume after wait completes."
+        output.description = "Use for unattended/background waits that do not require user confirmation, including long-running tasks, external jobs, cooldowns, or expected notifications; resume after wait completes or after it exits early because the current session received a new user message, including plugin-synthesized notifications."
       }
     },
     "chat.headers": chatHeaders,
