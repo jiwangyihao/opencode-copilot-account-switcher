@@ -34,7 +34,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "npm run build && npm run test:built",
-    "test:built": "node --test test/plugin-entry.test.js",
+    "test:built": "node --test test/wait-tool.test.js test/plugin-entry.test.js",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
