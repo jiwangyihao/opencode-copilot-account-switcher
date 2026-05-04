@@ -8671,3 +8671,4 @@ test("provider descriptor contract keeps Copilot assembled and Codex enabled", a
   assert.equal(descriptors.CODEX_PROVIDER_DESCRIPTOR.storeNamespace, "codex")
   assert.equal(codex.enabledByDefault, true)
 })
+

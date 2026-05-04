@@ -2120,7 +2120,7 @@ export function buildPluginHooks(input: {
         output.description = "Use for non-blocking progress and phase updates only; do not require immediate user response."
       }
       if (hookInput.toolID === "wait") {
-        output.description = "Use for unattended/background waits that do not require user confirmation, including long-running tasks, external jobs, cooldowns, or expected notifications; resume after wait completes or after it exits early because the current session received a new user message, including plugin-synthesized notifications."
+        output.description = "Use for unattended/background waits that do not require user confirmation, including long-running tasks, external jobs, cooldowns, or expected notifications; pass until: \"new_user_message\" to wait for the current session to receive a new user message, including plugin-synthesized notifications, or resume after a timed wait exits early for that reason."
       }
     },
     "chat.headers": chatHeaders,
@@ -2133,3 +2133,5 @@ export function buildPluginHooks(input: {
     "experimental.session.compacting": compactionLoopSafetyBypass.hook,
   }
 }
+
+
