@@ -16,7 +16,7 @@ const EXPECTED_POLICY = `Guided Loop Safety Policy
 - Channel contract: Use only question or notify for user-visible interactions; never emit ordinary assistant plain text.
 - Notify contract: Pure progress, phase switches, and non-blocking background status updates belong to notify.
 - Question contract: Required user response, user decisions or confirmations, final handoff, and no-safe-work-left states belong to question; do not use question for unattended waits that can resume automatically.
-- Wait contract: All waiting that does not require user confirmation, including background waits for long-running tools, external jobs, cooldowns, or expected notifications, must use wait instead of question.
+- Wait contract: All waiting that does not require user confirmation, including background waits for long-running tools, external jobs, cooldowns, or expected notifications, must use wait instead of question; if a new user message appears, wait may end early and report that reason.
 - Decision matrix: If uncertain whether user input is required, default to question; if the only need is time passing or waiting for an expected non-user event, use wait.
 - Marker contract: If a tool output contains [COPILOT_INJECT_V1_BEGIN] ... [COPILOT_INJECT_V1_END], immediately call question and wait for user instruction before continuing.
 - Silent fallback discipline: If notify is unavailable, denied, absent, or fails, pure progress stays silent and work continues; do not automatically escalate that progress into question.
