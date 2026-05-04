@@ -198,6 +198,8 @@ Guided Loop Safety 现在默认开启。实际使用中，它可以让一次 req
 - 用法：`wait({ seconds })` 做计时等待，`seconds` 可省略且最小值固定为 30 秒；`wait({ until: "new_user_message" })` 会一直等到当前会话出现新的用户消息
 - 返回格式：完整计时等待为 `started: <ISO>; waited: <N>s; now: <ISO>`；计时等待中若出现新用户消息会返回 `ended: early; reason: ...; message: <id>`；事件等待命中时会返回 `ended: event; event: new_user_message; reason: ...; message: <id>`
 
+> 迁移说明：`wait` 正在拆为通用独立包 `opencode-wait`；当前 Copilot 包在迁移期继续默认组合它，现有用户无需改变安装方式。
+
 如果你在切换 Copilot 账号后遇到瞬时 TLS/网络失败，或者遇到由旧 session item ID 残留引起的 `input[*].id too long` 错误，也可以在同一菜单中开启 Copilot Network Retry。它默认关闭。开启后，插件会先保留 upstream 官方 loader 生成的 `baseURL`、认证头和 `fetch` 行为，只在最后一跳 Copilot `fetch` 路径上做最小包装，把可重试的网络类失败归一化成 OpenCode 已有重试链路能识别的形态；对于明确命中的 `input[*].id too long` 400，还会回写命中的 session part，避免旧 item ID 持续污染后续重试。
 
 ## 实验性 `/copilot-status`
@@ -464,6 +466,8 @@ Guided Loop Safety is enabled by default. In practice, this can keep one request
 - Default: **enabled**
 - Usage: `wait({ seconds })` for timed waits, with `seconds` optional and clamped to minimum 30; `wait({ until: "new_user_message" })` waits until the current session receives a new user message
 - Output shape: full timed waits return `started: <ISO>; waited: <N>s; now: <ISO>`; if a timed wait sees a new user message, it returns `ended: early; reason: ...; message: <id>`; event waits return `ended: event; event: new_user_message; reason: ...; message: <id>`
+
+> Migration note: `wait` is being split into the generic standalone package `opencode-wait`; this Copilot package keeps composing it during migration, so existing users do not need to change their installation path yet.
 
 If you switch Copilot accounts and then hit transient TLS/network failures or `input[*].id too long` errors caused by stale session item IDs, enable Copilot Network Retry from the same menu. It is off by default. When enabled, the plugin keeps the official Copilot header/baseURL behavior from the upstream loader, only wraps the final Copilot `fetch` path, and converts retryable network-like failures into a shape that OpenCode already treats as retryable. It also repairs the matched session part after an `input[*].id too long` 400 so later retries can recover instead of repeatedly failing on stale item IDs.
 
