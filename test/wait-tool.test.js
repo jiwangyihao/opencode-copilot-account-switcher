@@ -80,3 +80,131 @@ test("wait tool returns started waited now timeline", async () => {
   assert.match(result, /waited: 30s/)
   assert.match(result, /; now: /)
 })
+
+test("wait tool ends early when a new real user message appears in the current session", async () => {
+  const messageCalls = []
+  const wait = createWaitTool({
+    now: (() => {
+      let tick = 0
+      return () => 1_700_000_000_000 + tick++ * 1_000
+    })(),
+    pollIntervalMs: 1,
+    sleep: () => new Promise(() => {}),
+    client: {
+      session: {
+        messages: async (input) => {
+          messageCalls.push(input)
+          return {
+            data: messageCalls.length === 1
+              ? [
+                  {
+                    info: { id: "m1", role: "user", time: { created: 1_700_000_000_000 } },
+                    parts: [],
+                  },
+                ]
+              : [
+                  {
+                    info: { id: "m2", role: "user", time: { created: 1_700_000_001_000 } },
+                    parts: [{ type: "text", text: "typed by user", synthetic: false }],
+                  },
+                  {
+                    info: { id: "m1", role: "user", time: { created: 1_700_000_000_000 } },
+                    parts: [],
+                  },
+                ],
+          }
+        },
+      },
+    },
+  })
+
+  const result = await wait.execute({ seconds: 30 }, createContext())
+
+  assert.equal(messageCalls.length >= 2, true)
+  assert.deepEqual(messageCalls[0], {
+    path: { id: "s1" },
+    query: { directory: "/tmp/project", limit: 20 },
+  })
+  assert.match(result, /ended: early/i)
+  assert.match(result, /reason: new user message;/i)
+  assert.match(result, /message: m2/i)
+  assert.doesNotMatch(result, /waited: 30s/)
+})
+
+test("wait tool reports synthetic reason when a plugin-synthesized user message appears", async () => {
+  const messageCalls = []
+  const wait = createWaitTool({
+    now: (() => {
+      let tick = 0
+      return () => 1_700_000_000_000 + tick++ * 1_000
+    })(),
+    pollIntervalMs: 1,
+    sleep: () => new Promise(() => {}),
+    client: {
+      session: {
+        messages: async (input) => {
+          messageCalls.push(input)
+          return {
+            data: messageCalls.length === 1
+              ? [
+                  {
+                    info: { id: "m1", role: "user", time: { created: 1_700_000_000_000 } },
+                    parts: [],
+                  },
+                ]
+              : [
+                  {
+                    info: { id: "m2", role: "user", time: { created: 1_700_000_001_000 } },
+                    parts: [{ type: "text", text: "pty done", synthetic: true }],
+                  },
+                  {
+                    info: { id: "m1", role: "user", time: { created: 1_700_000_000_000 } },
+                    parts: [],
+                  },
+                ],
+          }
+        },
+      },
+    },
+  })
+
+  const result = await wait.execute({ seconds: 30 }, createContext())
+
+  assert.match(result, /ended: early/i)
+  assert.match(result, /reason: new user message \(synthetic\)/i)
+  assert.match(result, /message: m2/i)
+  assert.doesNotMatch(result, /waited: 30s/)
+})
+
+test("wait tool catches user messages that arrive before the initial session snapshot returns", async () => {
+  const wait = createWaitTool({
+    now: (() => {
+      let tick = 0
+      return () => 1_700_000_000_000 + tick++ * 1_000
+    })(),
+    pollIntervalMs: 1,
+    sleep: () => new Promise((resolve) => setTimeout(resolve, 10)),
+    client: {
+      session: {
+        messages: async () => ({
+          data: [
+            {
+              info: { id: "m2", role: "user", time: { created: 1_700_000_001_000 } },
+              parts: [{ type: "text", text: "already arrived" }],
+            },
+            {
+              info: { id: "m1", role: "user", time: { created: 1_700_000_000_000 } },
+              parts: [],
+            },
+          ],
+        }),
+      },
+    },
+  })
+
+  const result = await wait.execute({ seconds: 30 }, createContext())
+
+  assert.match(result, /ended: early/i)
+  assert.match(result, /reason: new user message;/i)
+  assert.match(result, /message: m2/i)
+})
