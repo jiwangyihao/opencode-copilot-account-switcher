@@ -34,6 +34,8 @@ type UserMessageObservation = {
   synthetic: boolean
 }
 
+type WaitUntilEvent = "new_user_message"
+
 const MIN_WAIT_SECONDS = 30
 const DEFAULT_USER_MESSAGE_POLL_INTERVAL_MS = 1_000
 const USER_MESSAGE_LOOKBACK_LIMIT = 20
@@ -52,6 +54,10 @@ function normalizePollIntervalMs(value: unknown) {
   const parsed = Number(value)
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_USER_MESSAGE_POLL_INTERVAL_MS
   return Math.max(1, Math.floor(parsed))
+}
+
+function normalizeUntil(value: unknown): WaitUntilEvent | undefined {
+  return value === "new_user_message" ? value : undefined
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -158,15 +164,34 @@ async function waitForNewUserMessage(input: {
   return undefined
 }
 
-function formatEarlyResult(input: {
+function formatUserMessageResult(input: {
   started: number
   finished: number
-  seconds: number
+  seconds?: number
+  eventMode: boolean
   message: UserMessageObservation
 }) {
   const waited = Math.max(0, Math.floor((input.finished - input.started) / 1000))
   const reason = input.message.synthetic ? "new user message (synthetic)" : "new user message"
-  return `started: ${toIso(input.started)}; requested: ${input.seconds}s; waited: ${waited}s; now: ${toIso(input.finished)}; ended: early; reason: ${reason}; message: ${input.message.id}`
+  const parts = [
+    `started: ${toIso(input.started)}`,
+    input.seconds === undefined ? undefined : `requested: ${input.seconds}s`,
+    `waited: ${waited}s`,
+    `now: ${toIso(input.finished)}`,
+    `ended: ${input.eventMode ? "event" : "early"}`,
+  ]
+  if (input.eventMode) parts.push("event: new_user_message")
+  parts.push(`reason: ${reason}`, `message: ${input.message.id}`)
+  return parts.filter((part): part is string => part !== undefined).join("; ")
+}
+
+function formatUnavailableEventResult(input: {
+  started: number
+  finished: number
+  event: WaitUntilEvent
+}) {
+  const waited = Math.max(0, Math.floor((input.finished - input.started) / 1000))
+  return `started: ${toIso(input.started)}; waited: ${waited}s; now: ${toIso(input.finished)}; ended: unavailable; event: ${input.event}; reason: session messages unavailable`
 }
 
 export function createWaitTool(input: WaitToolInput = {}) {
@@ -175,22 +200,39 @@ export function createWaitTool(input: WaitToolInput = {}) {
   const pollIntervalMs = normalizePollIntervalMs(input.pollIntervalMs)
 
   return tool({
-    description: "Wait in background for unattended tasks that do not require user confirmation, including long-running work, cooldowns, or expected non-user events. Ends early when the current session receives a new user message, including plugin-synthesized notifications.",
+    description: "Wait in background for unattended tasks that do not require user confirmation, including long-running work, cooldowns, or expected non-user events. Use until: \"new_user_message\" to wait until the current session receives a new user message, including plugin-synthesized notifications.",
     args: {
       seconds: tool.schema.number().optional().describe("How long to wait in seconds (minimum 30)."),
+      until: tool.schema.string().optional().describe("Event to wait for. Currently supported: new_user_message."),
     },
     async execute(args, context) {
-      const seconds = normalizeSeconds(args.seconds)
+      const until = normalizeUntil(args.until)
+      const eventOnly = until === "new_user_message" && args.seconds === undefined
+      const seconds = eventOnly ? undefined : normalizeSeconds(args.seconds)
       const started = now()
+      if (eventOnly && !input.client?.session?.messages) {
+        return formatUnavailableEventResult({
+          started,
+          finished: now(),
+          event: until,
+        })
+      }
+
       const controller = new AbortController()
-      const timeoutOutcome = sleep(seconds * 1000, controller.signal).then(
-        () => ({ type: "timeout" as const }),
-        (error) => {
-          if (controller.signal.aborted) return new Promise<never>(() => {})
-          throw error
-        },
-      )
-      const userMessageOutcome = waitForNewUserMessage({
+      const outcomes: Promise<
+        | { type: "timeout" }
+        | { type: "user-message"; message: UserMessageObservation }
+      >[] = []
+      if (seconds !== undefined) {
+        outcomes.push(sleep(seconds * 1000, controller.signal).then(
+          () => ({ type: "timeout" as const }),
+          (error) => {
+            if (controller.signal.aborted) return new Promise<never>(() => {})
+            throw error
+          },
+        ))
+      }
+      outcomes.push(waitForNewUserMessage({
         client: input.client,
         sessionID: context.sessionID,
         directory: context.directory,
@@ -201,17 +243,18 @@ export function createWaitTool(input: WaitToolInput = {}) {
       }).then((message) => {
         if (!message) return new Promise<never>(() => {})
         return { type: "user-message" as const, message }
-      })
+      }))
 
-      const outcome = await Promise.race([timeoutOutcome, userMessageOutcome])
+      const outcome = await Promise.race(outcomes)
       controller.abort()
       const finished = now()
 
       if (outcome.type === "user-message") {
-        return formatEarlyResult({
+        return formatUserMessageResult({
           started,
           finished,
           seconds,
+          eventMode: eventOnly,
           message: outcome.message,
         })
       }

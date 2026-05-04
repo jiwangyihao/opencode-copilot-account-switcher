@@ -176,6 +176,55 @@ test("wait tool reports synthetic reason when a plugin-synthesized user message 
   assert.doesNotMatch(result, /waited: 30s/)
 })
 
+test("wait tool can wait until a new user message event without a timeout", async () => {
+  const timeoutSleeps = []
+  const messageCalls = []
+  const wait = createWaitTool({
+    now: (() => {
+      let tick = 0
+      return () => 1_700_000_000_000 + tick++ * 1_000
+    })(),
+    pollIntervalMs: 1,
+    sleep: async (ms) => {
+      timeoutSleeps.push(ms)
+    },
+    client: {
+      session: {
+        messages: async () => {
+          messageCalls.push(true)
+          return {
+            data: messageCalls.length === 1
+              ? [
+                  {
+                    info: { id: "m1", role: "user", time: { created: 1_700_000_000_000 } },
+                    parts: [],
+                  },
+                ]
+              : [
+                  {
+                    info: { id: "m2", role: "user", time: { created: 1_700_000_001_000 } },
+                    parts: [{ type: "text", text: "event happened", synthetic: true }],
+                  },
+                  {
+                    info: { id: "m1", role: "user", time: { created: 1_700_000_000_000 } },
+                    parts: [],
+                  },
+                ],
+          }
+        },
+      },
+    },
+  })
+
+  const result = await wait.execute({ until: "new_user_message" }, createContext())
+
+  assert.deepEqual(timeoutSleeps, [])
+  assert.match(result, /ended: event/i)
+  assert.match(result, /event: new_user_message/i)
+  assert.match(result, /reason: new user message \(synthetic\)/i)
+  assert.match(result, /message: m2/i)
+  assert.doesNotMatch(result, /requested: 30s/)
+})
 test("wait tool catches user messages that arrive before the initial session snapshot returns", async () => {
   const wait = createWaitTool({
     now: (() => {
@@ -208,3 +257,4 @@ test("wait tool catches user messages that arrive before the initial session sna
   assert.match(result, /reason: new user message;/i)
   assert.match(result, /message: m2/i)
 })
+
