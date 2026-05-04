@@ -27,7 +27,7 @@
 - **Synthetic Agent Initiator** — 默认关闭；实验性开关，会偏离 upstream 当前稳定行为，发送或覆盖 `x-initiator=agent`，不保证平台一定不计费，且存在滥用判定与意外计费风险
 - **Copilot Status Slash Command** — 默认开启；实验性 `/copilot-status` workaround，只把 TUI 作为主支持面，Web/App 不承诺一致体验
 - **Copilot Inject Slash Command** — 默认开启；`/copilot-inject` 为无参数强干预开关，触发后会在下一次非 `question` 工具输出中注入 marker，强制模型立即走 `question`
-- **Wait Tool** — 默认开启；提供 `wait` 工具（最短 30 秒）用于后台等待；当前会话出现新的用户消息（包括插件合成消息）时会提前结束并返回原因
+- **Wait Tool** — 默认开启；提供 `wait` 工具用于后台等待；支持 `seconds` 计时等待，也支持 `until: "new_user_message"` 等到当前会话出现新的用户消息（包括插件合成消息）
 
 ## 功能一览
 
@@ -39,7 +39,7 @@
 - **Synthetic Agent Initiator** — 默认关闭；实验性开关，会偏离 upstream 稳定行为，发送或覆盖 `x-initiator=agent`，并伴随计费/滥用风险
 - **`/copilot-status`** — 默认开启；实验性 slash command，会先弹出“正在拉取”toast，再弹出 quota 结果或错误 toast
 - **`/copilot-inject`** — 默认开启；无参数实验性强干预开关，下一次非 `question` 工具输出会自动附加 marker，要求模型立刻调用 `question`
-- **`wait` 工具** — 默认开启；最短等待 30 秒，返回开始时间、等待秒数和当前时间；若当前会话出现新的用户消息（包括插件合成消息）则提前结束并说明原因
+- **`wait` 工具** — 默认开启；支持 `seconds` 计时等待（最短 30 秒）和 `until: "new_user_message"` 事件等待；当前会话出现新的用户消息（包括插件合成消息）时会说明原因
 - **无需模型配置** — 使用官方 provider，无需改模型
 
 ## 微信通知功能
@@ -195,8 +195,8 @@ Guided Loop Safety 现在默认开启。实际使用中，它可以让一次 req
 ## `wait` 工具
 
 - 默认：**开启**
-- 用法：`wait({ seconds })`；`seconds` 可省略，最小值固定为 30 秒
-- 返回格式：完整等待时为 `started: <ISO>; waited: <N>s; now: <ISO>`；若当前会话出现新的用户消息（包括插件合成消息），会提前返回 `ended: early; reason: ...; message: <id>`
+- 用法：`wait({ seconds })` 做计时等待，`seconds` 可省略且最小值固定为 30 秒；`wait({ until: "new_user_message" })` 会一直等到当前会话出现新的用户消息
+- 返回格式：完整计时等待为 `started: <ISO>; waited: <N>s; now: <ISO>`；计时等待中若出现新用户消息会返回 `ended: early; reason: ...; message: <id>`；事件等待命中时会返回 `ended: event; event: new_user_message; reason: ...; message: <id>`
 
 如果你在切换 Copilot 账号后遇到瞬时 TLS/网络失败，或者遇到由旧 session item ID 残留引起的 `input[*].id too long` 错误，也可以在同一菜单中开启 Copilot Network Retry。它默认关闭。开启后，插件会先保留 upstream 官方 loader 生成的 `baseURL`、认证头和 `fetch` 行为，只在最后一跳 Copilot `fetch` 路径上做最小包装，把可重试的网络类失败归一化成 OpenCode 已有重试链路能识别的形态；对于明确命中的 `input[*].id too long` 400，还会回写命中的 session part，避免旧 item ID 持续污染后续重试。
 
@@ -293,7 +293,7 @@ Default behavior and optional switches:
 - **Synthetic Agent Initiator** — optional and off by default; experimental switch that diverges from stable upstream behavior, sends or overrides `x-initiator=agent`, does not guarantee non-billable treatment, and carries abuse or unexpected-billing risk
 - **Copilot Status Slash Command** — enabled by default; experimental `/copilot-status` workaround with TUI-first support and no cross-client UX guarantee
 - **Copilot Inject Slash Command** — enabled by default; no-arg `/copilot-inject` force-intervention switch that injects a marker into the next non-`question` tool output and drives immediate `question`
-- **Wait Tool** — enabled by default; provides `wait` (minimum 30s) for background waits and exits early when the current session receives a new user message, including plugin-synthesized messages
+- **Wait Tool** — enabled by default; provides `wait` for background waits with either `seconds` timing or `until: "new_user_message"` event waiting for new user or plugin-synthesized messages
 
 ## What You Get
 
@@ -305,7 +305,7 @@ Default behavior and optional switches:
 - **Synthetic Agent Initiator** — optional and off by default; experimental switch that diverges from stable upstream behavior, sends or overrides `x-initiator=agent`, and carries billing/abuse risk
 - **`/copilot-status`** — enabled by default; experimental slash command that shows a loading toast first and then a quota result or error toast
 - **`/copilot-inject`** — enabled by default; no-arg force-intervention command that appends a marker to the next non-`question` tool output to force immediate `question`
-- **`wait` tool** — enabled by default; minimum wait is 30 seconds and response contains start/wait/current timestamps; it exits early with a reason when the current session receives a new user message, including plugin-synthesized messages
+- **`wait` tool** — enabled by default; supports `seconds` timed waits (minimum 30 seconds) and `until: "new_user_message"` event waits; it reports the reason when a new user or plugin-synthesized message ends the wait
 - **Zero model config** — no model changes required (official provider only)
 
 ## WeChat Notifications
@@ -462,8 +462,8 @@ Guided Loop Safety is enabled by default. In practice, this can keep one request
 ## `wait` Tool
 
 - Default: **enabled**
-- Usage: `wait({ seconds })`; `seconds` is optional and clamped to minimum 30
-- Output shape: full waits return `started: <ISO>; waited: <N>s; now: <ISO>`; if the current session receives a new user message, including a plugin-synthesized one, it returns early with `ended: early; reason: ...; message: <id>`
+- Usage: `wait({ seconds })` for timed waits, with `seconds` optional and clamped to minimum 30; `wait({ until: "new_user_message" })` waits until the current session receives a new user message
+- Output shape: full timed waits return `started: <ISO>; waited: <N>s; now: <ISO>`; if a timed wait sees a new user message, it returns `ended: early; reason: ...; message: <id>`; event waits return `ended: event; event: new_user_message; reason: ...; message: <id>`
 
 If you switch Copilot accounts and then hit transient TLS/network failures or `input[*].id too long` errors caused by stale session item IDs, enable Copilot Network Retry from the same menu. It is off by default. When enabled, the plugin keeps the official Copilot header/baseURL behavior from the upstream loader, only wraps the final Copilot `fetch` path, and converts retryable network-like failures into a shape that OpenCode already treats as retryable. It also repairs the matched session part after an `input[*].id too long` 400 so later retries can recover instead of repeatedly failing on stale item IDs.
 
@@ -552,3 +552,4 @@ No. The plugin keeps retry policy inside OpenCode by normalizing retryable Copil
 ## License
 
 MPL-2.0 License. See [LICENSE](LICENSE) for details.
+
