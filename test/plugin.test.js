@@ -618,7 +618,17 @@ test("after question inject no longer appends markers", async () => {
   assert.equal(String(output.output), "next")
 })
 
-test("tool.definition rewrites question description with wait and uncertainty semantics", async () => {
+test("tool registry keeps wait outside the Copilot package", async () => {
+  const plugin = buildPluginHooks({
+    auth: { provider: "github-copilot", methods: [] },
+    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
+    client: {},
+  })
+
+  assert.deepEqual(Object.keys(plugin.tool ?? {}).sort(), ["notify"])
+})
+
+test("tool.definition rewrites question description without owning wait", async () => {
   const plugin = buildPluginHooks({
     auth: { provider: "github-copilot", methods: [] },
     loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
@@ -628,23 +638,21 @@ test("tool.definition rewrites question description with wait and uncertainty se
   await plugin["tool.definition"]?.({ toolID: "question" }, output)
 
   assert.match(output.description, /required user response|user confirmation|final handoff|uncertain/i)
-  assert.match(output.description, /do not use.*unattended.*wait|use wait/i)
+  assert.match(output.description, /unattended\/background waits/i)
+  assert.match(output.description, /dedicated wait tool when available/i)
   assert.doesNotMatch(output.description, /explicit wait state/i)
 })
 
-test("tool.definition rewrites wait description for unattended non-user waits", async () => {
+test("tool.definition leaves external wait tools untouched", async () => {
   const plugin = buildPluginHooks({
     auth: { provider: "github-copilot", methods: [] },
     loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
   })
 
-  const output = { description: "original", parameters: {} }
+  const output = { description: "external wait", parameters: {} }
   await plugin["tool.definition"]?.({ toolID: "wait" }, output)
 
-  assert.match(output.description, /unattended|background/i)
-  assert.match(output.description, /do not require user confirmation|without user confirmation/i)
-  assert.match(output.description, /long-running|external jobs|expected notifications/i)
-  assert.match(output.description, /new user message|plugin-synthesized/i)
+  assert.equal(output.description, "external wait")
 })
 
 test("tool.definition rewrites notify description as non-blocking progress channel", async () => {
@@ -8671,4 +8679,5 @@ test("provider descriptor contract keeps Copilot assembled and Codex enabled", a
   assert.equal(descriptors.CODEX_PROVIDER_DESCRIPTOR.storeNamespace, "codex")
   assert.equal(codex.enabledByDefault, true)
 })
+
 

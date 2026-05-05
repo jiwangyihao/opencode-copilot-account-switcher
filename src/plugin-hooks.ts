@@ -37,7 +37,6 @@ import {
   loadOfficialCodexChatHeaders,
 } from "./upstream/codex-loader-adapter.js"
 import { createNotifyTool } from "./notify-tool.js"
-import { createWaitTool } from "./wait-tool.js"
 import type { CommonSettingsStore } from "./common-settings-store.js"
 import { refreshActiveAccountQuota, type RefreshActiveAccountQuotaResult } from "./active-account-quota.js"
 import { handleStatusCommand, showStatusToast } from "./status-command.js"
@@ -2108,19 +2107,13 @@ export function buildPluginHooks(input: {
       notify: createNotifyTool({
         client: input.client,
       }),
-      wait: createWaitTool({
-        client: input.client,
-      }),
     },
     "tool.definition": async (hookInput, output) => {
       if (hookInput.toolID === "question") {
-        output.description = "Use for required user response, user confirmation, final handoff, no-safe-work-left states, or uncertain routing cases. Do not use for unattended/background waits that can resume automatically; use wait when no user confirmation is needed."
+        output.description = "Use for required user response, user confirmation, final handoff, no-safe-work-left states, or uncertain routing cases. Do not use for unattended/background waits that can resume automatically; use a dedicated wait tool when available."
       }
       if (hookInput.toolID === "notify") {
         output.description = "Use for non-blocking progress and phase updates only; do not require immediate user response."
-      }
-      if (hookInput.toolID === "wait") {
-        output.description = "Use for unattended/background waits that do not require user confirmation, including long-running tasks, external jobs, cooldowns, or expected notifications; pass until: \"new_user_message\" to wait for the current session to receive a new user message, including plugin-synthesized notifications, or resume after a timed wait exits early for that reason."
       }
     },
     "chat.headers": chatHeaders,
@@ -2133,5 +2126,6 @@ export function buildPluginHooks(input: {
     "experimental.session.compacting": compactionLoopSafetyBypass.hook,
   }
 }
+
 
 
