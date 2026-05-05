@@ -6162,6 +6162,15 @@ test("route decision logs chosen account auth fingerprint for routed user turns"
       networkRetryEnabled: false,
     }),
     loadCandidateAccountLoads: async () => ({ main: 1, alt: 5 }),
+    loadOfficialConfig: async () => ({
+      apiKey: "",
+      fetch: async () => new Response("{}", {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+        },
+      }),
+    }),
     finalizeRequestForSelection: async ({ request, init }) => ({
       request,
       init: {
@@ -6225,6 +6234,15 @@ test("route decision logs debug link id for routed user turns", async () => {
       networkRetryEnabled: false,
     }),
     loadCandidateAccountLoads: async () => ({ main: 1, alt: 5 }),
+    loadOfficialConfig: async () => ({
+      apiKey: "",
+      fetch: async () => new Response("{}", {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+        },
+      }),
+    }),
     finalizeRequestForSelection: async ({ request, init }) => ({
       request,
       init: {
@@ -8679,5 +8697,6 @@ test("provider descriptor contract keeps Copilot assembled and Codex enabled", a
   assert.equal(descriptors.CODEX_PROVIDER_DESCRIPTOR.storeNamespace, "codex")
   assert.equal(codex.enabledByDefault, true)
 })
+
 
 
