@@ -27,7 +27,6 @@
 - **Synthetic Agent Initiator** — 默认关闭；实验性开关，会偏离 upstream 当前稳定行为，发送或覆盖 `x-initiator=agent`，不保证平台一定不计费，且存在滥用判定与意外计费风险
 - **Copilot Status Slash Command** — 默认开启；实验性 `/copilot-status` workaround，只把 TUI 作为主支持面，Web/App 不承诺一致体验
 - **Copilot Inject Slash Command** — 默认开启；`/copilot-inject` 为无参数强干预开关，触发后会在下一次非 `question` 工具输出中注入 marker，强制模型立即走 `question`
-- **Wait Tool** — 默认开启；提供 `wait` 工具用于后台等待；支持 `seconds` 计时等待，也支持 `until: "new_user_message"` 等到当前会话出现新的用户消息（包括插件合成消息）
 
 ## 功能一览
 
@@ -39,7 +38,6 @@
 - **Synthetic Agent Initiator** — 默认关闭；实验性开关，会偏离 upstream 稳定行为，发送或覆盖 `x-initiator=agent`，并伴随计费/滥用风险
 - **`/copilot-status`** — 默认开启；实验性 slash command，会先弹出“正在拉取”toast，再弹出 quota 结果或错误 toast
 - **`/copilot-inject`** — 默认开启；无参数实验性强干预开关，下一次非 `question` 工具输出会自动附加 marker，要求模型立刻调用 `question`
-- **`wait` 工具** — 默认开启；支持 `seconds` 计时等待（最短 30 秒）和 `until: "new_user_message"` 事件等待；当前会话出现新的用户消息（包括插件合成消息）时会说明原因
 - **无需模型配置** — 使用官方 provider，无需改模型
 
 ## 微信通知功能
@@ -175,7 +173,7 @@ opencode auth login --provider github-copilot
 - **删除账号**
 - **全部删除**
 
-Guided Loop Safety 现在默认开启。实际使用中，它可以让一次 request 更容易连续工作好几个小时：当 `question` 工具在当前会话中可用且被允许时，所有需要你介入的强交互内容（决策、缺失输入、用户确认、最终交接、无安全工作可继续）必须通过它完成；所有无需用户确认、等待后可自动继续的等待类任务（长时间工具、外部作业、冷却、预期通知）必须使用 `wait`，避免把无人值守等待升级成必须用户亲自回复的停点；纯进度、阶段切换和“仍在工作中”状态优先通过 `notify` 发送，若 `notify` 不可用则静默继续，避免把纯进度错误升级成打断式提问；若不确定是否需要用户输入则默认使用 `question`，若只是等待时间流逝或等待预期的非用户事件则使用 `wait`。另外，策略层要求用户可见交互仅走 `question/notify`，避免普通 assistant 直出文本打断流程。
+Guided Loop Safety 现在默认开启。实际使用中，它可以让一次 request 更容易连续工作好几个小时：当 `question` 工具在当前会话中可用且被允许时，所有需要你介入的强交互内容（决策、缺失输入、用户确认、最终交接、无安全工作可继续）必须通过它完成；所有无需用户确认、等待后可自动继续的等待类任务（长时间工具、外部作业、冷却、预期通知）应交给已安装的专用等待工具（例如独立插件 `opencode-wait`），避免把无人值守等待升级成必须用户亲自回复的停点；纯进度、阶段切换和“仍在工作中”状态优先通过 `notify` 发送，若 `notify` 不可用则静默继续，避免把纯进度错误升级成打断式提问；若不确定是否需要用户输入则默认使用 `question`，若只是等待时间流逝或等待预期的非用户事件，则优先使用已安装的专用等待工具。
 
 ## 实验性 `/copilot-inject`
 
@@ -192,13 +190,15 @@ Guided Loop Safety 现在默认开启。实际使用中，它可以让一次 req
 - 清除时机：模型实际调用 `question` 后，inject armed 状态自动清除
 - 作用范围：仅当前插件实例内存，不写入存储文件，不跨实例共享
 
-## `wait` 工具
+## 与 `opencode-wait` 配合
 
-- 默认：**开启**
-- 用法：`wait({ seconds })` 做计时等待，`seconds` 可省略且最小值固定为 30 秒；`wait({ until: "new_user_message" })` 会一直等到当前会话出现新的用户消息
-- 返回格式：完整计时等待为 `started: <ISO>; waited: <N>s; now: <ISO>`；计时等待中若出现新用户消息会返回 `ended: early; reason: ...; message: <id>`；事件等待命中时会返回 `ended: event; event: new_user_message; reason: ...; message: <id>`
+如果你的工作流需要无人值守等待、冷却时间或 `until: "new_user_message"` 事件等待，请单独安装 `opencode-wait`：
 
-> 迁移说明：`wait` 正在拆为通用独立包 `opencode-wait`；当前 Copilot 包在迁移期继续默认组合它，现有用户无需改变安装方式。
+```bash
+opencode plugin opencode-wait@0.1.0 --force -g
+```
+
+安装后，Guided Loop Safety 的等待语义会自然落到这个专用工具；Copilot 插件继续聚焦账号、配额和 Copilot 请求增强。
 
 如果你在切换 Copilot 账号后遇到瞬时 TLS/网络失败，或者遇到由旧 session item ID 残留引起的 `input[*].id too long` 错误，也可以在同一菜单中开启 Copilot Network Retry。它默认关闭。开启后，插件会先保留 upstream 官方 loader 生成的 `baseURL`、认证头和 `fetch` 行为，只在最后一跳 Copilot `fetch` 路径上做最小包装，把可重试的网络类失败归一化成 OpenCode 已有重试链路能识别的形态；对于明确命中的 `input[*].id too long` 400，还会回写命中的 session part，避免旧 item ID 持续污染后续重试。
 
@@ -295,7 +295,6 @@ Default behavior and optional switches:
 - **Synthetic Agent Initiator** — optional and off by default; experimental switch that diverges from stable upstream behavior, sends or overrides `x-initiator=agent`, does not guarantee non-billable treatment, and carries abuse or unexpected-billing risk
 - **Copilot Status Slash Command** — enabled by default; experimental `/copilot-status` workaround with TUI-first support and no cross-client UX guarantee
 - **Copilot Inject Slash Command** — enabled by default; no-arg `/copilot-inject` force-intervention switch that injects a marker into the next non-`question` tool output and drives immediate `question`
-- **Wait Tool** — enabled by default; provides `wait` for background waits with either `seconds` timing or `until: "new_user_message"` event waiting for new user or plugin-synthesized messages
 
 ## What You Get
 
@@ -307,7 +306,6 @@ Default behavior and optional switches:
 - **Synthetic Agent Initiator** — optional and off by default; experimental switch that diverges from stable upstream behavior, sends or overrides `x-initiator=agent`, and carries billing/abuse risk
 - **`/copilot-status`** — enabled by default; experimental slash command that shows a loading toast first and then a quota result or error toast
 - **`/copilot-inject`** — enabled by default; no-arg force-intervention command that appends a marker to the next non-`question` tool output to force immediate `question`
-- **`wait` tool** — enabled by default; supports `seconds` timed waits (minimum 30 seconds) and `until: "new_user_message"` event waits; it reports the reason when a new user or plugin-synthesized message ends the wait
 - **Zero model config** — no model changes required (official provider only)
 
 ## WeChat Notifications
@@ -444,7 +442,7 @@ You will see an interactive menu. Use the built-in language switch action if you
 - **Delete account**
 - **Delete all**
 
-Guided Loop Safety is enabled by default. In practice, this can keep one request productive for hours: when `question` is available and permitted, all strong-interaction content that needs the user (decisions, missing required input, user confirmation, final handoff, and no-safe-work-left states) must use it. Any unattended wait that does not require user confirmation and can resume automatically after time passes or an expected non-user event arrives must use `wait`, so background work is not converted into a blocking user-reply stop. Pure progress updates and phase changes should use `notify`; if `notify` is unavailable, pure progress stays silent and work continues instead of being escalated into interrupting questions. If it is uncertain whether user input is required, default to `question`; if the only need is time passing or an expected non-user event, use `wait`. The policy also constrains user-visible interaction channels to `question/notify`, avoiding ordinary plain-text assistant interruptions.
+Guided Loop Safety is enabled by default. In practice, this can keep one request productive for hours: when `question` is available and permitted, all strong-interaction content that needs the user (decisions, missing required input, user confirmation, final handoff, and no-safe-work-left states) must use it. Any unattended wait that does not require user confirmation and can resume automatically after time passes or an expected non-user event should go through an installed dedicated wait tool such as `opencode-wait`, so background work is not converted into a blocking user-reply stop. Pure progress updates and phase changes should use `notify`; if `notify` is unavailable, pure progress stays silent and work continues instead of being escalated into interrupting questions. If it is uncertain whether user input is required, default to `question`; if the only need is time passing or waiting for an expected non-user event, prefer an installed dedicated wait tool.
 
 ## Experimental `/copilot-inject`
 
@@ -461,13 +459,15 @@ Guided Loop Safety is enabled by default. In practice, this can keep one request
 - Clear condition: armed inject state is auto-cleared as soon as `question` executes
 - Scope: instance memory only; not persisted to store and not shared across plugin instances
 
-## `wait` Tool
+## Using with `opencode-wait`
 
-- Default: **enabled**
-- Usage: `wait({ seconds })` for timed waits, with `seconds` optional and clamped to minimum 30; `wait({ until: "new_user_message" })` waits until the current session receives a new user message
-- Output shape: full timed waits return `started: <ISO>; waited: <N>s; now: <ISO>`; if a timed wait sees a new user message, it returns `ended: early; reason: ...; message: <id>`; event waits return `ended: event; event: new_user_message; reason: ...; message: <id>`
+If your workflow needs unattended waits, cooldowns, or `until: "new_user_message"` event waits, install `opencode-wait` separately:
 
-> Migration note: `wait` is being split into the generic standalone package `opencode-wait`; this Copilot package keeps composing it during migration, so existing users do not need to change their installation path yet.
+```bash
+opencode plugin opencode-wait@0.1.0 --force -g
+```
+
+After it is installed, Guided Loop Safety can route wait semantics to that dedicated tool while this Copilot plugin focuses on accounts, quota, and Copilot request enhancements.
 
 If you switch Copilot accounts and then hit transient TLS/network failures or `input[*].id too long` errors caused by stale session item IDs, enable Copilot Network Retry from the same menu. It is off by default. When enabled, the plugin keeps the official Copilot header/baseURL behavior from the upstream loader, only wraps the final Copilot `fetch` path, and converts retryable network-like failures into a shape that OpenCode already treats as retryable. It also repairs the matched session part after an `input[*].id too long` 400 so later retries can recover instead of repeatedly failing on stale item IDs.
 
