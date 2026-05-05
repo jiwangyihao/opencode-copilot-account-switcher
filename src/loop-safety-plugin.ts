@@ -8,8 +8,8 @@ export const LOOP_SAFETY_POLICY = `Guided Loop Safety Policy
 - Channel contract: Use only question or notify for user-visible interactions; never emit ordinary assistant plain text.
 - Notify contract: Pure progress, phase switches, and non-blocking background status updates belong to notify.
 - Question contract: Required user response, user decisions or confirmations, final handoff, and no-safe-work-left states belong to question; do not use question for unattended waits that can resume automatically.
-- Wait contract: All waiting that does not require user confirmation, including background waits for long-running tools, external jobs, cooldowns, or expected notifications, must use wait instead of question; use wait({ until: "new_user_message" }) when the expected event is a new user or plugin-synthesized message; timed waits may also end early and report that reason when a new user message appears.
-- Decision matrix: If uncertain whether user input is required, default to question; if the only need is time passing or waiting for an expected non-user event, use wait.
+- Wait contract: All waiting that does not require user confirmation, including background waits for long-running tools, external jobs, cooldowns, or expected notifications, belongs in a dedicated wait tool when one is installed; do not convert unattended waits into question prompts.
+- Decision matrix: If uncertain whether user input is required, default to question; if the only need is time passing or waiting for an expected non-user event, prefer a dedicated wait tool when available.
 - Marker contract: If a tool output contains [COPILOT_INJECT_V1_BEGIN] ... [COPILOT_INJECT_V1_END], immediately call question and wait for user instruction before continuing.
 - Silent fallback discipline: If notify is unavailable, denied, absent, or fails, pure progress stays silent and work continues; do not automatically escalate that progress into question.
 - Silent fallback discipline: If question is unavailable, denied, or absent, only strong-interaction content may fall back to direct assistant text.
@@ -154,4 +154,5 @@ export function createCompactionLoopSafetyBypass(): CompactionLoopSafetyBypass {
     },
   }
 }
+
 
