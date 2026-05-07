@@ -1,11 +1,13 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { execFile } from "node:child_process"
 import { existsSync, promises as fs } from "node:fs"
 import { randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import { pathToFileURL } from "node:url"
+import { promisify } from "node:util"
 import { strFromU8, unzipSync } from "fflate"
 
 import { ACCOUNT_SWITCH_TTL_MS } from "../dist/copilot-retry-notifier.js"
@@ -16,6 +18,8 @@ import { getProviderDescriptorByKey, getProviderDescriptorByProviderID, listProv
 import { buildCandidateAccountLoads } from "../dist/routing-state.js"
 import { LOOP_SAFETY_POLICY } from "../dist/loop-safety-plugin.js"
 import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
+
+const execFileAsync = promisify(execFile)
 
 function createTempRoutingStateDirectory() {
   return join(tmpdir(), `routing-state-${randomUUID()}`)
@@ -618,14 +622,14 @@ test("after question inject no longer appends markers", async () => {
   assert.equal(String(output.output), "next")
 })
 
-test("tool registry keeps wait outside the Copilot package", async () => {
+test("tool registry keeps notify and wait outside the Copilot package", async () => {
   const plugin = buildPluginHooks({
     auth: { provider: "github-copilot", methods: [] },
     loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
     client: {},
   })
 
-  assert.deepEqual(Object.keys(plugin.tool ?? {}).sort(), ["notify"])
+  assert.deepEqual(Object.keys(plugin.tool ?? {}).sort(), [])
 })
 
 test("tool.definition rewrites question description without owning wait", async () => {
@@ -655,16 +659,16 @@ test("tool.definition leaves external wait tools untouched", async () => {
   assert.equal(output.description, "external wait")
 })
 
-test("tool.definition rewrites notify description as non-blocking progress channel", async () => {
+test("tool.definition leaves external notify tools untouched", async () => {
   const plugin = buildPluginHooks({
     auth: { provider: "github-copilot", methods: [] },
     loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
   })
 
-  const output = { description: "original", parameters: {} }
+  const output = { description: "external notify", parameters: { type: "object" }, extra: "keep" }
   await plugin["tool.definition"]?.({ toolID: "notify" }, output)
 
-  assert.match(output.description, /non-blocking progress|phase updates|immediate user response/i)
+  assert.deepEqual(output, { description: "external notify", parameters: { type: "object" }, extra: "keep" })
 })
 
 test("status command hook ignores unrelated commands", async () => {
@@ -893,132 +897,6 @@ test("status command hook does nothing when unified slash switch is disabled", a
   assert.equal(writes.length, 0)
 })
 
-function createToolContext() {
-  return {
-    sessionID: "s1",
-    messageID: "m1",
-    agent: "task",
-    directory: "/tmp/project",
-    worktree: "/tmp/project",
-    abort: new AbortController().signal,
-    metadata() {},
-    async ask() {},
-  }
-}
-
-test("plugin exposes notify tool for model progress updates", () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-  })
-
-  assert.equal(typeof plugin.tool?.notify?.execute, "function")
-  assert.match(plugin.tool?.notify?.description ?? "", /notify/i)
-  assert.ok(plugin.tool?.notify?.args?.message)
-  assert.ok(plugin.tool?.notify?.args?.variant)
-  assert.equal(Object.hasOwn(plugin.tool?.notify?.args ?? {}, "title"), false)
-  assert.equal(Object.hasOwn(plugin.tool?.notify?.args ?? {}, "duration"), false)
-})
-
-test("notify tool defaults variant to info", async () => {
-  const calls = []
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {
-      tui: {
-        showToast: async (options) => {
-          calls.push(options)
-        },
-      },
-    },
-  })
-
-  await plugin.tool.notify.execute(
-    { message: "still working" },
-    createToolContext(),
-  )
-
-  assert.equal(calls[0]?.body?.variant, "info")
-})
-
-test("notify tool maps message and variant to tui.showToast", async () => {
-  const calls = []
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {
-      tui: {
-        showToast: async (options) => {
-          calls.push(options)
-        },
-      },
-    },
-  })
-
-  const result = await plugin.tool.notify.execute(
-    { message: "后台继续执行测试", variant: "info" },
-    {
-      sessionID: "s1",
-      messageID: "m1",
-      agent: "task",
-      directory: "/tmp/project",
-      worktree: "/tmp/project",
-      abort: new AbortController().signal,
-      metadata() {},
-      async ask() {},
-    },
-  )
-
-  assert.equal(result, "ok")
-  assert.equal(calls.length, 1)
-  assert.equal(calls[0]?.body?.message, "后台继续执行测试")
-  assert.equal(calls[0]?.body?.variant, "info")
-})
-
-test("notify tool fails open when showToast is unavailable", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {},
-  })
-
-  await assert.doesNotReject(() => plugin.tool.notify.execute(
-    { message: "still running" },
-    createToolContext(),
-  ))
-})
-
-test("notify tool swallows toast failures and warns once", async () => {
-  const warnings = []
-  const originalWarn = console.warn
-  console.warn = (...args) => warnings.push(args.map(String).join(" "))
-
-  try {
-    const plugin = buildPluginHooks({
-      auth: { provider: "github-copilot", methods: [] },
-      loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-      client: {
-        tui: {
-          showToast: async () => {
-            throw new Error("toast failed")
-          },
-        },
-      },
-    })
-
-    await assert.doesNotReject(() => plugin.tool.notify.execute(
-      { message: "still running" },
-      createToolContext(),
-    ))
-  } finally {
-    console.warn = originalWarn
-  }
-
-  assert.equal(warnings.length, 1)
-  assert.match(warnings[0] ?? "", /notify-tool/i)
-})
-
 test("plugin source does not preload upstream hook bundle for untouched hooks", async () => {
   const pluginSource = await fs.readFile(new URL("../dist/plugin.js", import.meta.url), "utf8")
 
@@ -1035,6 +913,27 @@ test("source tree no longer keeps local codex oauth implementation", () => {
   const exists = existsSync(new URL("../src/codex-oauth.ts", import.meta.url))
 
   assert.equal(exists, false)
+})
+
+test("copilot package has no stale notify-tool artifacts after build", () => {
+  assert.equal(existsSync(new URL("../src/notify-tool.ts", import.meta.url)), false)
+  assert.equal(existsSync(new URL("../dist/notify-tool.js", import.meta.url)), false)
+  assert.equal(existsSync(new URL("../dist/notify-tool.d.ts", import.meta.url)), false)
+})
+
+test("npm pack dry run excludes notify-tool artifacts", async () => {
+  const command = process.platform === "win32" ? "cmd.exe" : "npm"
+  const args = process.platform === "win32"
+    ? ["/d", "/s", "/c", "npm pack --dry-run --json"]
+    : ["pack", "--dry-run", "--json"]
+  const { stdout } = await execFileAsync(command, args, {
+    cwd: process.cwd(),
+    windowsHide: true,
+  })
+  const pack = JSON.parse(stdout)
+  const files = pack[0].files.map((entry) => entry.path)
+
+  assert.equal(files.some((filePath) => filePath.includes("notify-tool")), false)
 })
 
 test("plugin chat headers append internal session id for plugin-local routing", async () => {

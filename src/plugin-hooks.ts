@@ -36,7 +36,6 @@ import {
   loadOfficialCodexConfig,
   loadOfficialCodexChatHeaders,
 } from "./upstream/codex-loader-adapter.js"
-import { createNotifyTool } from "./notify-tool.js"
 import type { CommonSettingsStore } from "./common-settings-store.js"
 import { refreshActiveAccountQuota, type RefreshActiveAccountQuotaResult } from "./active-account-quota.js"
 import { handleStatusCommand, showStatusToast } from "./status-command.js"
@@ -2103,17 +2102,9 @@ export function buildPluginHooks(input: {
       output.output = `${normalized}${normalized.length > 0 ? "\n\n" : ""}${markerBlock}`
       await showInjectToast("已要求模型立刻调用提问工具", "warning")
     },
-    tool: {
-      notify: createNotifyTool({
-        client: input.client,
-      }),
-    },
     "tool.definition": async (hookInput, output) => {
       if (hookInput.toolID === "question") {
         output.description = "Use for required user response, user confirmation, final handoff, no-safe-work-left states, or uncertain routing cases. Do not use for unattended/background waits that can resume automatically; use a dedicated wait tool when available."
-      }
-      if (hookInput.toolID === "notify") {
-        output.description = "Use for non-blocking progress and phase updates only; do not require immediate user response."
       }
     },
     "chat.headers": chatHeaders,
