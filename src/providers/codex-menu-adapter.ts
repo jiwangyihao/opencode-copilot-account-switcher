@@ -532,9 +532,7 @@ export function createCodexMenuAdapter(inputDeps: AdapterDependencies): Provider
         return true
       }
       if (
-        action.name === "toggle-loop-safety"
-        || action.name === "toggle-loop-safety-provider-scope"
-        || action.name === "toggle-experimental-slash-commands"
+        action.name === "toggle-experimental-slash-commands"
         || action.name === "toggle-network-retry"
         || action.name === "toggle-wechat-notifications"
         || action.name === "toggle-wechat-question-notify"

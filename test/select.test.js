@@ -7,15 +7,15 @@ test("buildSelectDebugEvent captures suspicious toggle selection key events", ()
   const event = buildSelectDebugEvent({
     stage: "key",
     parsedKey: "enter",
-    currentValue: { type: "toggle-loop-safety" },
+    currentValue: { type: "toggle-network-retry" },
   })
 
   assert.deepEqual(event, {
     stage: "key",
     parsedKey: "enter",
-    currentActionType: "toggle-loop-safety",
+    currentActionType: "toggle-network-retry",
     nextActionType: null,
-    actionType: "toggle-loop-safety",
+    actionType: "toggle-network-retry",
   })
 })
 

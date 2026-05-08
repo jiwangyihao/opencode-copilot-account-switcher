@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readdir, readFile, rm } from "node:fs/promises"
 import { spawn } from "node:child_process"
 import { createRequire } from "node:module"
 import os from "node:os"
@@ -7,6 +7,12 @@ import path from "node:path"
 import test from "node:test"
 
 const require = createRequire(import.meta.url)
+// biome-ignore lint/complexity/useRegexLiterals: avoids noControlCharactersInRegex diagnostics for ANSI control stripping
+const OSC_SEQUENCE_PATTERN = new RegExp("\\u001b\\][^\\u0007]*(?:\\u0007|\\u001b\\\\)", "g")
+// biome-ignore lint/complexity/useRegexLiterals: avoids noControlCharactersInRegex diagnostics for ANSI control stripping
+const CSI_SEQUENCE_PATTERN = new RegExp("\\u001b\\[[0-?]*[ -/]*[@-~]", "g")
+// biome-ignore lint/complexity/useRegexLiterals: avoids noControlCharactersInRegex diagnostics for ANSI control stripping
+const CONTROL_CHARACTER_PATTERN = new RegExp("[\\u0000-\\u0008\\u000b-\\u001a\\u001c-\\u001f\\u007f]", "g")
 
 function resolveExecutable(command, platform = process.platform) {
   if (platform === "win32" && command === "where") {
@@ -309,9 +315,9 @@ function loadNodePtySpawn() {
 
 function stripAnsi(text) {
   return String(text ?? "")
-    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
-    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/[\u0000-\u0008\u000b-\u001a\u001c-\u001f\u007f]/g, "")
+    .replace(OSC_SEQUENCE_PATTERN, "")
+    .replace(CSI_SEQUENCE_PATTERN, "")
+    .replace(CONTROL_CHARACTER_PATTERN, "")
 }
 
 function toScreenText(rawBuffer) {
@@ -367,19 +373,6 @@ function createPtyExitPromise(pty, session) {
   }
 }
 
-function quoteWindowsCmdArgument(argument) {
-  const value = String(argument)
-
-  if (value.length === 0) {
-    return '""'
-  }
-
-  if (!/[\s"&<>|^()]/.test(value)) {
-    return value
-  }
-
-  return `"${value.replace(/"/g, '""')}"`
-}
 
 async function buildPtyLaunchSpec({ host, commandArgsOverride, platform = process.platform }) {
   const runtimeCommand = host.runtimeCommand ?? host.runtimePath
@@ -694,7 +687,6 @@ async function advanceFromAddCredentialToPluginMenu(session, addCredentialScreen
 
 function screenLooksLikePluginMenu(screenText) {
   const markers = [
-    /Guided Loop Safety/i,
     /Common settings|通用设置/i,
     /Provider settings|Provider 专属设置/i,
     /WeChat notifications|微信通知/i,
@@ -748,7 +740,7 @@ export async function openWechatNotificationsSubmenuThroughRealOpencode({
         resolvePluginInlineConfigContentImpl,
       })
 
-      for (let step = 0; step < 12; step += 1) {
+      for (let step = 0; step < 11; step += 1) {
         await sendKeyWithScreenChangeRetry(pluginMenuResult.session, "DOWN", {
           sendInputImpl,
           readScreenImpl,
@@ -858,14 +850,9 @@ async function advanceFromPluginMenuToWechatSubmenu(session, {
     }
   }
 
-  throw new Error(`menu buffer did not match /Bind \/ Rebind WeChat|绑定 \/ 重绑微信/i within ${screenWaitTimeoutMs}ms`)
+  throw new Error(`menu buffer did not match Bind / Rebind WeChat|绑定 / 重绑微信 within ${screenWaitTimeoutMs}ms`)
 }
 
-function buildRealWechatBindTranscript(session) {
-  return [toScreenText(session?.rawBuffer), session?.screenText]
-    .filter((value) => typeof value === "string" && value.length > 0)
-    .join("\n")
-}
 
 function sliceAppendedText(currentText, baselineText) {
   const current = String(currentText ?? "")
@@ -1375,7 +1362,7 @@ async function sendKeyWithScreenChangeRetry(session, key, {
         pollIntervalMs: inputPollIntervalMs,
         readScreenImpl,
       })
-    } catch (error) {
+    } catch {
       previousScreenText = await readSessionScreen(session, readScreenImpl)
 
       if (attempt === inputRetryAttempts) {

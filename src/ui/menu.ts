@@ -40,8 +40,6 @@ export type MenuAction =
   | { type: "toggle-refresh" }
   | { type: "set-interval" }
   | { type: "toggle-language" }
-  | { type: "toggle-loop-safety" }
-  | { type: "toggle-loop-safety-provider-scope" }
   | { type: "toggle-experimental-slash-commands" }
   | { type: "toggle-network-retry" }
   | { type: "wechat-menu" }
@@ -84,8 +82,6 @@ export type ShowMenuInput = {
   lastQuotaRefresh?: number
   modelAccountAssignmentCount?: number
   defaultAccountGroupCount?: number
-  loopSafetyEnabled?: boolean
-  loopSafetyProviderScope?: "copilot-only" | "all-models"
   networkRetryEnabled?: boolean
   wechatNotificationsEnabled?: boolean
   wechatQuestionNotifyEnabled?: boolean
@@ -106,8 +102,6 @@ type MenuCapabilities = {
   checkModels: boolean
   defaultAccountGroup: boolean
   assignModels: boolean
-  loopSafety: boolean
-  policyScope: boolean
   experimentalSlashCommands: boolean
   networkRetry: boolean
   syntheticAgentInitiator: boolean
@@ -123,8 +117,6 @@ function defaultMenuCapabilities(provider: MenuProvider): MenuCapabilities {
       checkModels: false,
       defaultAccountGroup: false,
       assignModels: false,
-      loopSafety: true,
-      policyScope: true,
       experimentalSlashCommands: true,
       networkRetry: true,
       syntheticAgentInitiator: false,
@@ -138,8 +130,6 @@ function defaultMenuCapabilities(provider: MenuProvider): MenuCapabilities {
     checkModels: true,
     defaultAccountGroup: true,
     assignModels: true,
-    loopSafety: true,
-    policyScope: true,
     experimentalSlashCommands: true,
     networkRetry: true,
     syntheticAgentInitiator: true,
@@ -168,12 +158,6 @@ export function getMenuCopy(language: MenuLanguage = "zh", provider: MenuProvide
         autoRefreshOn: "Auto refresh: On",
         autoRefreshOff: "Auto refresh: Off",
         setRefresh: "Set refresh interval",
-        loopSafetyOn: "Guided Loop Safety: On",
-        loopSafetyOff: "Guided Loop Safety: Off",
-        loopSafetyHint: "Reduce unnecessary handoff replies while work can continue",
-        policyScopeCopilotOnly: "Policy default scope: Current provider only",
-        policyScopeAllModels: "Policy default scope: All models",
-        policyScopeHint: "Choose whether Guided Loop Safety applies only to the current provider by default or to all models",
         experimentalSlashCommandsOn: "Experimental slash commands: On",
         experimentalSlashCommandsOff: "Experimental slash commands: Off",
         experimentalSlashCommandsHint: "Experimental provider-specific slash commands",
@@ -220,12 +204,6 @@ export function getMenuCopy(language: MenuLanguage = "zh", provider: MenuProvide
       autoRefreshOn: "自动刷新：已开启",
       autoRefreshOff: "自动刷新：已关闭",
       setRefresh: "设置刷新间隔",
-      loopSafetyOn: "Guided Loop Safety：已开启",
-      loopSafetyOff: "Guided Loop Safety：已关闭",
-      loopSafetyHint: "让模型更少无谓汇报，没做完前优先继续干活",
-      policyScopeCopilotOnly: "Policy 默认注入范围：仅当前 provider",
-      policyScopeAllModels: "Policy 默认注入范围：所有模型",
-      policyScopeHint: "决定 Guided Loop Safety 默认只作用于当前 provider，还是扩展到所有模型",
       experimentalSlashCommandsOn: "实验性 Slash Commands：已开启",
       experimentalSlashCommandsOff: "实验性 Slash Commands：已关闭",
       experimentalSlashCommandsHint: "当前 provider 的实验性 Slash Commands 开关",
@@ -274,16 +252,10 @@ export function getMenuCopy(language: MenuLanguage = "zh", provider: MenuProvide
       autoRefreshOn: "Auto refresh: On",
       autoRefreshOff: "Auto refresh: Off",
       setRefresh: "Set refresh interval",
-      loopSafetyOn: "Guided Loop Safety: On",
-      loopSafetyOff: "Guided Loop Safety: Off",
-      loopSafetyHint: "Reduce unnecessary handoff replies while work can continue",
-      policyScopeCopilotOnly: "Policy default scope: Copilot only",
-      policyScopeAllModels: "Policy default scope: All models",
-      policyScopeHint: "Choose whether Guided Loop Safety applies only to Copilot by default or to all models",
       experimentalSlashCommandsOn: "Experimental slash commands: On",
       experimentalSlashCommandsOff: "Experimental slash commands: Off",
       experimentalSlashCommandsHint:
-        "Controls whether /copilot-status, /copilot-compact, /copilot-stop-tool, /copilot-inject, and /copilot-policy-all-models are registered",
+        "Controls whether /copilot-status, /copilot-compact, and /copilot-stop-tool are registered",
       retryOn: "Network Retry: On",
       retryOff: "Network Retry: Off",
       retryHint: "Helps recover some requests after retries or malformed responses",
@@ -328,16 +300,10 @@ export function getMenuCopy(language: MenuLanguage = "zh", provider: MenuProvide
     autoRefreshOn: "自动刷新：已开启",
     autoRefreshOff: "自动刷新：已关闭",
     setRefresh: "设置刷新间隔",
-    loopSafetyOn: "Guided Loop Safety：已开启",
-    loopSafetyOff: "Guided Loop Safety：已关闭",
-    loopSafetyHint: "让模型更少无谓汇报，没做完前优先继续干活",
-    policyScopeCopilotOnly: "Policy 默认注入范围：仅 Copilot",
-    policyScopeAllModels: "Policy 默认注入范围：所有模型",
-    policyScopeHint: "决定 Guided Loop Safety 默认只作用于 Copilot，还是扩展到所有模型",
     experimentalSlashCommandsOn: "实验性 Slash Commands：已开启",
     experimentalSlashCommandsOff: "实验性 Slash Commands：已关闭",
     experimentalSlashCommandsHint:
-      "控制 /copilot-status、/copilot-compact、/copilot-stop-tool、/copilot-inject、/copilot-policy-all-models 是否注册",
+      "控制 /copilot-status、/copilot-compact、/copilot-stop-tool 是否注册",
     retryOn: "Network Retry：已开启",
     retryOff: "Network Retry：已关闭",
     retryHint: "请求异常时可自动重试并修复部分请求",
@@ -391,8 +357,6 @@ export function buildMenuItems(input: {
   lastQuotaRefresh?: number
   modelAccountAssignmentCount?: number
   defaultAccountGroupCount?: number
-  loopSafetyEnabled: boolean
-  loopSafetyProviderScope?: "copilot-only" | "all-models"
   networkRetryEnabled: boolean
   wechatNotificationsEnabled?: boolean
   wechatQuestionNotifyEnabled?: boolean
@@ -419,12 +383,7 @@ export function buildMenuItems(input: {
     capabilities.syntheticAgentInitiator = false
   }
   const quotaHint = input.lastQuotaRefresh ? `last ${formatRelativeTime(input.lastQuotaRefresh)}` : undefined
-  const loopSafetyProviderScope = input.loopSafetyProviderScope ?? "copilot-only"
   const experimentalSlashCommandsEnabled = input.experimentalSlashCommandsEnabled !== false
-  const wechatNotificationsEnabled = input.wechatNotificationsEnabled !== false
-  const wechatQuestionNotifyEnabled = input.wechatQuestionNotifyEnabled !== false
-  const wechatPermissionNotifyEnabled = input.wechatPermissionNotifyEnabled !== false
-  const wechatSessionErrorNotifyEnabled = input.wechatSessionErrorNotifyEnabled !== false
 
   const providerActions: MenuItem<MenuAction>[] = [
     { label: copy.actionsHeading, value: { type: "cancel" }, kind: "heading" },
@@ -463,20 +422,6 @@ export function buildMenuItems(input: {
 
   const commonSettings: MenuItem<MenuAction>[] = [
     { label: copy.commonSettingsHeading, value: { type: "cancel" }, kind: "heading" },
-    {
-      label: input.loopSafetyEnabled ? copy.loopSafetyOn : copy.loopSafetyOff,
-      value: { type: "toggle-loop-safety" },
-      color: "cyan",
-      hint: copy.loopSafetyHint,
-      disabled: !capabilities.loopSafety,
-    },
-    {
-      label: loopSafetyProviderScope === "all-models" ? copy.policyScopeAllModels : copy.policyScopeCopilotOnly,
-      value: { type: "toggle-loop-safety-provider-scope" },
-      color: "cyan",
-      hint: copy.policyScopeHint,
-      disabled: !capabilities.policyScope,
-    },
     {
       label: experimentalSlashCommandsEnabled ? copy.experimentalSlashCommandsOn : copy.experimentalSlashCommandsOff,
       value: { type: "toggle-experimental-slash-commands" },
@@ -743,8 +688,6 @@ export async function showMenuWithDeps(
       lastQuotaRefresh: input.lastQuotaRefresh,
       modelAccountAssignmentCount: input.modelAccountAssignmentCount,
       defaultAccountGroupCount: input.defaultAccountGroupCount,
-      loopSafetyEnabled: input.loopSafetyEnabled === true,
-      loopSafetyProviderScope: input.loopSafetyProviderScope,
       networkRetryEnabled: input.networkRetryEnabled === true,
       wechatNotificationsEnabled: input.wechatNotificationsEnabled,
       wechatQuestionNotifyEnabled: input.wechatQuestionNotifyEnabled,

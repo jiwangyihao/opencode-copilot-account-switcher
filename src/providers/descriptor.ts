@@ -6,7 +6,6 @@ export type ProviderCapability =
   | "model-routing"
   | "network-retry"
   | "slash-commands"
-  | "loop-safety"
 
 export type ProviderDescriptor = {
   key: string
@@ -39,8 +38,6 @@ export const COPILOT_PROVIDER_DESCRIPTOR: ProviderDescriptor = {
     "copilot-status",
     "copilot-compact",
     "copilot-stop-tool",
-    "copilot-inject",
-    "copilot-policy-all-models",
   ],
   menuEntries: [
     "switch-account",
@@ -49,7 +46,6 @@ export const COPILOT_PROVIDER_DESCRIPTOR: ProviderDescriptor = {
     "quota-refresh",
     "configure-default-account-group",
     "assign-model-account",
-    "toggle-loop-safety",
     "toggle-network-retry",
   ],
   capabilities: [
@@ -58,7 +54,6 @@ export const COPILOT_PROVIDER_DESCRIPTOR: ProviderDescriptor = {
     "model-routing",
     "network-retry",
     "slash-commands",
-    "loop-safety",
   ],
 }
 

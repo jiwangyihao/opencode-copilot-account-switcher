@@ -6,7 +6,7 @@ const defaultSelectDebugLogFile = (() => {
 })()
 
 function shouldLogSuspiciousAction(actionType: unknown) {
-  return actionType === "toggle-loop-safety" || actionType === "toggle-network-retry"
+  return actionType === "toggle-network-retry"
 }
 
 function getActionType(value: unknown) {

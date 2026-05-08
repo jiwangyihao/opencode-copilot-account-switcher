@@ -74,8 +74,6 @@ export type StoreFile = {
   refreshMinutes?: number
   lastAccountSwitchAt?: number
   lastQuotaRefresh?: number
-  loopSafetyEnabled?: boolean
-  loopSafetyProviderScope?: "copilot-only" | "all-models"
   networkRetryEnabled?: boolean
   syntheticAgentInitiatorEnabled?: boolean
   experimentalSlashCommandsEnabled?: boolean
@@ -87,6 +85,8 @@ type LegacyStoreFile = Omit<StoreFile, "activeAccountNames" | "modelAccountAssig
   activeAccountNames?: unknown
   modelAccountAssignments?: Record<string, unknown>
   experimentalStatusSlashCommandEnabled?: unknown
+  loopSafetyEnabled?: unknown
+  loopSafetyProviderScope?: unknown
 }
 
 const authFile = "auth.json"
@@ -104,8 +104,6 @@ function buildStoreSnapshot(store: StoreFile | undefined) {
     active: store?.active ?? null,
     accountCount: Object.keys(store?.accounts ?? {}).length,
     modelAccountAssignmentCount: Object.keys(store?.modelAccountAssignments ?? {}).length,
-    loopSafetyEnabled: store?.loopSafetyEnabled ?? null,
-    loopSafetyProviderScope: store?.loopSafetyProviderScope ?? null,
     networkRetryEnabled: store?.networkRetryEnabled ?? null,
     experimentalSlashCommandsEnabled: store?.experimentalSlashCommandsEnabled ?? null,
     lastAccountSwitchAt: store?.lastAccountSwitchAt ?? null,
@@ -190,7 +188,12 @@ export function parseStore(raw: string): StoreFile {
   const parsed = raw ? (JSON.parse(raw) as LegacyStoreFile) : ({ accounts: {} } as LegacyStoreFile)
   const legacySlashCommandsEnabled = parsed.experimentalStatusSlashCommandEnabled
   const accounts = parsed.accounts ?? {}
-  const { experimentalStatusSlashCommandEnabled: _legacyStatusSlash, ...parsedWithoutLegacy } = parsed
+  const {
+    experimentalStatusSlashCommandEnabled: _legacyStatusSlash,
+    loopSafetyEnabled: _legacyLoopSafetyEnabled,
+    loopSafetyProviderScope: _legacyLoopSafetyProviderScope,
+    ...parsedWithoutLegacy
+  } = parsed
   const store: StoreFile = {
     ...(parsedWithoutLegacy as StoreFile),
     accounts,
@@ -208,8 +211,6 @@ export function parseStore(raw: string): StoreFile {
   if (typeof store.lastAccountSwitchAt !== "number" || Number.isNaN(store.lastAccountSwitchAt)) {
     delete store.lastAccountSwitchAt
   }
-  if (store.loopSafetyEnabled !== false) store.loopSafetyEnabled = true
-  if (store.loopSafetyProviderScope !== "all-models") store.loopSafetyProviderScope = "copilot-only"
   if (store.networkRetryEnabled !== true) store.networkRetryEnabled = false
   if (store.syntheticAgentInitiatorEnabled !== true) store.syntheticAgentInitiatorEnabled = false
   if (store.experimentalSlashCommandsEnabled !== true && store.experimentalSlashCommandsEnabled !== false) {
@@ -316,13 +317,21 @@ export async function writeStore(
   },
 ) {
   const file = options?.filePath ?? storePath()
+  const {
+    loopSafetyEnabled: _legacyLoopSafetyEnabled,
+    loopSafetyProviderScope: _legacyLoopSafetyProviderScope,
+    ...persistedStore
+  } = store as StoreFile & {
+    loopSafetyEnabled?: unknown
+    loopSafetyProviderScope?: unknown
+  }
   const before = await readStoreSafe(file)
   await logStoreWrite({
     filePath: file,
     before,
-    after: store,
+    after: persistedStore,
     debug: options?.debug,
   })
   await fs.mkdir(path.dirname(file), { recursive: true })
-  await fs.writeFile(file, JSON.stringify(store, null, 2), { mode: 0o600 })
+  await fs.writeFile(file, JSON.stringify(persistedStore, null, 2), { mode: 0o600 })
 }

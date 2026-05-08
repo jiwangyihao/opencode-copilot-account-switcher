@@ -15,13 +15,11 @@ test("experimental slash commands enabled registers codex-status", async () => {
     auth: { provider: "openai", methods: [] },
     loadStoreSync: () => ({
       accounts: {},
-      loopSafetyEnabled: false,
-      experimentalSlashCommandsEnabled: true,
+        experimentalSlashCommandsEnabled: true,
     }),
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
-      experimentalSlashCommandsEnabled: true,
+        experimentalSlashCommandsEnabled: true,
     }),
   })
 
@@ -37,13 +35,11 @@ test("experimental slash commands disabled leaves codex-status unregistered", as
     auth: { provider: "openai", methods: [] },
     loadStoreSync: () => ({
       accounts: {},
-      loopSafetyEnabled: false,
-      experimentalSlashCommandsEnabled: false,
+        experimentalSlashCommandsEnabled: false,
     }),
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
-      experimentalSlashCommandsEnabled: false,
+        experimentalSlashCommandsEnabled: false,
     }),
   })
 
@@ -67,8 +63,7 @@ test("codex-status command hook delegates only when experiment switch enabled", 
     auth: { provider: "openai", methods: [] },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
-      experimentalSlashCommandsEnabled: true,
+        experimentalSlashCommandsEnabled: true,
     }),
     handleCodexStatusCommandImpl: async () => {
       delegated.push("called")
@@ -92,8 +87,7 @@ test("codex-status command hook does not delegate when experiment switch disable
     auth: { provider: "openai", methods: [] },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
-      experimentalSlashCommandsEnabled: false,
+        experimentalSlashCommandsEnabled: false,
     }),
     handleCodexStatusCommandImpl: async () => {
       delegated.push("called")
@@ -113,8 +107,7 @@ test("codex-status hook does not use copilot quota refresh path", async () => {
     auth: { provider: "openai", methods: [] },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
-      experimentalSlashCommandsEnabled: true,
+        experimentalSlashCommandsEnabled: true,
     }),
     refreshQuota: async () => {
       throw new Error("copilot refresh should not run")
@@ -138,7 +131,6 @@ test("codex menu path keeps common settings and hides provider-specific Copilot 
     provider: "codex",
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
   })
 
@@ -148,8 +140,8 @@ test("codex menu path keeps common settings and hides provider-specific Copilot 
   assert.equal(labels.includes("同步可用模型列表"), false)
   assert.equal(labels.includes("配置默认账号组"), false)
   assert.equal(labels.includes("为模型配置账号组"), false)
-  assert.equal(labels.includes("Guided Loop Safety：已关闭"), true)
-  assert.equal(labels.includes("Policy 默认注入范围：仅当前 provider"), true)
+  assert.equal(labels.includes("Guided Loop Safety：已关闭"), false)
+  assert.equal(labels.includes("Policy 默认注入范围：仅当前 provider"), false)
   assert.equal(labels.includes("实验性 Slash Commands：已开启"), true)
   assert.equal(labels.includes("Network Retry：已关闭"), true)
   assert.equal(labels.includes("synthetic 消息按 agent 身份发送：已开启"), false)
