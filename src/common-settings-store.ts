@@ -6,8 +6,6 @@ import { commonSettingsPath as defaultCommonSettingsPath, legacyCopilotStorePath
 import { parseStore, type StoreFile } from "./store.js"
 
 export type CommonSettingsStore = {
-  loopSafetyEnabled?: boolean
-  loopSafetyProviderScope?: "copilot-only" | "all-models"
   networkRetryEnabled?: boolean
   experimentalSlashCommandsEnabled?: boolean
   experimentalStatusSlashCommandEnabled?: boolean
@@ -106,13 +104,11 @@ function normalizeWechatSettings(source: CommonSettingsStore): WechatMenuSetting
   }
 }
 
-function normalizeCommonSettingsStore(input: CommonSettingsStore | undefined): CommonSettingsStore {
+export function normalizeCommonSettingsStore(input: CommonSettingsStore | undefined): CommonSettingsStore {
   const source = input ?? {}
   const legacySlashCommandsEnabled = source.experimentalStatusSlashCommandEnabled
   const wechat = normalizeWechatSettings(source)
   return {
-    ...(source.loopSafetyEnabled !== false ? { loopSafetyEnabled: true } : { loopSafetyEnabled: false }),
-    loopSafetyProviderScope: source.loopSafetyProviderScope === "all-models" ? "all-models" : "copilot-only",
     ...(source.networkRetryEnabled === true ? { networkRetryEnabled: true } : { networkRetryEnabled: false }),
     experimentalSlashCommandsEnabled:
       source.experimentalSlashCommandsEnabled === true || source.experimentalSlashCommandsEnabled === false
@@ -128,12 +124,6 @@ function parsePartialCommonSettingsStore(raw: string): CommonSettingsStore {
   const parsed = raw ? (JSON.parse(raw) as CommonSettingsStore) : {}
   const partial: CommonSettingsStore = {}
 
-  if (parsed.loopSafetyEnabled === true || parsed.loopSafetyEnabled === false) {
-    partial.loopSafetyEnabled = parsed.loopSafetyEnabled
-  }
-  if (parsed.loopSafetyProviderScope === "all-models" || parsed.loopSafetyProviderScope === "copilot-only") {
-    partial.loopSafetyProviderScope = parsed.loopSafetyProviderScope
-  }
   if (parsed.networkRetryEnabled === true || parsed.networkRetryEnabled === false) {
     partial.networkRetryEnabled = parsed.networkRetryEnabled
   }
@@ -165,8 +155,6 @@ function parsePartialCommonSettingsStore(raw: string): CommonSettingsStore {
 function readLegacyCommonSettings(store: StoreFile | undefined): CommonSettingsStore {
   if (!store) return {}
   return normalizeCommonSettingsStore({
-    loopSafetyEnabled: store.loopSafetyEnabled,
-    loopSafetyProviderScope: store.loopSafetyProviderScope,
     networkRetryEnabled: store.networkRetryEnabled,
     experimentalSlashCommandsEnabled: store.experimentalSlashCommandsEnabled,
     experimentalStatusSlashCommandEnabled: store.experimentalStatusSlashCommandEnabled,
@@ -175,8 +163,6 @@ function readLegacyCommonSettings(store: StoreFile | undefined): CommonSettingsS
 
 function mergeCommonSettings(current: CommonSettingsStore, legacy: CommonSettingsStore) {
   return normalizeCommonSettingsStore({
-    loopSafetyEnabled: current.loopSafetyEnabled ?? legacy.loopSafetyEnabled,
-    loopSafetyProviderScope: current.loopSafetyProviderScope ?? legacy.loopSafetyProviderScope,
     networkRetryEnabled: current.networkRetryEnabled ?? legacy.networkRetryEnabled,
     experimentalSlashCommandsEnabled:
       current.experimentalSlashCommandsEnabled ?? legacy.experimentalSlashCommandsEnabled,
@@ -256,8 +242,6 @@ export async function writeCommonSettingsStore(
   const file = options?.filePath ?? commonSettingsPath()
   const normalized = normalizeCommonSettingsStore(store)
   const persisted: CommonSettingsStore = {
-    loopSafetyEnabled: normalized.loopSafetyEnabled,
-    loopSafetyProviderScope: normalized.loopSafetyProviderScope,
     networkRetryEnabled: normalized.networkRetryEnabled,
     experimentalSlashCommandsEnabled: normalized.experimentalSlashCommandsEnabled,
     wechat: normalized.wechat,

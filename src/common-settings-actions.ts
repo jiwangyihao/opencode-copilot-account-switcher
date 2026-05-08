@@ -1,8 +1,6 @@
 import type { CommonSettingsStore } from "./common-settings-store.js"
 
 export type CommonSettingsActionType =
-  | "toggle-loop-safety"
-  | "toggle-loop-safety-provider-scope"
   | "toggle-experimental-slash-commands"
   | "toggle-network-retry"
   | "wechat-bind"
@@ -40,27 +38,6 @@ export async function applyCommonSettingsAction(input: {
     settings.wechat.notifications = notifications
   }
 
-  if (input.action.type === "toggle-loop-safety") {
-    settings.loopSafetyEnabled = settings.loopSafetyEnabled !== true
-    await input.writeSettings(settings, {
-      reason: "toggle-loop-safety",
-      source: "applyCommonSettingsAction",
-      actionType: "toggle-loop-safety",
-    })
-    return true
-  }
-
-  if (input.action.type === "toggle-loop-safety-provider-scope") {
-    settings.loopSafetyProviderScope = settings.loopSafetyProviderScope === "all-models"
-      ? "copilot-only"
-      : "all-models"
-    await input.writeSettings(settings, {
-      reason: "toggle-loop-safety-provider-scope",
-      source: "applyCommonSettingsAction",
-      actionType: "toggle-loop-safety-provider-scope",
-    })
-    return true
-  }
 
   if (input.action.type === "toggle-experimental-slash-commands") {
     settings.experimentalSlashCommandsEnabled = settings.experimentalSlashCommandsEnabled !== true

@@ -19,6 +19,33 @@ async function readJson(file) {
   return JSON.parse(await readFile(file, "utf8"))
 }
 
+test("common settings preserve retry and WeChat fields without Loop Safety fields", async () => {
+  const storeModule = await loadCommonSettingsStoreOrFail()
+  const normalizeCommonSettings = storeModule.normalizeCommonSettings ?? storeModule.normalizeCommonSettingsStore
+  const input = {
+    networkRetryEnabled: true,
+    experimentalSlashCommandsEnabled: true,
+    wechat: {
+      notifications: {
+        enabled: true,
+        question: true,
+        permission: false,
+        sessionError: true,
+      },
+    },
+  }
+
+  const settings = typeof normalizeCommonSettings === "function"
+    ? normalizeCommonSettings(input)
+    : storeModule.parseCommonSettingsStore(JSON.stringify(input))
+
+  assert.equal(Object.hasOwn(settings, "loopSafetyEnabled"), false)
+  assert.equal(Object.hasOwn(settings, "loopSafetyProviderScope"), false)
+  assert.equal(settings.networkRetryEnabled, true)
+  assert.equal(settings.experimentalSlashCommandsEnabled, true)
+  assert.equal(settings.wechat.notifications.permission, false)
+})
+
 test("common settings store path uses account-switcher settings.json", async () => {
   const { commonSettingsPath } = await loadCommonSettingsStoreOrFail()
   const normalized = commonSettingsPath().replace(/\\/g, "/")
@@ -47,7 +74,7 @@ test("common settings store path follows late XDG_CONFIG_HOME override", async (
   }
 })
 
-test("common settings store migrates legacy copilot flags into dedicated settings file", async () => {
+test("common settings store migrates retained legacy copilot flags into dedicated settings file", async () => {
   const { readCommonSettingsStore, writeCommonSettingsStore } = await loadCommonSettingsStoreOrFail()
   const dir = await mkdtemp(path.join(os.tmpdir(), "common-settings-store-legacy-"))
   const settingsFile = path.join(dir, "settings.json")
@@ -57,8 +84,6 @@ test("common settings store migrates legacy copilot flags into dedicated setting
     legacyCopilotFile,
     JSON.stringify({
       accounts: {},
-      loopSafetyEnabled: false,
-      loopSafetyProviderScope: "all-models",
       networkRetryEnabled: true,
       experimentalSlashCommandsEnabled: false,
       experimentalStatusSlashCommandEnabled: true,
@@ -72,8 +97,6 @@ test("common settings store migrates legacy copilot flags into dedicated setting
   })
 
   assert.deepEqual(settings, {
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "all-models",
     networkRetryEnabled: true,
     experimentalSlashCommandsEnabled: false,
     wechat: {
@@ -90,8 +113,6 @@ test("common settings store migrates legacy copilot flags into dedicated setting
   const raw = await readJson(settingsFile)
 
   assert.deepEqual(raw, {
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "all-models",
     networkRetryEnabled: true,
     experimentalSlashCommandsEnabled: false,
     wechat: {
@@ -115,7 +136,6 @@ test("common settings store prefers new settings and only backfills missing lega
   await writeFile(
     settingsFile,
     JSON.stringify({
-      loopSafetyEnabled: true,
       networkRetryEnabled: false,
     }, null, 2),
     "utf8",
@@ -126,8 +146,6 @@ test("common settings store prefers new settings and only backfills missing lega
       accounts: {
         legacy: { name: "legacy", refresh: "r", access: "a", expires: 0 },
       },
-      loopSafetyEnabled: false,
-      loopSafetyProviderScope: "all-models",
       networkRetryEnabled: true,
       experimentalSlashCommandsEnabled: false,
     }, null, 2),
@@ -140,8 +158,6 @@ test("common settings store prefers new settings and only backfills missing lega
   })
 
   assert.deepEqual(settings, {
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "all-models",
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: false,
     wechat: {
@@ -185,8 +201,6 @@ test("common settings store migration is idempotent across repeated reads and wr
 
   assert.deepEqual(second, first)
   assert.deepEqual(await readJson(settingsFile), {
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "copilot-only",
     networkRetryEnabled: true,
     experimentalSlashCommandsEnabled: false,
     wechat: {
@@ -210,8 +224,6 @@ test("writing normalized defaults overrides legacy common settings instead of re
     legacyCopilotFile,
     JSON.stringify({
       accounts: {},
-      loopSafetyEnabled: false,
-      loopSafetyProviderScope: "all-models",
       networkRetryEnabled: true,
       experimentalSlashCommandsEnabled: false,
     }, null, 2),
@@ -219,15 +231,11 @@ test("writing normalized defaults overrides legacy common settings instead of re
   )
 
   await writeCommonSettingsStore({
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "copilot-only",
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
   }, { filePath: settingsFile })
 
   assert.deepEqual(await readJson(settingsFile), {
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "copilot-only",
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
     wechat: {
@@ -246,8 +254,6 @@ test("writing normalized defaults overrides legacy common settings instead of re
   })
 
   assert.deepEqual(settings, {
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "copilot-only",
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
     wechat: {
@@ -326,8 +332,6 @@ test("common settings store persists nested wechat settings with primaryBinding 
 
   const raw = await readJson(settingsFile)
   assert.deepEqual(raw, {
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "copilot-only",
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
     wechat: {
