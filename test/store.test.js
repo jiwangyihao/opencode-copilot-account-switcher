@@ -33,12 +33,6 @@ async function readDebugLogEvent(logFile) {
   return JSON.parse(lines[0])
 }
 
-test("parseStore defaults loopSafetyEnabled to true when missing", () => {
-  const store = parseStore('{"accounts":{}}')
-
-  assert.equal(store.loopSafetyEnabled, true)
-  assert.deepEqual(store.accounts, {})
-})
 
 test("storePath uses account-switcher copilot store path", () => {
   const normalized = storePath().replace(/\\/g, "/")
@@ -101,18 +95,6 @@ test("parseStore does not leak legacy experimentalStatusSlashCommandEnabled fiel
   assert.equal("experimentalStatusSlashCommandEnabled" in store, false)
 })
 
-test("loop safety provider scope defaults to copilot-only", () => {
-  const store = parseStore('{"accounts":{}}')
-
-  assert.equal(store.loopSafetyProviderScope, "copilot-only")
-})
-
-test("loop safety provider scope preserves explicit all-models", () => {
-  const store = parseStore('{"accounts":{},"loopSafetyProviderScope":"all-models"}')
-
-  assert.equal(store.loopSafetyProviderScope, "all-models")
-})
-
 test("parseStore keeps lastAccountSwitchAt when present", () => {
   const store = parseStore(
     '{"accounts":{"primary":{"refresh":"r","access":"a","expires":1}},"lastAccountSwitchAt":1735689600000}'
@@ -135,7 +117,6 @@ test("parseStore leaves lastAccountSwitchAt undefined by default", () => {
   const store = parseStore('{"accounts":{"secondary":{"refresh":"r","access":"a","expires":1}}}')
 
   assert.equal(store.lastAccountSwitchAt, undefined)
-  assert.equal(store.loopSafetyEnabled, true)
   assert.equal(store.networkRetryEnabled, false)
   assert.equal(store.accounts.secondary.name, "secondary")
 })
@@ -202,24 +183,22 @@ test("readStore rejects malformed JSON from an existing store file", async () =>
   await assert.rejects(() => readStore(file))
 })
 
-test("readStore defaults a missing store file to an empty store with loop safety on", async () => {
+test("readStore defaults a missing store file to an empty store", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "loop-safety-missing-"))
   const file = path.join(dir, "missing-store.json")
 
   const store = await readStore(file)
 
   assert.deepEqual(store.accounts, {})
-  assert.equal(store.loopSafetyEnabled, true)
 })
 
-test("readStoreSafe also defaults a missing store file to loop safety on", async () => {
+test("readStoreSafe also defaults a missing store file to an empty store", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "loop-safety-safe-missing-"))
   const file = path.join(dir, "missing-store.json")
 
   const store = await readStoreSafe(file)
 
   assert.deepEqual(store?.accounts, {})
-  assert.equal(store?.loopSafetyEnabled, true)
 })
 
 test("readStore throws when the path is unreadable as a file", async () => {
@@ -280,7 +259,6 @@ test("writeStore does not emit debug log by default", async () => {
         accounts: {
           primary: { name: "primary", refresh: "r", access: "a", expires: 0 },
         },
-        loopSafetyEnabled: true,
         networkRetryEnabled: true,
       },
       null,
@@ -293,15 +271,14 @@ test("writeStore does not emit debug log by default", async () => {
     await writeStore(
       {
         accounts: {},
-        loopSafetyEnabled: false,
         networkRetryEnabled: true,
       },
       {
         filePath: file,
         debug: {
-          reason: "toggle-loop-safety",
-          source: "applyMenuAction",
-          actionType: "toggle-loop-safety",
+          reason: "toggle-network-retry",
+          source: "applyCommonSettingsAction",
+          actionType: "toggle-network-retry",
         },
       },
     )
@@ -322,7 +299,6 @@ test("writeStore emits enabled debug log with reason and before-after snapshots"
         accounts: {
           primary: { name: "primary", refresh: "r", access: "a", expires: 0 },
         },
-        loopSafetyEnabled: true,
         networkRetryEnabled: true,
         lastAccountSwitchAt: 123,
       },
@@ -336,15 +312,14 @@ test("writeStore emits enabled debug log with reason and before-after snapshots"
     await writeStore(
       {
         accounts: {},
-        loopSafetyEnabled: false,
         networkRetryEnabled: true,
       },
       {
         filePath: file,
         debug: {
-          reason: "toggle-loop-safety",
-          source: "applyMenuAction",
-          actionType: "toggle-loop-safety",
+          reason: "toggle-network-retry",
+          source: "applyCommonSettingsAction",
+          actionType: "toggle-network-retry",
         },
       },
     )
@@ -353,9 +328,9 @@ test("writeStore emits enabled debug log with reason and before-after snapshots"
   const event = await readDebugLogEvent(logFile)
 
   assert.equal(event.kind, "store-write")
-  assert.equal(event.reason, "toggle-loop-safety")
-  assert.equal(event.source, "applyMenuAction")
-  assert.equal(event.actionType, "toggle-loop-safety")
+  assert.equal(event.reason, "toggle-network-retry")
+  assert.equal(event.source, "applyCommonSettingsAction")
+  assert.equal(event.actionType, "toggle-network-retry")
   assert.equal(event.cwd, process.cwd())
   assert.ok(Array.isArray(event.argv))
   assert.ok(Array.isArray(event.stack))
@@ -364,8 +339,6 @@ test("writeStore emits enabled debug log with reason and before-after snapshots"
     active: null,
     accountCount: 1,
     modelAccountAssignmentCount: 0,
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "copilot-only",
     networkRetryEnabled: true,
     experimentalSlashCommandsEnabled: true,
     lastAccountSwitchAt: 123,
@@ -375,8 +348,6 @@ test("writeStore emits enabled debug log with reason and before-after snapshots"
     active: null,
     accountCount: 0,
     modelAccountAssignmentCount: 0,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: null,
     networkRetryEnabled: true,
     experimentalSlashCommandsEnabled: null,
     lastAccountSwitchAt: null,
