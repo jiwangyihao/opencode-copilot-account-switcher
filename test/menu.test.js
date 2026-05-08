@@ -35,117 +35,18 @@ test("getMenuCopy keeps network retry copy provider-agnostic for Copilot", () =>
   assert.doesNotMatch(zhCopy.retryOff, /Copilot/i)
 })
 
-test("buildMenuItems shows Guided Loop Safety off state when disabled", () => {
+test("buildMenuItems no longer renders Loop Safety rows", () => {
   const items = buildMenuItems({
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
+    capabilities: { networkRetry: true },
+    networkRetryEnabled: true,
     language: "en",
   })
 
-  const toggle = items.find((item) => item.label === "Guided Loop Safety: Off")
-  assert.ok(toggle)
-  assert.equal(toggle?.hint, "Reduce unnecessary handoff replies while work can continue")
-})
-
-test("buildMenuItems shows Guided Loop Safety on state when enabled", () => {
-  const items = buildMenuItems({
-    accounts: [],
-    refresh: { enabled: true, minutes: 15 },
-    lastQuotaRefresh: undefined,
-    loopSafetyEnabled: true,
-    language: "en",
-  })
-
-  const toggle = items.find((item) => item.label === "Guided Loop Safety: On")
-  assert.ok(toggle)
-})
-
-test("guided loop safety toggle is placed in common settings section", () => {
-  const items = buildMenuItems({
-    accounts: [],
-    refresh: { enabled: false, minutes: 15 },
-    lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    language: "en",
-  })
-
-  const labels = items.map((item) => item.label)
-  const commonSettingsHeadingIndex = labels.indexOf("Common settings")
-  const toggleIndex = labels.indexOf("Guided Loop Safety: Off")
-
-  assert.equal(toggleIndex, commonSettingsHeadingIndex + 1)
-})
-
-test("guided loop safety toggle stays inside the Common settings section", () => {
-  const items = buildMenuItems({
-    accounts: [],
-    refresh: { enabled: false, minutes: 15 },
-    lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    language: "en",
-  })
-
-  const toggleIndex = items.findIndex((item) => item.label === "Guided Loop Safety: Off")
-  const commonHeadingIndex = items.findIndex((item) => item.label === "Common settings")
-  const separatorIndices = items
-    .map((item, index) => (item.separator === true ? index : -1))
-    .filter((index) => index >= 0)
-  const commonSectionEnd = separatorIndices.find((index) => index > commonHeadingIndex) ?? -1
-
-  assert.notEqual(toggleIndex, -1)
-  assert.notEqual(commonSectionEnd, -1)
-  assert.equal(toggleIndex > commonHeadingIndex, true)
-  assert.equal(toggleIndex < commonSectionEnd, true)
-})
-
-test("buildMenuItems shows default policy scope when value is omitted", () => {
-  const items = buildMenuItems({
-    accounts: [],
-    refresh: { enabled: false, minutes: 15 },
-    lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    networkRetryEnabled: false,
-    language: "en",
-  })
-
-  const toggle = items.find((item) => item.label === "Policy default scope: Copilot only")
-  assert.ok(toggle)
-})
-
-test("buildMenuItems shows all-models policy scope when enabled", () => {
-  const items = buildMenuItems({
-    accounts: [],
-    refresh: { enabled: false, minutes: 15 },
-    lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "all-models",
-    networkRetryEnabled: false,
-    language: "en",
-  })
-
-  const toggle = items.find((item) => item.label === "Policy default scope: All models")
-  assert.ok(toggle)
-  assert.match(toggle?.hint ?? "", /Guided Loop Safety/i)
-})
-
-test("policy scope toggle is placed after guided loop safety", () => {
-  const items = buildMenuItems({
-    accounts: [],
-    refresh: { enabled: false, minutes: 15 },
-    lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
-    networkRetryEnabled: false,
-    language: "en",
-  })
-
-  const labels = items.map((item) => item.label)
-  const loopSafetyIndex = labels.indexOf("Guided Loop Safety: Off")
-  const scopeIndex = labels.indexOf("Policy default scope: Copilot only")
-
-  assert.equal(scopeIndex, loopSafetyIndex + 1)
+  const labels = items.map((item) => item.label).join("\n")
+  assert.equal(/Guided Loop Safety|Policy (?:default )?scope|copilot-inject|copilot-policy-all-models/i.test(labels), false)
 })
 
 test("buildMenuItems shows default experimental slash command state when value is omitted", () => {
@@ -153,8 +54,6 @@ test("buildMenuItems shows default experimental slash command state when value i
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     networkRetryEnabled: false,
     language: "en",
   })
@@ -168,8 +67,6 @@ test("buildMenuItems shows experimental slash command off state when disabled", 
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: false,
     networkRetryEnabled: false,
     language: "en",
@@ -178,28 +75,26 @@ test("buildMenuItems shows experimental slash command off state when disabled", 
   const toggle = items.find((item) => item.label === "Experimental slash commands: Off")
   assert.ok(toggle)
   assert.match(toggle?.hint ?? "", /copilot-status/)
-  assert.match(toggle?.hint ?? "", /copilot-inject/)
-  assert.match(toggle?.hint ?? "", /copilot-policy-all-models/)
+  assert.equal((toggle?.hint ?? "").includes("copilot-inject"), false)
+  assert.equal((toggle?.hint ?? "").includes("copilot-policy-all-models"), false)
 })
 
-test("experimental slash commands toggle is placed after policy scope and before network retry", () => {
+test("experimental slash commands toggle is placed before network retry in common settings", () => {
   const items = buildMenuItems({
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: true,
     networkRetryEnabled: false,
     language: "en",
   })
 
   const labels = items.map((item) => item.label)
-  const scopeIndex = labels.indexOf("Policy default scope: Copilot only")
+  const commonHeadingIndex = labels.indexOf("Common settings")
   const slashIndex = labels.indexOf("Experimental slash commands: On")
   const retryIndex = labels.indexOf("Network Retry: Off")
 
-  assert.equal(slashIndex, scopeIndex + 1)
+  assert.equal(slashIndex, commonHeadingIndex + 1)
   assert.equal(retryIndex, slashIndex + 1)
 })
 
@@ -208,8 +103,6 @@ test("buildMenuItems shows Network Retry off state when disabled", () => {
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: true,
     networkRetryEnabled: false,
     language: "en",
@@ -225,8 +118,6 @@ test("buildMenuItems shows Network Retry on state when enabled", () => {
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: true,
     networkRetryEnabled: true,
     language: "en",
@@ -242,8 +133,6 @@ test("Copilot network retry toggle is placed after slash toggle in common settin
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: true,
     networkRetryEnabled: false,
     language: "en",
@@ -270,7 +159,6 @@ test("assign models action is placed after default account group", () => {
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     language: "en",
   })
@@ -289,7 +177,6 @@ test("buildMenuItems uses the updated action copy for sync-oriented items", () =
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     language: "en",
   })
@@ -306,7 +193,6 @@ test("buildMenuItems shows default account group action with coherent hint", () 
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     language: "en",
     defaultAccountGroupCount: 2,
@@ -322,7 +208,6 @@ test("buildMenuItems keeps model assignment hint coherent for account groups", (
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     language: "en",
     modelAccountAssignmentCount: 3,
@@ -338,8 +223,6 @@ test("buildMenuItems shows synthetic initiator off state and risk hint when disa
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: true,
     networkRetryEnabled: false,
     syntheticAgentInitiatorEnabled: false,
@@ -358,8 +241,6 @@ test("buildMenuItems shows synthetic initiator on state when enabled", () => {
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: true,
     networkRetryEnabled: false,
     syntheticAgentInitiatorEnabled: true,
@@ -375,8 +256,6 @@ test("synthetic initiator toggle is placed after network retry and before the se
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: true,
     networkRetryEnabled: false,
     syntheticAgentInitiatorEnabled: false,
@@ -404,7 +283,6 @@ test("buildMenuItems includes a language switch action", () => {
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: true,
     networkRetryEnabled: false,
   })
 
@@ -417,8 +295,6 @@ test("experimental slash commands hint includes compact and stop-tool commands",
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: false,
     networkRetryEnabled: false,
     language: "en",
@@ -436,16 +312,14 @@ test("buildMenuItems keeps common settings visible for Codex provider", () => {
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: true,
     networkRetryEnabled: false,
     language: "en",
   })
 
   const labels = items.map((item) => item.label)
-  assert.equal(labels.includes("Guided Loop Safety: Off"), true)
-  assert.equal(labels.includes("Policy default scope: Current provider only"), true)
+  assert.equal(labels.includes("Guided Loop Safety: Off"), false)
+  assert.equal(labels.includes("Policy default scope: Current provider only"), false)
   assert.equal(labels.includes("Experimental slash commands: On"), true)
   assert.equal(labels.includes("Network Retry: Off"), true)
   assert.equal(labels.includes("Send synthetic messages as agent: Off"), false)
@@ -459,19 +333,17 @@ test("buildMenuItems ignores provider-only capability overrides for Codex provid
     capabilities: {
       checkModels: true,
       assignModels: true,
-      loopSafety: true,
       networkRetry: true,
     },
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
     lastQuotaRefresh: undefined,
-    loopSafetyEnabled: false,
     networkRetryEnabled: true,
     language: "en",
   })
 
   const labels = items.map((item) => item.label)
-  assert.equal(labels.includes("Guided Loop Safety: Off"), true)
+  assert.equal(labels.includes("Guided Loop Safety: Off"), false)
   assert.equal(labels.includes("Network Retry: On"), true)
   assert.equal(labels.includes("Assign account groups per model"), false)
   assert.equal(labels.includes("Sync available models"), false)
@@ -482,8 +354,6 @@ test("buildMenuItems keeps section order stable for Copilot", () => {
     provider: "copilot",
     accounts: [{ name: "alice", index: 0 }],
     refresh: { enabled: false, minutes: 15 },
-    loopSafetyEnabled: false,
-    loopSafetyProviderScope: "copilot-only",
     experimentalSlashCommandsEnabled: true,
     networkRetryEnabled: false,
     syntheticAgentInitiatorEnabled: false,

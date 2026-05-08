@@ -29,7 +29,6 @@ test("wechat entry is under common settings and detailed wechat actions are not 
     provider: "copilot",
     accounts: [],
     refresh: { enabled: false, minutes: 15 },
-    loopSafetyEnabled: true,
     networkRetryEnabled: false,
     wechatNotificationsEnabled: true,
     wechatQuestionNotifyEnabled: false,
@@ -61,7 +60,6 @@ test("wechat submenu selection returns explicit wechat-bind action", async () =>
 
   const result = await showMenuWithDeps([], {
     provider: "copilot",
-    loopSafetyEnabled: true,
     networkRetryEnabled: false,
     wechatNotificationsEnabled: true,
     wechatQuestionNotifyEnabled: false,
@@ -95,7 +93,6 @@ test("wechat submenu shows bound account info and hides internal baseUrl", async
 
   await showMenuWithDeps([], {
     provider: "copilot",
-    loopSafetyEnabled: true,
     networkRetryEnabled: false,
     wechatNotificationsEnabled: true,
     wechatQuestionNotifyEnabled: true,
@@ -137,7 +134,6 @@ test("wechat submenu treats operator binding as bound when settings binding is m
 
   const result = await showMenuWithDeps([], {
     provider: "copilot",
-    loopSafetyEnabled: true,
     networkRetryEnabled: false,
     wechatNotificationsEnabled: true,
     wechatQuestionNotifyEnabled: true,
@@ -173,7 +169,6 @@ test("wechat submenu hydrates binding details from settings/operator deps when m
 
   const result = await showMenuWithDeps([], {
     provider: "copilot",
-    loopSafetyEnabled: true,
     networkRetryEnabled: false,
     wechatNotificationsEnabled: true,
     wechatQuestionNotifyEnabled: true,
@@ -229,7 +224,6 @@ test("wechat submenu cancel returns to main menu and keeps back behavior stable"
 
   const result = await showMenuWithDeps([], {
     provider: "copilot",
-    loopSafetyEnabled: true,
     networkRetryEnabled: false,
     language: "zh",
   }, {
@@ -322,7 +316,6 @@ test("wechat debug bundle menu prompts for mode and returns explicit action", as
 
   const result = await showMenuWithDeps([], {
     provider: "copilot",
-    loopSafetyEnabled: true,
     networkRetryEnabled: false,
     wechatNotificationsEnabled: true,
     wechatQuestionNotifyEnabled: true,
