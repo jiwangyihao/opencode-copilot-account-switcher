@@ -41,6 +41,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "prebuild": "node scripts/clean-dist.mjs",
     "build": "tsc -p tsconfig.build.json",
     "sync:copilot-snapshot": "node scripts/sync-copilot-upstream.mjs --output src/upstream/copilot-plugin.snapshot.ts",
     "check:copilot-sync": "node scripts/sync-copilot-upstream.mjs --output src/upstream/copilot-plugin.snapshot.ts --check",
