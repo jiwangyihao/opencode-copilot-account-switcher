@@ -1340,7 +1340,7 @@ test("real host PTY helper: providers login treats common-settings/provider-sett
   }
   const buffers = [
     "T  Add credential",
-    "GitHub Copilot 账号\nGuided Loop Safety\n通用设置\nProvider 专属设置",
+    "GitHub Copilot 账号\n通用设置\n微信通知\nProvider 专属设置",
   ]
   let readCount = 0
 
@@ -1367,7 +1367,7 @@ test("real host PTY helper: providers login treats common-settings/provider-sett
   try {
     assert.equal(result.ok, true)
     assert.equal(result.stage, "plugin-menu-visible")
-    assert.match(result.pluginMenuScreen, /Guided Loop Safety/i)
+    assert.match(result.pluginMenuScreen, /微信通知|WeChat notifications/i)
     assert.match(result.pluginMenuScreen, /通用设置/)
     assert.match(result.pluginMenuScreen, /Provider 专属设置/)
     assert.deepEqual(sentInputs.slice(0, 1), ["\r"])
@@ -1449,7 +1449,7 @@ test("real host PTY helper: retries Enter when Add credential screen does not ad
 test("real host PTY helper: retries the full Add credential -> plugin menu open on a fresh PTY when the first session stalls", async () => {
   const sentInputsByAttempt = []
   const ptys = []
-  const pluginMenuScreen = "GitHub Copilot accounts\nGuided Loop Safety\nWeChat notifications\nProvider settings"
+  const pluginMenuScreen = "GitHub Copilot accounts\nCommon settings\nWeChat notifications\nProvider settings"
 
   const createFakePty = (attempt) => {
     const dataEmitter = new EventEmitter()
@@ -1601,7 +1601,7 @@ test("real host PTY helper: providers login uses isolated hostRoot cwd to avoid 
       if (enterCount === 0) {
         return "T  Add credential"
       }
-      return "Guided Loop Safety\n通用设置\nProvider 专属设置"
+      return "通用设置\n微信通知\nProvider 专属设置"
     },
   })
 
@@ -1736,7 +1736,7 @@ test("real host PTY helper: openGitHubCopilotPluginMenuThroughRealOpencode stops
   assert.equal(killCount, 1)
 })
 
-test("real host PTY helper: plugin menu sends 12 DOWN keys before opening 微信通知 submenu", async () => {
+test("real host PTY helper: plugin menu sends 11 DOWN keys before opening 微信通知 submenu", async () => {
   const dataEmitter = new EventEmitter()
   const exitEmitter = new EventEmitter()
   const sentInputs = []
@@ -1762,12 +1762,11 @@ test("real host PTY helper: plugin menu sends 12 DOWN keys before opening 微信
     },
   }
   const pluginMenuScreen = (selectedIndex) => {
-    const selectedLabel = selectedIndex === 12 ? "WeChat notifications" : `Menu item ${selectedIndex}`
+    const selectedLabel = selectedIndex === 11 ? "WeChat notifications" : `Menu item ${selectedIndex}`
     return [
       "GitHub Copilot accounts",
       `Selected: ${selectedLabel}`,
-      "Guided Loop Safety",
-      selectedIndex === 12 ? "● WeChat notifications" : "○ WeChat notifications",
+            selectedIndex === 11 ? "● WeChat notifications" : "○ WeChat notifications",
       "Provider settings",
     ].join("\n")
   }
@@ -1803,7 +1802,7 @@ test("real host PTY helper: plugin menu sends 12 DOWN keys before opening 微信
         return "T  Add credential"
       }
 
-      if (enterCount >= 2 && downCount >= 12) {
+      if (enterCount >= 2 && downCount >= 11) {
         return submenuScreen
       }
 
@@ -1817,7 +1816,7 @@ test("real host PTY helper: plugin menu sends 12 DOWN keys before opening 微信
     assert.equal(result.reachedPluginMenu, true)
     assert.equal(result.reachedWechatSubmenu, true)
     assert.match(result.wechatSubmenuScreen, /Bind \/ Rebind WeChat/)
-    assert.equal(sentInputs.filter((input) => input === "\u001b[B").length, 12)
+    assert.equal(sentInputs.filter((input) => input === "\u001b[B").length, 11)
     assert.equal(sentInputs.at(-1), "\r")
   } finally {
     await stopRealOpencodePty(result.session)
@@ -1851,12 +1850,11 @@ test("real host PTY helper: retries a swallowed DOWN and still reaches 微信通
   }
 
   const pluginMenuScreen = (selectedIndex) => {
-    const selectedLabel = selectedIndex === 12 ? "WeChat notifications" : `Menu item ${selectedIndex}`
+    const selectedLabel = selectedIndex === 11 ? "WeChat notifications" : `Menu item ${selectedIndex}`
     return [
       "GitHub Copilot accounts",
       `Selected: ${selectedLabel}`,
-      "Guided Loop Safety",
-      selectedIndex === 12 ? "● WeChat notifications" : "○ WeChat notifications",
+            selectedIndex === 11 ? "● WeChat notifications" : "○ WeChat notifications",
       "Provider settings",
     ].join("\n")
   }
@@ -1893,7 +1891,7 @@ test("real host PTY helper: retries a swallowed DOWN and still reaches 微信通
       }
 
       const selectedIndex = downCount <= 5 ? downCount : downCount - 1
-      if (enterCount >= 2 && selectedIndex >= 12) {
+      if (enterCount >= 2 && selectedIndex >= 11) {
         return submenuScreen
       }
 
@@ -1910,7 +1908,7 @@ test("real host PTY helper: retries a swallowed DOWN and still reaches 微信通
     assert.equal(result.ok, true)
     assert.equal(result.reachedWechatSubmenu, true)
     assert.match(result.wechatSubmenuScreen, /Bind \/ Rebind WeChat/)
-    assert.equal(sentInputs.filter((input) => input === "\u001b[B").length, 13)
+    assert.equal(sentInputs.filter((input) => input === "\u001b[B").length, 12)
   } finally {
     await stopRealOpencodePty(result.session)
   }
@@ -1943,12 +1941,11 @@ test("real host PTY helper: 微信通知子菜单首帧只出现绑定项时会�
   }
 
   const pluginMenuScreen = (selectedIndex) => {
-    const selectedLabel = selectedIndex === 12 ? "WeChat notifications" : `Menu item ${selectedIndex}`
+    const selectedLabel = selectedIndex === 11 ? "WeChat notifications" : `Menu item ${selectedIndex}`
     return [
       "GitHub Copilot accounts",
       `Selected: ${selectedLabel}`,
-      "Guided Loop Safety",
-      selectedIndex === 12 ? "● WeChat notifications" : "○ WeChat notifications",
+            selectedIndex === 11 ? "● WeChat notifications" : "○ WeChat notifications",
       "Provider settings",
     ].join("\n")
   }
@@ -1994,11 +1991,11 @@ test("real host PTY helper: 微信通知子菜单首帧只出现绑定项时会�
       }
 
       if (enterCount === 1) {
-        return pluginMenuScreen(Math.min(downCount, 12))
+        return pluginMenuScreen(Math.min(downCount, 11))
       }
 
       if (enterCount === 2) {
-        if (downCount < 12) {
+        if (downCount < 11) {
           return pluginMenuScreen(downCount)
         }
 
@@ -2049,12 +2046,11 @@ test("real host PTY helper: waits for 微信通知 to be selected before pressin
   }
 
   const pluginMenuScreen = (selectedIndex) => {
-    const selectedLabel = selectedIndex === 12 ? "WeChat notifications" : `Menu item ${selectedIndex}`
+    const selectedLabel = selectedIndex === 11 ? "WeChat notifications" : `Menu item ${selectedIndex}`
     return [
       "GitHub Copilot accounts",
       `Selected: ${selectedLabel}`,
-      "Guided Loop Safety",
-      selectedIndex === 12 ? "● WeChat notifications" : "○ WeChat notifications",
+            selectedIndex === 11 ? "● WeChat notifications" : "○ WeChat notifications",
       "Provider settings",
     ].join("\n")
   }
@@ -2091,11 +2087,11 @@ test("real host PTY helper: waits for 微信通知 to be selected before pressin
         return "T  Add credential"
       }
 
-      if (enterCount >= 2 && downCount >= 13) {
+      if (enterCount >= 2 && downCount >= 12) {
         return submenuScreen
       }
 
-      return pluginMenuScreen(Math.max(0, Math.min(downCount - 1, 12)))
+      return pluginMenuScreen(Math.max(0, Math.min(downCount - 1, 11)))
     },
     screenWaitTimeoutMs: 40,
     menuNavigationDelayMs: 0,
@@ -2108,7 +2104,7 @@ test("real host PTY helper: waits for 微信通知 to be selected before pressin
     assert.equal(result.ok, true)
     assert.equal(result.reachedWechatSubmenu, true)
     assert.match(result.wechatSubmenuScreen, /Bind \/ Rebind WeChat/)
-    assert.equal(sentInputs.filter((input) => input === "\u001b[B").length, 13)
+    assert.equal(sentInputs.filter((input) => input === "\u001b[B").length, 12)
     assert.equal(sentInputs.at(-1), "\r")
   } finally {
     await stopRealOpencodePty(result.session)
@@ -2201,12 +2197,11 @@ test("real host PTY helper: 微信通知子菜单后会 DOWN + ENTER 真正执�
     },
   }
   const pluginMenuScreen = (selectedIndex) => {
-    const selectedLabel = selectedIndex === 12 ? "WeChat notifications" : `Menu item ${selectedIndex}`
+    const selectedLabel = selectedIndex === 11 ? "WeChat notifications" : `Menu item ${selectedIndex}`
     return [
       "GitHub Copilot accounts",
       `Selected: ${selectedLabel}`,
-      "Guided Loop Safety",
-      selectedIndex === 12 ? "● WeChat notifications" : "○ WeChat notifications",
+            selectedIndex === 11 ? "● WeChat notifications" : "○ WeChat notifications",
       "Provider settings",
     ].join("\n")
   }
@@ -2255,15 +2250,15 @@ test("real host PTY helper: 微信通知子菜单后会 DOWN + ENTER 真正执�
       }
 
       if (enterCount === 1) {
-        return pluginMenuScreen(Math.min(downCount, 12))
+        return pluginMenuScreen(Math.min(downCount, 11))
       }
 
       if (enterCount === 2) {
-        if (downCount >= 13) {
+        if (downCount >= 12) {
           return submenuBindSelectedScreen
         }
 
-        return downCount >= 12 ? submenuScreen : pluginMenuScreen(downCount)
+        return downCount >= 11 ? submenuScreen : pluginMenuScreen(downCount)
       }
 
       return bindDispatchScreen
@@ -2272,7 +2267,7 @@ test("real host PTY helper: 微信通知子菜单后会 DOWN + ENTER 真正执�
       const enterCount = sentInputs.filter((input) => input === "\r").length
       const downCount = sentInputs.filter((input) => input === "\u001b[B").length
 
-      if (enterCount >= 3 && downCount >= 13) {
+      if (enterCount >= 3 && downCount >= 12) {
         return "QR URL fallback: https://host-gate.invalid/qr"
       }
 
@@ -2297,7 +2292,7 @@ test("real host PTY helper: 微信通知子菜单后会 DOWN + ENTER 真正执�
     assert.match(result.wechatSubmenuScreen, /Bind \/ Rebind WeChat/)
     assert.match(result.logText, /host-gate\.invalid\/qr/i)
     assert.match(result.error, /host-gate\.invalid\/qr/i)
-    assert.equal(sentInputs.filter((input) => input === "\u001b[B").length, 13)
+    assert.equal(sentInputs.filter((input) => input === "\u001b[B").length, 12)
     assert.deepEqual(sentInputs.slice(-2), ["\u001b[B", "\r"])
   } finally {
     await stopRealOpencodePty(result.session)
@@ -2330,12 +2325,11 @@ test("real host PTY helper: bind 执行前会先把子菜单焦点移回 绑定 
     },
   }
   const pluginMenuScreen = (selectedIndex) => {
-    const selectedLabel = selectedIndex === 12 ? "WeChat notifications" : `Menu item ${selectedIndex}`
+    const selectedLabel = selectedIndex === 11 ? "WeChat notifications" : `Menu item ${selectedIndex}`
     return [
       "GitHub Copilot accounts",
       `Selected: ${selectedLabel}`,
-      "Guided Loop Safety",
-      selectedIndex === 12 ? "● WeChat notifications" : "○ WeChat notifications",
+            selectedIndex === 11 ? "● WeChat notifications" : "○ WeChat notifications",
       "Provider settings",
     ].join("\n")
   }
@@ -2393,7 +2387,7 @@ test("real host PTY helper: bind 执行前会先把子菜单焦点移回 绑定 
       }
 
       if (enterCount === 1) {
-        return pluginMenuScreen(Math.min(downCount, 12))
+        return pluginMenuScreen(Math.min(downCount, 11))
       }
 
       if (enterCount === 2) {
@@ -2401,7 +2395,7 @@ test("real host PTY helper: bind 执行前会先把子菜单焦点移回 绑定 
           return submenuBindSelectedScreen
         }
 
-        return downCount >= 12 ? submenuToggleSelectedScreen : pluginMenuScreen(downCount)
+        return downCount >= 11 ? submenuToggleSelectedScreen : pluginMenuScreen(downCount)
       }
 
       return upCount >= 1 ? bindDispatchScreen : wrongActionScreen
@@ -2462,12 +2456,11 @@ test("real host PTY helper: 旧二维码日志不会把尚未产出新二维码�
     },
   }
   const pluginMenuScreen = (selectedIndex) => {
-    const selectedLabel = selectedIndex === 12 ? "WeChat notifications" : `Menu item ${selectedIndex}`
+    const selectedLabel = selectedIndex === 11 ? "WeChat notifications" : `Menu item ${selectedIndex}`
     return [
       "GitHub Copilot accounts",
       `Selected: ${selectedLabel}`,
-      "Guided Loop Safety",
-      selectedIndex === 12 ? "● WeChat notifications" : "○ WeChat notifications",
+            selectedIndex === 11 ? "● WeChat notifications" : "○ WeChat notifications",
       "Provider settings",
     ].join("\n")
   }
@@ -2516,15 +2509,15 @@ test("real host PTY helper: 旧二维码日志不会把尚未产出新二维码�
       }
 
       if (enterCount === 1) {
-        return pluginMenuScreen(Math.min(downCount, 12))
+        return pluginMenuScreen(Math.min(downCount, 11))
       }
 
       if (enterCount === 2) {
-        if (downCount >= 13) {
+        if (downCount >= 12) {
           return submenuBindSelectedScreen
         }
 
-        return downCount >= 12 ? submenuScreen : pluginMenuScreen(downCount)
+        return downCount >= 11 ? submenuScreen : pluginMenuScreen(downCount)
       }
 
       return bindDispatchScreen
@@ -2577,12 +2570,11 @@ test("real host PTY helper: 最后一跳被吞且没有新屏新日志时不会�
     },
   }
   const pluginMenuScreen = (selectedIndex) => {
-    const selectedLabel = selectedIndex === 12 ? "WeChat notifications" : `Menu item ${selectedIndex}`
+    const selectedLabel = selectedIndex === 11 ? "WeChat notifications" : `Menu item ${selectedIndex}`
     return [
       "GitHub Copilot accounts",
       `Selected: ${selectedLabel}`,
-      "Guided Loop Safety",
-      selectedIndex === 12 ? "● WeChat notifications" : "○ WeChat notifications",
+            selectedIndex === 11 ? "● WeChat notifications" : "○ WeChat notifications",
       "Provider settings",
     ].join("\n")
   }
@@ -2619,7 +2611,7 @@ test("real host PTY helper: 最后一跳被吞且没有新屏新日志时不会�
       }
 
       if (enterCount === 1) {
-        return pluginMenuScreen(Math.min(downCount, 12))
+        return pluginMenuScreen(Math.min(downCount, 11))
       }
 
       return submenuScreen
