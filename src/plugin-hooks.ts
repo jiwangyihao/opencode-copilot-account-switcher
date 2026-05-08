@@ -1,14 +1,8 @@
-import { appendFileSync } from "node:fs"
 import { AsyncLocalStorage } from "node:async_hooks"
+import { appendFileSync } from "node:fs"
+import type { Hooks } from "@opencode-ai/plugin"
 import { createHash } from "node:crypto"
 import { OpencodeClient as OpencodeV2Client } from "@opencode-ai/sdk/v2/client"
-import {
-  createCompactionLoopSafetyBypass,
-  createLoopSafetySystemTransform,
-  getLoopSafetyProviderScope,
-  type LoopSafetyProviderScope,
-  type CopilotPluginHooks,
-} from "./loop-safety-plugin.js"
 import { COPILOT_PROVIDER_DESCRIPTOR } from "./providers/descriptor.js"
 import { CODEX_PROVIDER_DESCRIPTOR } from "./providers/descriptor.js"
 import {
@@ -62,6 +56,8 @@ import {
   type WechatBridgeLifecycle,
   type WechatBridgeLifecycleInput,
 } from "./wechat/bridge.js"
+
+type CopilotPluginHooks = Hooks
 
 type AuthLoader = NonNullable<CopilotPluginHooks["auth"]>["loader"]
 type AuthProvider = Parameters<NonNullable<AuthLoader>>[1]
@@ -333,20 +329,6 @@ type TriggerBillingCompensationInput = {
   retryAfterMs?: number
 }
 
-export class InjectCommandHandledError extends Error {
-  constructor() {
-    super("copilot-inject-handled")
-    this.name = "InjectCommandHandledError"
-  }
-}
-
-export class PolicyScopeCommandHandledError extends Error {
-  constructor() {
-    super("copilot-policy-scope-handled")
-    this.name = "PolicyScopeCommandHandledError"
-  }
-}
-
 type RetryStoreContext = {
   networkRetryEnabled?: boolean
   lastAccountSwitchAt?: number
@@ -436,12 +418,6 @@ function mergeStoreWithCommonSettings(
   if (!store && !common) return undefined
   return {
     ...(store ?? { accounts: {} }),
-    ...(common?.loopSafetyEnabled === true || common?.loopSafetyEnabled === false
-      ? { loopSafetyEnabled: common.loopSafetyEnabled }
-      : {}),
-    ...(common?.loopSafetyProviderScope
-      ? { loopSafetyProviderScope: common.loopSafetyProviderScope }
-      : {}),
     ...(common?.networkRetryEnabled === true || common?.networkRetryEnabled === false
       ? { networkRetryEnabled: common.networkRetryEnabled }
       : {}),
@@ -596,13 +572,6 @@ function getMergedRequestHeader(request: Request | URL | string, init: RequestIn
   return headers.get(name)
 }
 
-function getMergedRequestHeadersRecord(request: Request | URL | string, init: RequestInit | undefined) {
-  const headers = new Headers(request instanceof Request ? request.headers : undefined)
-  for (const [headerName, value] of new Headers(init?.headers).entries()) {
-    headers.set(headerName, value)
-  }
-  return Object.fromEntries(headers.entries())
-}
 
 function getFinalSentRequestHeadersRecord(request: Request | URL | string, init: RequestInit | undefined) {
   const headers = new Headers(request instanceof Request ? request.headers : undefined)
@@ -1008,7 +977,6 @@ export function buildPluginHooks(input: {
   const enableCopilotAuthLoader = authLoaderMode === "copilot"
   const enableCodexAuthLoader = authLoaderMode === "codex"
   const enableModelRouting = input.enableModelRouting ?? enableCopilotAuthLoader
-  const compactionLoopSafetyBypass = createCompactionLoopSafetyBypass()
   const loadStore = input.loadStore ?? readStoreSafe
   const loadStoreSync = input.loadStoreSync ?? readStoreSafeSync
   const loadCommonSettings = input.loadCommonSettings
@@ -1062,8 +1030,6 @@ export function buildPluginHooks(input: {
     ?? (enableCodexAuthLoader ? createCodexRetryingFetch : createCopilotRetryingFetch)
   const now = input.now ?? (() => Date.now())
   const random = input.random ?? Math.random
-  let injectArmed = false
-  let policyScopeOverride: LoopSafetyProviderScope | undefined
   const modelAccountFirstUse = new Set<string>()
   const sessionAccountBindings = new Map<string, SessionBinding>()
   const rateLimitQueues = new Map<string, number[]>()
@@ -1146,8 +1112,6 @@ export function buildPluginHooks(input: {
     })
   })
 
-  const getPolicyScope = (store: StoreFile | undefined) => getLoopSafetyProviderScope(store, policyScopeOverride)
-
   const loadMergedStore = async () => {
     const [store, common] = await Promise.all([
       loadStore().catch(() => undefined),
@@ -1168,44 +1132,6 @@ export function buildPluginHooks(input: {
     if (retryStore) return retryStore.networkRetryEnabled === true
     const store = readRetryStoreContext(await loadStore().catch(() => undefined))
     return store?.networkRetryEnabled === true
-  }
-
-  const showInjectToast = async (message: string, variant: "info" | "success" | "warning" | "error" = "info") => {
-    await showStatusToast({
-      client: input.client,
-      message,
-      variant,
-      warn: (scope, error) => {
-        console.warn(`[${scope}] failed to show toast`, error)
-      },
-    })
-  }
-
-  const lookupSessionAncestry = async (sessionID: string) => {
-    const session = await (input.client?.session?.get as undefined | ((input: {
-      path: {
-        id: string
-      }
-      query?: {
-        directory?: string
-      }
-      throwOnError?: boolean
-    }) => Promise<SessionGetResponse | undefined>))?.({
-      path: {
-        id: sessionID,
-      },
-      query: {
-        directory: input.directory,
-      },
-      throwOnError: true,
-    })
-
-    return [{
-      sessionID,
-      parentID: typeof session?.data?.parentID === "string" && session.data.parentID.length > 0
-        ? session.data.parentID
-        : undefined,
-    }]
   }
 
   const classifyRequestReason = async (requestInput: {
@@ -1488,14 +1414,6 @@ export function buildPluginHooks(input: {
         })
         nextRequest = rewritten.request
         nextInit = rewritten.init
-      }
-
-      const auth: CopilotAuthState = {
-        type: "oauth",
-        refresh: resolved.entry.refresh,
-        access: resolved.entry.access,
-        expires: resolved.entry.expires,
-        enterpriseUrl: resolved.entry.enterpriseUrl,
       }
 
       const sendBillingCompensationIfNeeded = async (input: {
@@ -1985,41 +1903,11 @@ export function buildPluginHooks(input: {
           template: "Interrupt the current session tool flow, annotate the interrupted result, and append a synthetic continue.",
           description: "Experimental interrupt-and-annotate recovery with synthetic continue for Copilot sessions",
         }
-        config.command["copilot-inject"] = {
-          template: "Arm an immediate tool-output inject marker flow that drives model to question.",
-          description: "Experimental force-intervene hook for Copilot workflows",
-        }
-        config.command["copilot-policy-all-models"] = {
-          template: "Toggle the current OpenCode instance policy injection scope between Copilot-only and all providers/models.",
-          description: "Experimental policy scope toggle for all providers",
-        }
       }
     },
     "command.execute.before": async (hookInput) => {
       trackWechatBridgeInteractedSession(wechatBridgeSessionContext, hookInput.sessionID)
       const store = await loadMergedStore()
-      if (hookInput.command === "copilot-inject") {
-        if (!enableCopilotAuthLoader) return
-        if (!areExperimentalSlashCommandsEnabled(store)) return
-        injectArmed = true
-        await showInjectToast("将在模型下次调用工具的时候要求模型立刻调用提问工具", "info")
-        throw new InjectCommandHandledError()
-      }
-
-      if (hookInput.command === "copilot-policy-all-models") {
-        if (!enableCopilotAuthLoader) return
-        if (!areExperimentalSlashCommandsEnabled(store)) return
-        const next = getPolicyScope(store) === "all-models" ? "copilot-only" : "all-models"
-        policyScopeOverride = next
-        await showInjectToast(
-          next === "all-models"
-            ? "当前实例已将 policy 注入扩展到所有 provider 和所有模型"
-            : "当前实例已恢复为仅对 Copilot provider 注入 policy",
-          "info",
-        )
-        throw new PolicyScopeCommandHandledError()
-      }
-
       if (hookInput.command === "copilot-status") {
         if (!enableCopilotAuthLoader) return
         if (!areExperimentalSlashCommandsEnabled(store)) return
@@ -2062,59 +1950,11 @@ export function buildPluginHooks(input: {
     },
     "tool.execute.before": async (hookInput) => {
       trackWechatBridgeInteractedSession(wechatBridgeSessionContext, hookInput.sessionID)
-      if (!injectArmed) return
-      if (hookInput.tool !== "question") return
-      injectArmed = false
     },
-    "tool.execute.after": async (hookInput, output) => {
+    "tool.execute.after": async (hookInput) => {
       trackWechatBridgeInteractedSession(wechatBridgeSessionContext, hookInput.sessionID)
-      if (hookInput.tool === "question") {
-        injectArmed = false
-        return
-      }
-
-      if (hookInput.tool === "task") return
-
-      if (!injectArmed) return
-
-      const begin = "[COPILOT_INJECT_V1_BEGIN]"
-      const body = "立即调用 question 工具并等待用户指示；在收到用户新指示前，不要继续执行后续任务。"
-      const end = "[COPILOT_INJECT_V1_END]"
-      const markerBlock = `${begin}\n${body}\n${end}`
-
-      const currentOutput = output.output == null ? "" : String(output.output)
-      const hasBegin = currentOutput.includes(begin)
-      const hasEnd = currentOutput.includes(end)
-
-      let normalized = currentOutput
-      if (hasBegin !== hasEnd) {
-        normalized = normalized
-          .replace(begin, "")
-          .replace(end, "")
-          .trimEnd()
-      }
-
-      if (normalized.includes(begin) && normalized.includes(end)) {
-        output.output = normalized
-        return
-      }
-
-      output.output = `${normalized}${normalized.length > 0 ? "\n\n" : ""}${markerBlock}`
-      await showInjectToast("已要求模型立刻调用提问工具", "warning")
-    },
-    "tool.definition": async (hookInput, output) => {
-      if (hookInput.toolID === "question") {
-        output.description = "Use for required user response, user confirmation, final handoff, no-safe-work-left states, or uncertain routing cases. Do not use for unattended/background waits that can resume automatically; use a dedicated wait tool when available."
-      }
     },
     "chat.headers": chatHeaders,
-    "experimental.chat.system.transform": createLoopSafetySystemTransform(
-      loadMergedStore,
-      compactionLoopSafetyBypass.consume,
-      lookupSessionAncestry,
-      getPolicyScope,
-    ),
-    "experimental.session.compacting": compactionLoopSafetyBypass.hook,
   }
 }
 

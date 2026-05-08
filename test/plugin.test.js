@@ -16,7 +16,6 @@ import { buildPluginHooks as buildPluginHooksRaw } from "../dist/plugin-hooks.js
 import { CODEX_PROVIDER_DESCRIPTOR, COPILOT_PROVIDER_DESCRIPTOR } from "../dist/providers/descriptor.js"
 import { getProviderDescriptorByKey, getProviderDescriptorByProviderID, listProviderDescriptors } from "../dist/providers/registry.js"
 import { buildCandidateAccountLoads } from "../dist/routing-state.js"
-import { LOOP_SAFETY_POLICY } from "../dist/loop-safety-plugin.js"
 import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
 const execFileAsync = promisify(execFile)
@@ -61,25 +60,6 @@ const upstreamProviderUtilsDistPath = join(
   "index.js",
 )
 
-async function armInject(plugin, args = "") {
-  await assert.rejects(
-    async () => plugin["command.execute.before"]?.(
-      { command: "copilot-inject", sessionID: "s1", arguments: args },
-      { parts: [] },
-    ),
-    (error) => error?.name === "InjectCommandHandledError",
-  )
-}
-
-async function toggleAllModelsPolicy(plugin) {
-  await assert.rejects(
-    async () => plugin["command.execute.before"]?.(
-      { command: "copilot-policy-all-models", sessionID: "s1", arguments: "" },
-      { parts: [] },
-    ),
-    (error) => error?.name === "PolicyScopeCommandHandledError",
-  )
-}
 
 async function waitForCondition(predicate, timeoutMs = 800) {
   const startedAt = Date.now()
@@ -191,22 +171,60 @@ async function replaceActiveWechatBridgeLifecycleForTest() {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-test("plugin exposes auth and experimental chat system transform hooks", () => {
+test("plugin exposes auth and chat headers without Loop Safety hooks", () => {
   const plugin = buildPluginHooks({
     auth: {
       provider: "github-copilot",
       methods: [],
     },
-    loadStore: async () => ({
-      accounts: {},
-      loopSafetyEnabled: false,
-    }),
+    loadStore: async () => ({ accounts: {} }),
   })
 
   assert.equal(plugin.auth?.provider, "github-copilot")
   assert.equal(typeof plugin.auth?.loader, "function")
   assert.equal(typeof plugin["chat.headers"], "function")
-  assert.equal(typeof plugin["experimental.chat.system.transform"], "function")
+  assert.equal(Object.hasOwn(plugin, "experimental.chat.system.transform"), false)
+})
+
+test("copilot package no longer owns Loop Safety hooks", () => {
+  const plugin = buildPluginHooks({
+    auth: { provider: "github-copilot", methods: [] },
+    loadStore: async () => ({ accounts: {} }),
+    client: {},
+  })
+
+  assert.equal(Object.hasOwn(plugin, "experimental.chat.system.transform"), false)
+  assert.equal(Object.hasOwn(plugin, "experimental.session.compacting"), false)
+})
+
+test("copilot package leaves question definition untouched", async () => {
+  const plugin = buildPluginHooks({
+    auth: { provider: "github-copilot", methods: [] },
+    loadStore: async () => ({ accounts: {} }),
+    client: {},
+  })
+
+  const output = { description: "original question", parameters: {}, extra: "keep" }
+  await plugin["tool.definition"]?.({ toolID: "question" }, output)
+
+  assert.deepEqual(output, { description: "original question", parameters: {}, extra: "keep" })
+})
+
+test("copilot slash commands exclude old Loop Safety commands", async () => {
+  const plugin = buildPluginHooks({
+    auth: { provider: "github-copilot", methods: [] },
+    loadStoreSync: () => ({ accounts: {}, experimentalSlashCommandsEnabled: true }),
+    loadStore: async () => ({ accounts: {}, experimentalSlashCommandsEnabled: true }),
+  })
+
+  const config = { command: {} }
+  await plugin.config?.(config)
+
+  assert.equal(Object.hasOwn(config.command, "copilot-inject"), false)
+  assert.equal(Object.hasOwn(config.command, "copilot-policy-all-models"), false)
+  assert.equal(Object.hasOwn(config.command, "copilot-status"), true)
+  assert.equal(Object.hasOwn(config.command, "copilot-compact"), true)
+  assert.equal(Object.hasOwn(config.command, "copilot-stop-tool"), true)
 })
 
 test("status slash command is injected when experiment is enabled", async () => {
@@ -214,12 +232,10 @@ test("status slash command is injected when experiment is enabled", async () => 
     auth: { provider: "github-copilot", methods: [] },
     loadStoreSync: () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
     }),
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
     }),
   })
@@ -230,9 +246,8 @@ test("status slash command is injected when experiment is enabled", async () => 
   assert.equal(typeof config.command["copilot-status"], "object")
   assert.match(config.command["copilot-status"].template, /quota|Copilot|status/i)
   assert.match(config.command["copilot-status"].description, /Copilot|status/i)
-  assert.equal(typeof config.command["copilot-inject"], "object")
-  assert.equal(typeof config.command["copilot-policy-all-models"], "object")
-  assert.match(config.command["copilot-inject"].template, /tool|question|inject|intervene/i)
+  assert.equal(Object.hasOwn(config.command, "copilot-inject"), false)
+  assert.equal(Object.hasOwn(config.command, "copilot-policy-all-models"), false)
 })
 
 test("session control slash commands are injected when experiment is enabled", async () => {
@@ -240,12 +255,10 @@ test("session control slash commands are injected when experiment is enabled", a
     auth: { provider: "github-copilot", methods: [] },
     loadStoreSync: () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
     }),
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: true,
     }),
@@ -273,12 +286,10 @@ test("experimental slash commands are not injected when unified switch is disabl
     auth: { provider: "github-copilot", methods: [] },
     loadStoreSync: () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: false,
     }),
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: false,
     }),
   })
@@ -297,7 +308,6 @@ test("slash commands are injected immediately without waiting for async store lo
     loadStore: () => new Promise(() => {}),
     loadStoreSync: () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
     }),
   })
@@ -306,8 +316,8 @@ test("slash commands are injected immediately without waiting for async store lo
   plugin.config?.(config)
 
   assert.equal(typeof config.command["copilot-status"], "object")
-  assert.equal(typeof config.command["copilot-inject"], "object")
-  assert.equal(typeof config.command["copilot-policy-all-models"], "object")
+  assert.equal(Object.hasOwn(config.command, "copilot-inject"), false)
+  assert.equal(Object.hasOwn(config.command, "copilot-policy-all-models"), false)
 })
 
 test("disabled experimental slash switch is decided from sync store path without waiting for async store load", () => {
@@ -316,7 +326,6 @@ test("disabled experimental slash switch is decided from sync store path without
     loadStore: () => new Promise(() => {}),
     loadStoreSync: () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: false,
     }),
   })
@@ -329,346 +338,14 @@ test("disabled experimental slash switch is decided from sync store path without
   assert.equal(Object.hasOwn(config.command, "copilot-policy-all-models"), false)
 })
 
-test("policy all-models command toggles current instance policy injection scope for non-Copilot providers", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({
-      accounts: {},
-      loopSafetyEnabled: true,
-      experimentalSlashCommandsEnabled: true,
-      loopSafetyProviderScope: "copilot-only",
-    }),
-    client: {
-      tui: {
-        showToast: async () => {},
-      },
-    },
-  })
-  const before = { system: ["base prompt"] }
-  await plugin["experimental.chat.system.transform"]?.(
-    { sessionID: "s1", model: { providerID: "google" } },
-    before,
-  )
-
-  await toggleAllModelsPolicy(plugin)
-
-  const afterEnable = { system: ["base prompt"] }
-  await plugin["experimental.chat.system.transform"]?.(
-    { sessionID: "s1", model: { providerID: "google" } },
-    afterEnable,
-  )
-
-  await toggleAllModelsPolicy(plugin)
-
-  const afterDisable = { system: ["base prompt"] }
-  await plugin["experimental.chat.system.transform"]?.(
-    { sessionID: "s1", model: { providerID: "google" } },
-    afterDisable,
-  )
-
-  assert.deepEqual(before.system, ["base prompt"])
-  assert.match(afterEnable.system.join("\n"), /Guided Loop Safety Policy/)
-  assert.deepEqual(afterDisable.system, ["base prompt"])
-})
-
-test("copilot-inject command ignores arguments, arms inject mode, and stops extra command execution", async () => {
-  const calls = []
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {
-      tui: {
-        showToast: async (options) => {
-          calls.push(options)
-        },
-      },
-    },
-  })
-
-  await armInject(plugin, "anything here")
-
-  assert.match(String(calls[0]?.body?.message ?? ""), /下次调用工具|next tool/i)
-})
-
-test("inject appends marker to non-question tool output", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {},
-  })
-
-  await armInject(plugin)
-
-  const output = { title: "run", output: "original output", metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "bash", sessionID: "s1", callID: "c1", args: { command: "pwd" } },
-    output,
-  )
-
-  assert.match(output.output, /original output/)
-  assert.match(output.output, /\[COPILOT_INJECT_V1_BEGIN\]/)
-  assert.match(output.output, /\[COPILOT_INJECT_V1_END\]/)
-})
-
-test("inject preserves original output and appends only", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {},
-  })
-
-  await armInject(plugin)
-
-  const raw = "line1\nline2"
-  const output = { title: "x", output: raw, metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "read", sessionID: "s1", callID: "c1", args: {} },
-    output,
-  )
-
-  assert.equal(output.output.startsWith(raw), true)
-})
-
-test("inject avoids duplicate marker when already present", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {},
-  })
-
-  await armInject(plugin)
-
-  const marker = [
-    "[COPILOT_INJECT_V1_BEGIN]",
-    "立即调用 question 工具并等待用户指示；在收到用户新指示前，不要继续执行后续任务。",
-    "[COPILOT_INJECT_V1_END]",
-  ].join("\n")
-  const output = { title: "x", output: `ok\n\n${marker}`, metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "glob", sessionID: "s1", callID: "c1", args: {} },
-    output,
-  )
-
-  const beginCount = (String(output.output).match(/\[COPILOT_INJECT_V1_BEGIN\]/g) ?? []).length
-  assert.equal(beginCount, 1)
-})
-
-test("inject repairs partial marker and appends full marker pair", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {},
-  })
-
-  await armInject(plugin)
-
-  const output = { title: "x", output: "before\n[COPILOT_INJECT_V1_BEGIN]\n", metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "grep", sessionID: "s1", callID: "c1", args: {} },
-    output,
-  )
-
-  const result = String(output.output)
-  const beginCount = (result.match(/\[COPILOT_INJECT_V1_BEGIN\]/g) ?? []).length
-  const endCount = (result.match(/\[COPILOT_INJECT_V1_END\]/g) ?? []).length
-  assert.equal(beginCount, 1)
-  assert.equal(endCount, 1)
-})
-
-test("inject normalizes empty or non-string output before append", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {},
-  })
-
-  await armInject(plugin)
-
-  const emptyOutput = { title: "x", output: undefined, metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "read", sessionID: "s1", callID: "c1", args: {} },
-    emptyOutput,
-  )
-  assert.match(String(emptyOutput.output), /\[COPILOT_INJECT_V1_BEGIN\]/)
-
-  const numberOutput = { title: "x", output: 123, metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "bash", sessionID: "s1", callID: "c2", args: {} },
-    numberOutput,
-  )
-  assert.match(String(numberOutput.output), /^123/)
-})
-
-test("inject skips task output and waits for the next regular tool output", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {},
-  })
-
-  await armInject(plugin)
-
-  const taskOutput = { title: "task", output: "subagent result", metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "task", sessionID: "s1", callID: "task1", args: {} },
-    taskOutput,
-  )
-  assert.doesNotMatch(String(taskOutput.output), /\[COPILOT_INJECT_V1_BEGIN\]/)
-
-  const nextOutput = { title: "bash", output: "regular tool", metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "bash", sessionID: "s1", callID: "c2", args: {} },
-    nextOutput,
-  )
-  assert.match(String(nextOutput.output), /\[COPILOT_INJECT_V1_BEGIN\]/)
-})
-
-test("inject toasts on every actual append", async () => {
-  const calls = []
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {
-      tui: {
-        showToast: async (options) => {
-          calls.push(options)
-        },
-      },
-    },
-  })
-
-  await armInject(plugin)
-  const output1 = { title: "x", output: "o1", metadata: {} }
-  const output2 = { title: "x", output: "o2", metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "read", sessionID: "s1", callID: "c1", args: {} },
-    output1,
-  )
-  await plugin["tool.execute.after"]?.(
-    { tool: "glob", sessionID: "s1", callID: "c2", args: {} },
-    output2,
-  )
-
-  const injectToasts = calls
-    .map((item) => String(item?.body?.message ?? ""))
-    .filter((message) => /已要求模型立刻调用提问工具/.test(message))
-  assert.equal(injectToasts.length, 2)
-})
-
-test("inject stays fail-open when toast dispatch fails", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {
-      tui: {
-        showToast: async () => {
-          throw new Error("toast-failed")
-        },
-      },
-    },
-  })
-
-  await armInject(plugin)
-
-  const output = { title: "x", output: "original", metadata: {} }
-  await assert.doesNotReject(() => plugin["tool.execute.after"]?.(
-    { tool: "read", sessionID: "s1", callID: "c1", args: {} },
-    output,
-  ))
-  assert.match(String(output.output), /\[COPILOT_INJECT_V1_BEGIN\]/)
-})
-
-test("question clears inject armed state", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {},
-  })
-
-  await armInject(plugin)
-  await plugin["tool.execute.before"]?.(
-    { tool: "question", sessionID: "s1", callID: "q1" },
-    { args: {} },
-  )
-
-  const output = { title: "x", output: "after-question", metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "read", sessionID: "s1", callID: "c1", args: {} },
-    output,
-  )
-
-  assert.doesNotMatch(String(output.output), /\[COPILOT_INJECT_V1_BEGIN\]/)
-})
-
-test("after question inject no longer appends markers", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-    client: {},
-  })
-
-  await armInject(plugin)
-  await plugin["tool.execute.after"]?.(
-    { tool: "question", sessionID: "s1", callID: "q1", args: {} },
-    { title: "q", output: "question output", metadata: {} },
-  )
-
-  const output = { title: "x", output: "next", metadata: {} }
-  await plugin["tool.execute.after"]?.(
-    { tool: "glob", sessionID: "s1", callID: "c1", args: {} },
-    output,
-  )
-
-  assert.equal(String(output.output), "next")
-})
-
 test("tool registry keeps notify and wait outside the Copilot package", async () => {
   const plugin = buildPluginHooks({
     auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
+    loadStore: async () => ({ accounts: {} }),
     client: {},
   })
 
   assert.deepEqual(Object.keys(plugin.tool ?? {}).sort(), [])
-})
-
-test("tool.definition rewrites question description without owning wait", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-  })
-
-  const output = { description: "original", parameters: {} }
-  await plugin["tool.definition"]?.({ toolID: "question" }, output)
-
-  assert.match(output.description, /required user response|user confirmation|final handoff|uncertain/i)
-  assert.match(output.description, /unattended\/background waits/i)
-  assert.match(output.description, /dedicated wait tool when available/i)
-  assert.doesNotMatch(output.description, /explicit wait state/i)
-})
-
-test("tool.definition leaves external wait tools untouched", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-  })
-
-  const output = { description: "external wait", parameters: {} }
-  await plugin["tool.definition"]?.({ toolID: "wait" }, output)
-
-  assert.equal(output.description, "external wait")
-})
-
-test("tool.definition leaves external notify tools untouched", async () => {
-  const plugin = buildPluginHooks({
-    auth: { provider: "github-copilot", methods: [] },
-    loadStore: async () => ({ accounts: {}, loopSafetyEnabled: false }),
-  })
-
-  const output = { description: "external notify", parameters: { type: "object" }, extra: "keep" }
-  await plugin["tool.definition"]?.({ toolID: "notify" }, output)
-
-  assert.deepEqual(output, { description: "external notify", parameters: { type: "object" }, extra: "keep" })
 })
 
 test("status command hook ignores unrelated commands", async () => {
@@ -678,7 +355,6 @@ test("status command hook ignores unrelated commands", async () => {
     auth: { provider: "github-copilot", methods: [] },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
     }),
     writeStore: async (store, meta) => writes.push({ store, meta }),
@@ -711,7 +387,6 @@ test("status command hook delegates to status command handler", async () => {
       accounts: {
         alice: { name: "alice", refresh: "ghu_x", access: "ghu_x", expires: 0 },
       },
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
     }),
     writeStore: async (store, meta) => writes.push({ store, meta }),
@@ -752,7 +427,6 @@ test("session control command hooks delegate to injected handlers", async () => 
     auth: { provider: "github-copilot", methods: [] },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: true,
     }),
@@ -808,7 +482,6 @@ test("stop-tool command forwards synthetic switch as strict boolean", async () =
     auth: { provider: "github-copilot", methods: [] },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: 1,
     }),
@@ -874,7 +547,6 @@ test("status command hook does nothing when unified slash switch is disabled", a
       accounts: {
         alice: { name: "alice", refresh: "ghu_x", access: "ghu_x", expires: 0 },
       },
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: false,
     }),
     writeStore: async (store, meta) => writes.push({ store, meta }),
@@ -944,7 +616,6 @@ test("plugin chat headers append internal session id for plugin-local routing", 
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
     }),
     loadOfficialChatHeaders: async () => async (input, output) => {
       output.headers["x-initiator"] = "agent"
@@ -1029,7 +700,6 @@ function createSyntheticChatHeadersHarness(input = {}) {
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       syntheticAgentInitiatorEnabled: input.syntheticAgentInitiatorEnabled === true,
     }),
     client: input.client ?? {
@@ -1098,7 +768,6 @@ function createFirstUseInitiatorHarness(input = {}) {
       ...(input.accounts ?? {}),
     },
     modelAccountAssignments: input.modelAccountAssignments,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     ...(input.store ?? {}),
   }
@@ -1240,7 +909,6 @@ function createSessionBindingHarness(input = {}) {
         expires: 0,
       },
     },
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     ...(input.store ?? {}),
   }
@@ -1606,7 +1274,6 @@ test("plugin chat headers debug logs include evidence and candidates without lea
       },
       loadStore: async () => ({
         accounts: {},
-        loopSafetyEnabled: false,
       }),
       client: {
         session: {
@@ -1698,7 +1365,6 @@ test("plugin auth loader keeps official fetch when network retry is disabled", a
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadOfficialConfig: async () => ({
@@ -1734,7 +1400,6 @@ test("plugin auth loader strips internal session header even without a resolved 
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadOfficialConfig: async () => ({
@@ -1787,7 +1452,6 @@ test("plugin auth loader wraps official fetch when network retry is enabled", as
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
     }),
     loadOfficialConfig: async () => ({
@@ -1831,7 +1495,6 @@ test("openai provider loader uses codex official adapter and codex retry enhance
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadCommonSettings: async () => ({
@@ -1896,7 +1559,6 @@ test("openai provider chain never executes copilot routing or auth-loader semant
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
       activeAccountNames: ["main"],
       modelAccountAssignments: { "gpt-5": ["main"] },
@@ -1952,7 +1614,6 @@ test("networkRetryEnabled from common settings enables retry for both copilot an
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadCommonSettings: async () => ({
@@ -1983,7 +1644,6 @@ test("networkRetryEnabled from common settings enables retry for both copilot an
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadCommonSettings: async () => ({
@@ -2028,7 +1688,6 @@ test("plugin auth loader suppresses first-use agent initiator once and restores 
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
     }),
     loadOfficialConfig: async () => ({
@@ -2102,7 +1761,6 @@ test("plugin auth loader only suppresses first use once and keeps subagent initi
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
     }),
     loadOfficialConfig: async () => ({
@@ -2332,7 +1990,6 @@ test("plugin auth loader initiator first use normalizes Request and init headers
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadOfficialConfig: async ({ getAuth }) => ({
@@ -2414,7 +2071,6 @@ test("plugin auth loader first-use agent detection uses merged header precedence
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadOfficialConfig: async ({ getAuth }) => ({
@@ -2472,7 +2128,6 @@ test("plugin auth loader passes plugin context into retry wrapper factory", asyn
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
     }),
     loadOfficialConfig: async () => ({
@@ -2512,7 +2167,6 @@ test("plugin auth loader only wires explicitly provided account switch clear cal
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
       lastAccountSwitchAt: 1_717_171_717_171,
     }),
@@ -2553,7 +2207,6 @@ test("plugin auth loader provides default account switch clear callback", async 
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
       lastAccountSwitchAt: 1_717_171_717_171,
     }),
@@ -2588,7 +2241,6 @@ test("plugin auth loader instantiates notifier and injects its interface into re
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
       lastAccountSwitchAt: 1_717_171_717_171,
     }),
@@ -2612,7 +2264,6 @@ test("plugin auth loader instantiates notifier and injects its interface into re
     writeStore: async (next, meta) => {
       writes.push({
         lastAccountSwitchAt: next.lastAccountSwitchAt,
-        loopSafetyEnabled: next.loopSafetyEnabled,
         networkRetryEnabled: next.networkRetryEnabled,
         meta,
       })
@@ -2637,7 +2288,6 @@ test("plugin auth loader instantiates notifier and injects its interface into re
   assert.deepEqual(writes, [
     {
       lastAccountSwitchAt: undefined,
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
       meta: {
         reason: "clear-account-switch-context",
@@ -2658,7 +2308,6 @@ test("plugin auth loader notifier is a no-op when plugin client toast sdk is una
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
       lastAccountSwitchAt: 1_717_171_717_171,
     }),
@@ -2674,7 +2323,6 @@ test("plugin auth loader notifier is a no-op when plugin client toast sdk is una
     writeStore: async (next, meta) => {
       writes.push({
         lastAccountSwitchAt: next.lastAccountSwitchAt,
-        loopSafetyEnabled: next.loopSafetyEnabled,
         networkRetryEnabled: next.networkRetryEnabled,
         meta,
       })
@@ -2696,7 +2344,6 @@ test("plugin auth loader notifier is a no-op when plugin client toast sdk is una
   assert.deepEqual(writes, [
     {
       lastAccountSwitchAt: undefined,
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
       meta: {
         reason: "clear-account-switch-context",
@@ -2705,7 +2352,6 @@ test("plugin auth loader notifier is a no-op when plugin client toast sdk is una
     },
     {
       lastAccountSwitchAt: undefined,
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
       meta: {
         reason: "clear-account-switch-context",
@@ -2714,7 +2360,6 @@ test("plugin auth loader notifier is a no-op when plugin client toast sdk is una
     },
     {
       lastAccountSwitchAt: undefined,
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
       meta: {
         reason: "clear-account-switch-context",
@@ -2732,7 +2377,6 @@ test("plugin auth loader leaves sse stream timeout errors untouched from retry f
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
     }),
     loadOfficialConfig: async () => ({
@@ -2793,7 +2437,6 @@ test("plugin auth loader leaves raw stream timeout errors on upstream responses 
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
     }),
     loadOfficialConfig: async () => ({
@@ -2933,7 +2576,6 @@ test("plugin auth loader notifier reads latest account switch context from store
     accounts: {
       account: { name: "account", refresh: "r", access: "a", expires: 0 },
     },
-    loopSafetyEnabled: false,
     networkRetryEnabled: true,
   }
   let retryContext
@@ -2996,7 +2638,6 @@ test("plugin auth loader notifier keeps captured account-switch copy after exter
     accounts: {
       account: { name: "account", refresh: "r", access: "a", expires: 0 },
     },
-    loopSafetyEnabled: false,
     networkRetryEnabled: true,
   }
   let retryContext
@@ -3045,7 +2686,6 @@ test("plugin auth loader returns empty config when official loader has no oauth 
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: true,
     }),
     loadOfficialConfig: async () => undefined,
@@ -3090,7 +2730,6 @@ test("plugin auth loader uses mapped account for matching Copilot model requests
       modelAccountAssignments: {
         "gpt-5": "alt",
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadOfficialConfig: async ({ getAuth }) => ({
@@ -3368,7 +3007,6 @@ test("plugin auth loader reselect uses x-initiator after chat.headers processing
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadCandidateAccountLoads: async () => {
@@ -3477,7 +3115,6 @@ test("plugin auth loader should reuse the bound account when official finalized 
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadCandidateAccountLoads: async () => {
@@ -3599,7 +3236,6 @@ test("plugin auth loader preserves session client this binding when finalized in
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     finalizeRequestForSelection: async ({ request, init }) => ({
@@ -3684,7 +3320,6 @@ test("plugin auth loader preserves session message this binding when finalized i
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     finalizeRequestForSelection: async ({ request, init }) => ({
@@ -3768,7 +3403,6 @@ test("plugin auth loader default finalized-header inspection does not consume Re
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadOfficialConfig: async ({ getAuth, baseFetch }) => ({
@@ -4274,7 +3908,6 @@ test("agent pass-through without resolved candidate does not trigger session anc
     },
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     client: {
@@ -5558,7 +5191,6 @@ test("direct plugin fetch tests default routing-state to isolated temporary dire
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadOfficialConfig: async ({ getAuth }) => ({
@@ -5620,7 +5252,6 @@ test("plain buildPluginHooks test instances default routing-state to isolated te
           expires: 0,
         },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     appendSessionTouchEventImpl: async (input) => {
@@ -5967,7 +5598,6 @@ test("plugin auth loader sends the finalized request headers it used for classif
           main: { name: "main", refresh: "main-refresh", access: "main-access", expires: 0 },
           alt: { name: "alt", refresh: "alt-refresh", access: "alt-access", expires: 0 },
         },
-        loopSafetyEnabled: false,
         networkRetryEnabled: false,
       }),
       loadCandidateAccountLoads: async () => {
@@ -6057,7 +5687,6 @@ test("route decision logs chosen account auth fingerprint for routed user turns"
         main: { name: "main", refresh: "main-refresh", access: "main-access", expires: 0 },
         alt: { name: "alt", refresh: "alt-refresh", access: "alt-access", expires: 0 },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadCandidateAccountLoads: async () => ({ main: 1, alt: 5 }),
@@ -6129,7 +5758,6 @@ test("route decision logs debug link id for routed user turns", async () => {
         main: { name: "main", refresh: "main-refresh", access: "main-access", expires: 0 },
         alt: { name: "alt", refresh: "alt-refresh", access: "alt-access", expires: 0 },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadCandidateAccountLoads: async () => ({ main: 1, alt: 5 }),
@@ -6218,7 +5846,6 @@ test("plugin auth loader avoids duplicate finalized headers when request already
         accounts: {
           main: { name: "main", refresh: "main-refresh", access: "main-access", expires: 0 },
         },
-        loopSafetyEnabled: false,
         networkRetryEnabled: false,
       }),
       appendRouteDecisionEventImpl: async (input) => {
@@ -6292,7 +5919,6 @@ test("user-reselect toast and outbound x-initiator stay aligned for routed user 
         main: { name: "main", refresh: "main-refresh", access: "main-access", expires: 0 },
         alt: { name: "alt", refresh: "alt-refresh", access: "alt-access", expires: 0 },
       },
-      loopSafetyEnabled: false,
       networkRetryEnabled: false,
     }),
     loadCandidateAccountLoads: async () => {
@@ -6375,41 +6001,9 @@ test("user-reselect toast and outbound x-initiator stay aligned for routed user 
   assert.equal(outgoing.at(-1)?.headers["x-initiator"], "user")
 })
 
-test("plugin menu common toggle path persists loopSafetyEnabled via common settings store", async () => {
-  const storeWrites = []
-  const commonWrites = []
-  const store = {
-    accounts: {},
-    loopSafetyEnabled: false,
-  }
-  const commonSettings = {
-    loopSafetyEnabled: false,
-  }
-
-  const handled = await applyMenuAction({
-    action: { type: "toggle-loop-safety" },
-    store,
-    writeStore: async (next) => {
-      storeWrites.push(next.loopSafetyEnabled)
-    },
-    readCommonSettings: async () => commonSettings,
-    writeCommonSettings: async (next) => {
-      commonSettings.loopSafetyEnabled = next.loopSafetyEnabled
-      commonWrites.push(next.loopSafetyEnabled)
-    },
-  })
-
-  assert.equal(handled, true)
-  assert.equal(store.loopSafetyEnabled, false)
-  assert.equal(commonSettings.loopSafetyEnabled, true)
-  assert.deepEqual(storeWrites, [])
-  assert.deepEqual(commonWrites, [true])
-})
-
 test("plugin menu common toggle path requires common settings store for networkRetryEnabled", async () => {
   const store = {
     accounts: {},
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
   }
 
@@ -6455,7 +6049,6 @@ test("plugin menu toggle path persists synthetic initiator state", async () => {
   const writes = []
   const store = {
     accounts: {},
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     syntheticAgentInitiatorEnabled: false,
   }
@@ -6473,87 +6066,9 @@ test("plugin menu toggle path persists synthetic initiator state", async () => {
   assert.deepEqual(writes, [true])
 })
 
-test("plugin menu common toggle path requires common settings store for loopSafetyProviderScope", async () => {
-  const store = {
-    accounts: {},
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "copilot-only",
-  }
-
-  await assert.rejects(() => applyMenuAction({
-    action: { type: "toggle-loop-safety-provider-scope" },
-    store,
-    writeStore: async () => {},
-  }), /requires common settings store/i)
-})
-
-test("plugin menu common toggle path persists loopSafetyProviderScope via common settings store", async () => {
-  const storeWrites = []
-  const commonWrites = []
-  const store = {
-    accounts: {},
-    loopSafetyProviderScope: "copilot-only",
-  }
-  const commonSettings = {
-    loopSafetyProviderScope: "copilot-only",
-  }
-
-  const handled = await applyMenuAction({
-    action: { type: "toggle-loop-safety-provider-scope" },
-    store,
-    writeStore: async (next) => {
-      storeWrites.push(next.loopSafetyProviderScope)
-    },
-    readCommonSettings: async () => commonSettings,
-    writeCommonSettings: async (next) => {
-      commonSettings.loopSafetyProviderScope = next.loopSafetyProviderScope
-      commonWrites.push(next.loopSafetyProviderScope)
-    },
-  })
-
-  assert.equal(handled, true)
-  assert.equal(store.loopSafetyProviderScope, "copilot-only")
-  assert.equal(commonSettings.loopSafetyProviderScope, "all-models")
-  assert.deepEqual(storeWrites, [])
-  assert.deepEqual(commonWrites, ["all-models"])
-})
-
-test("plugin menu common toggle path toggles loopSafetyProviderScope back to copilot-only via common settings store", async () => {
-  const storeWrites = []
-  const commonWrites = []
-  const store = {
-    accounts: {},
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "copilot-only",
-  }
-  const commonSettings = {
-    loopSafetyProviderScope: "all-models",
-  }
-
-  const handled = await applyMenuAction({
-    action: { type: "toggle-loop-safety-provider-scope" },
-    store,
-    writeStore: async (next) => {
-      storeWrites.push(next.loopSafetyProviderScope)
-    },
-    readCommonSettings: async () => commonSettings,
-    writeCommonSettings: async (next) => {
-      commonSettings.loopSafetyProviderScope = next.loopSafetyProviderScope
-      commonWrites.push(next.loopSafetyProviderScope)
-    },
-  })
-
-  assert.equal(handled, true)
-  assert.equal(store.loopSafetyProviderScope, "copilot-only")
-  assert.equal(commonSettings.loopSafetyProviderScope, "copilot-only")
-  assert.deepEqual(storeWrites, [])
-  assert.deepEqual(commonWrites, ["copilot-only"])
-})
-
 test("plugin menu common toggle path requires common settings store for experimental slash commands", async () => {
   const store = {
     accounts: {},
-    loopSafetyEnabled: true,
     experimentalSlashCommandsEnabled: true,
   }
 
@@ -6595,73 +6110,10 @@ test("plugin menu common toggle path persists experimental slash commands state 
   assert.deepEqual(commonWrites, [false])
 })
 
-test("plugin menu common toggle path forwards debug reason for loop safety writes", async () => {
-  const writes = []
-  const store = {
-    accounts: {},
-    loopSafetyEnabled: true,
-    networkRetryEnabled: true,
-  }
-  const commonSettings = {
-    loopSafetyEnabled: true,
-  }
-
-  const handled = await applyMenuAction({
-    action: { type: "toggle-loop-safety" },
-    store,
-    writeStore: async () => {},
-    readCommonSettings: async () => commonSettings,
-    writeCommonSettings: async (_next, meta) => {
-      writes.push(meta)
-    },
-  })
-
-  assert.equal(handled, true)
-  assert.deepEqual(writes, [
-    {
-      reason: "toggle-loop-safety",
-      source: "applyCommonSettingsAction",
-      actionType: "toggle-loop-safety",
-    },
-  ])
-})
-
-test("plugin menu common toggle path forwards debug reason for policy scope writes", async () => {
-  const writes = []
-  const store = {
-    accounts: {},
-    loopSafetyEnabled: true,
-    loopSafetyProviderScope: "copilot-only",
-  }
-  const commonSettings = {
-    loopSafetyProviderScope: "copilot-only",
-  }
-
-  const handled = await applyMenuAction({
-    action: { type: "toggle-loop-safety-provider-scope" },
-    store,
-    writeStore: async () => {},
-    readCommonSettings: async () => commonSettings,
-    writeCommonSettings: async (_next, meta) => {
-      writes.push(meta)
-    },
-  })
-
-  assert.equal(handled, true)
-  assert.deepEqual(writes, [
-    {
-      reason: "toggle-loop-safety-provider-scope",
-      source: "applyCommonSettingsAction",
-      actionType: "toggle-loop-safety-provider-scope",
-    },
-  ])
-})
-
 test("plugin menu common toggle path forwards debug reason for experimental slash command writes", async () => {
   const writes = []
   const store = {
     accounts: {},
-    loopSafetyEnabled: true,
     experimentalSlashCommandsEnabled: true,
   }
   const commonSettings = {
@@ -6817,7 +6269,6 @@ test("copilot menu runtime keeps import-auth bootstrap semantics", async () => {
     active: undefined,
     autoRefresh: false,
     refreshMinutes: 15,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
     syntheticAgentInitiatorEnabled: false,
@@ -6868,7 +6319,6 @@ test("copilot menu runtime switch-account keeps persistAccountSwitch semantics",
     },
     autoRefresh: false,
     refreshMinutes: 15,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
     syntheticAgentInitiatorEnabled: false,
@@ -6926,7 +6376,6 @@ test("copilot menu runtime shared add action keeps activateAddedAccount flow", a
     active: undefined,
     autoRefresh: false,
     refreshMinutes: 15,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
     syntheticAgentInitiatorEnabled: false,
@@ -6995,7 +6444,6 @@ test("copilot menu runtime shared remove actions keep debug metadata", async () 
     },
     autoRefresh: false,
     refreshMinutes: 15,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
     syntheticAgentInitiatorEnabled: false,
@@ -7055,7 +6503,6 @@ test("copilot menu runtime quota refresh and models refresh keep debug metadata"
     },
     autoRefresh: false,
     refreshMinutes: 15,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
     syntheticAgentInitiatorEnabled: false,
@@ -7111,7 +6558,6 @@ test("copilot menu runtime toggle actions keep write semantics", async () => {
     },
     autoRefresh: false,
     refreshMinutes: 15,
-    loopSafetyEnabled: false,
     networkRetryEnabled: false,
     experimentalSlashCommandsEnabled: true,
     syntheticAgentInitiatorEnabled: false,
@@ -7645,7 +7091,6 @@ test("plugin auth loader default clearAccountSwitchContext reloads and persists 
     accounts: {
       "stale-account": { name: "stale-account", refresh: "r1", access: "a1", expires: 0 },
     },
-    loopSafetyEnabled: false,
     networkRetryEnabled: true,
   }
   const freshStore = {
@@ -7654,7 +7099,6 @@ test("plugin auth loader default clearAccountSwitchContext reloads and persists 
     accounts: {
       "fresh-account": { name: "fresh-account", refresh: "r2", access: "a2", expires: 0 },
     },
-    loopSafetyEnabled: false,
     networkRetryEnabled: true,
   }
   const writes = []
@@ -7728,7 +7172,6 @@ test("plugin auth loader default clearAccountSwitchContext logs minimal diagnost
         accounts: {
           account: { name: "account", refresh: "r", access: "a", expires: 0 },
         },
-        loopSafetyEnabled: false,
         networkRetryEnabled: true,
       }),
       loadOfficialConfig: async () => ({
@@ -7772,7 +7215,6 @@ test("plugin auth loader notifier clears ttl-expired persisted switch context wi
     accounts: {
       account: { name: "account", refresh: "r", access: "a", expires: 0 },
     },
-    loopSafetyEnabled: false,
     networkRetryEnabled: true,
   }
   let retryContext
@@ -7843,321 +7285,6 @@ test("plugin source does not force promptAccountEntry on empty store bootstrap",
   assert.doesNotMatch(pluginSource, /if \(!Object\.entries\(store\.accounts\)\.length\)\s*\{\s*const \{ name, entry \} = await promptAccountEntry\(\[\]\)/)
 })
 
-test("plugin transform wiring appends for Copilot and skips non-Copilot", async () => {
-  const plugin = buildPluginHooks({
-    auth: {
-      provider: "github-copilot",
-      methods: [],
-    },
-    loadStore: async () => ({
-      accounts: {},
-      loopSafetyEnabled: true,
-    }),
-  })
-  const transform = plugin["experimental.chat.system.transform"]
-  const copilotOutput = { system: ["base prompt"] }
-  const nonCopilotOutput = { system: ["base prompt"] }
-
-  await transform?.(
-    { sessionID: "s1", model: { providerID: "github-copilot" } },
-    copilotOutput,
-  )
-  await transform?.(
-    { sessionID: "s2", model: { providerID: "google" } },
-    nonCopilotOutput,
-  )
-
-  assert.equal(copilotOutput.system.at(-1), LOOP_SAFETY_POLICY)
-  assert.equal(copilotOutput.system.filter((item) => item === LOOP_SAFETY_POLICY).length, 1)
-  assert.equal(nonCopilotOutput.system.includes(LOOP_SAFETY_POLICY), false)
-})
-
-function createTransformHarness(input = {}) {
-  const lookupCalls = []
-  const defaultClient = {
-    session: {
-      get: async (request) => {
-        lookupCalls.push(request)
-        if (typeof input.sessionGetResponse === "function") {
-          return input.sessionGetResponse(request)
-        }
-        return input.sessionGetResponse
-      },
-    },
-  }
-  const plugin = buildPluginHooks({
-    auth: {
-      provider: "github-copilot",
-      methods: [],
-    },
-    loadStore: async () => ({
-      accounts: {},
-      loopSafetyEnabled: input.loopSafetyEnabled ?? true,
-    }),
-    client: Object.hasOwn(input, "client") ? input.client : defaultClient,
-    directory: input.directory ?? "/tmp/project",
-  })
-
-  return {
-    lookupCalls,
-    transform: plugin["experimental.chat.system.transform"],
-    compacting: plugin["experimental.session.compacting"],
-  }
-}
-
-test("plugin transform wiring skips derived child session via session lookup", async () => {
-  const { transform, lookupCalls } = createTransformHarness({
-    sessionGetResponse: {
-      data: {
-        parentID: "root-session",
-      },
-    },
-  })
-  const output = { system: ["base prompt"] }
-
-  await transform?.(
-    { sessionID: "child-session", model: { providerID: "github-copilot" } },
-    output,
-  )
-
-  assert.deepEqual(output.system, ["base prompt"])
-  assert.deepEqual(lookupCalls, [
-    {
-      path: {
-        id: "child-session",
-      },
-      query: {
-        directory: "/tmp/project",
-      },
-      throwOnError: true,
-    },
-  ])
-})
-
-test("plugin transform wiring keeps injecting for root session lookup results", async () => {
-  const { transform } = createTransformHarness({
-    sessionGetResponse: {
-      data: {},
-    },
-  })
-  const output = { system: ["base prompt"] }
-
-  await transform?.(
-    { sessionID: "root-session", model: { providerID: "github-copilot" } },
-    output,
-  )
-
-  assert.deepEqual(output.system, ["base prompt", LOOP_SAFETY_POLICY])
-})
-
-test("plugin transform wiring fails open when lookup returns undefined payload shapes", async () => {
-  for (const sessionGetResponse of [undefined, {}, { data: undefined }]) {
-    const { transform } = createTransformHarness({ sessionGetResponse })
-    const output = { system: ["base prompt"] }
-
-    await transform?.(
-      { sessionID: "root-session", model: { providerID: "github-copilot" } },
-      output,
-    )
-
-    assert.deepEqual(output.system, ["base prompt", LOOP_SAFETY_POLICY])
-  }
-})
-
-test("plugin transform wiring fails open when session lookup throws or is unavailable", async () => {
-  const cases = [
-    {
-      client: {
-        session: {
-          get: async () => {
-            throw new Error("boom")
-          },
-        },
-      },
-    },
-    {
-      client: undefined,
-    },
-    {
-      client: {},
-    },
-    {
-      client: {
-        session: {},
-      },
-    },
-  ]
-
-  for (const testCase of cases) {
-    const { transform, lookupCalls } = createTransformHarness(testCase)
-    const output = { system: ["base prompt"] }
-
-    await transform?.(
-      { sessionID: "root-session", model: { providerID: "github-copilot" } },
-      output,
-    )
-
-    assert.deepEqual(output.system, ["base prompt", LOOP_SAFETY_POLICY])
-    if ("client" in testCase && testCase.client?.session?.get === undefined) {
-      assert.deepEqual(lookupCalls, [])
-    }
-  }
-})
-
-test("plugin transform wiring fails open when buildPluginHooks omits client entirely", async () => {
-  const plugin = buildPluginHooks({
-    auth: {
-      provider: "github-copilot",
-      methods: [],
-    },
-    loadStore: async () => ({
-      accounts: {},
-      loopSafetyEnabled: true,
-    }),
-    directory: "/tmp/project",
-  })
-  const output = { system: ["base prompt"] }
-
-  await assert.doesNotReject(async () => {
-    await plugin["experimental.chat.system.transform"]?.(
-      { sessionID: "root-session", model: { providerID: "github-copilot" } },
-      output,
-    )
-  })
-
-  assert.deepEqual(output.system, ["base prompt", LOOP_SAFETY_POLICY])
-})
-
-test("plugin transform wiring only skips when parentID is a non-empty string", async () => {
-  const cases = [
-    { parentID: "", expected: ["base prompt", LOOP_SAFETY_POLICY] },
-    { parentID: 0, expected: ["base prompt", LOOP_SAFETY_POLICY] },
-    { parentID: false, expected: ["base prompt", LOOP_SAFETY_POLICY] },
-    { parentID: null, expected: ["base prompt", LOOP_SAFETY_POLICY] },
-    { parentID: "root-session", expected: ["base prompt"] },
-  ]
-
-  for (const testCase of cases) {
-    const { transform } = createTransformHarness({
-      sessionGetResponse: {
-        data: {
-          parentID: testCase.parentID,
-        },
-      },
-    })
-    const output = { system: ["base prompt"] }
-
-    await transform?.(
-      { sessionID: "candidate-session", model: { providerID: "github-copilot" } },
-      output,
-    )
-
-    assert.deepEqual(output.system, testCase.expected)
-  }
-})
-
-test("plugin transform wiring does not lookup when sessionID is missing and fails open", async () => {
-  const { transform, lookupCalls } = createTransformHarness({
-    sessionGetResponse: async () => {
-      throw new Error("lookup should not run")
-    },
-  })
-  const missingOutput = { system: ["base prompt"] }
-  const emptyOutput = { system: ["base prompt"] }
-
-  await transform?.(
-    { model: { providerID: "github-copilot" } },
-    missingOutput,
-  )
-  await transform?.(
-    { sessionID: "", model: { providerID: "github-copilot" } },
-    emptyOutput,
-  )
-
-  assert.deepEqual(missingOutput.system, ["base prompt", LOOP_SAFETY_POLICY])
-  assert.deepEqual(emptyOutput.system, ["base prompt", LOOP_SAFETY_POLICY])
-  assert.deepEqual(lookupCalls, [])
-})
-
-test("plugin transform wiring does not lookup for disabled non-Copilot or compaction bypass paths", async () => {
-  const disabledHarness = createTransformHarness({
-    loopSafetyEnabled: false,
-    sessionGetResponse: async () => {
-      throw new Error("lookup should not run when disabled")
-    },
-  })
-  const nonCopilotHarness = createTransformHarness({
-    sessionGetResponse: async () => {
-      throw new Error("lookup should not run for non-Copilot")
-    },
-  })
-  const bypassHarness = createTransformHarness({
-    sessionGetResponse: async () => {
-      throw new Error("lookup should not run for compaction bypass")
-    },
-  })
-  const disabledOutput = { system: ["base prompt"] }
-  const nonCopilotOutput = { system: ["base prompt"] }
-  const bypassOutput = { system: ["base prompt"] }
-
-  await disabledHarness.transform?.(
-    { sessionID: "disabled-session", model: { providerID: "github-copilot" } },
-    disabledOutput,
-  )
-  await nonCopilotHarness.transform?.(
-    { sessionID: "google-session", model: { providerID: "google" } },
-    nonCopilotOutput,
-  )
-  await bypassHarness.compacting?.(
-    { sessionID: "compacting-session" },
-    { context: [], prompt: undefined },
-  )
-  await bypassHarness.transform?.(
-    { sessionID: "compacting-session", model: { providerID: "github-copilot" } },
-    bypassOutput,
-  )
-
-  assert.deepEqual(disabledHarness.lookupCalls, [])
-  assert.deepEqual(nonCopilotHarness.lookupCalls, [])
-  assert.deepEqual(bypassHarness.lookupCalls, [])
-  assert.deepEqual(disabledOutput.system, ["base prompt"])
-  assert.deepEqual(nonCopilotOutput.system, ["base prompt"])
-  assert.deepEqual(bypassOutput.system, ["base prompt"])
-})
-
-test("plugin transform skips pending compaction session once", async () => {
-  const plugin = buildPluginHooks({
-    auth: {
-      provider: "github-copilot",
-      methods: [],
-    },
-    loadStore: async () => ({
-      accounts: {},
-      loopSafetyEnabled: true,
-    }),
-  })
-  const compacting = plugin["experimental.session.compacting"]
-  const transform = plugin["experimental.chat.system.transform"]
-  const skipped = { system: ["base prompt"] }
-  const normal = { system: ["base prompt"] }
-
-  await compacting?.(
-    { sessionID: "s1" },
-    { context: [], prompt: undefined },
-  )
-  await transform?.(
-    { sessionID: "s1", model: { providerID: "github-copilot" } },
-    skipped,
-  )
-  await transform?.(
-    { sessionID: "s1", model: { providerID: "github-copilot" } },
-    normal,
-  )
-
-  assert.deepEqual(skipped.system, ["base prompt"])
-  assert.deepEqual(normal.system, ["base prompt", LOOP_SAFETY_POLICY])
-})
-
 test("package root only exposes plugin entry and internal subpath exposes helpers", async () => {
   const root = await import("../dist/index.js")
   const internal = await import("../dist/internal.js")
@@ -8178,7 +7305,19 @@ test("provider descriptor includes required copilot fields", () => {
   assert.equal(COPILOT_PROVIDER_DESCRIPTOR.storeNamespace, "copilot")
   assert.ok(Array.isArray(COPILOT_PROVIDER_DESCRIPTOR.commands))
   assert.ok(Array.isArray(COPILOT_PROVIDER_DESCRIPTOR.menuEntries))
-  assert.equal(typeof COPILOT_PROVIDER_DESCRIPTOR.capabilities, "object")
+  assert.ok(Array.isArray(COPILOT_PROVIDER_DESCRIPTOR.capabilities))
+
+  assert.equal(COPILOT_PROVIDER_DESCRIPTOR.commands.includes("copilot-inject"), false)
+  assert.equal(COPILOT_PROVIDER_DESCRIPTOR.commands.includes("copilot-policy-all-models"), false)
+  assert.equal(COPILOT_PROVIDER_DESCRIPTOR.menuEntries.includes("toggle-loop-safety"), false)
+  assert.equal(COPILOT_PROVIDER_DESCRIPTOR.capabilities.includes("loop-safety"), false)
+
+  for (const command of ["copilot-status", "copilot-compact", "copilot-stop-tool"]) {
+    assert.equal(COPILOT_PROVIDER_DESCRIPTOR.commands.includes(command), true)
+  }
+  for (const capability of ["auth", "chat-headers", "model-routing", "network-retry", "slash-commands"]) {
+    assert.equal(COPILOT_PROVIDER_DESCRIPTOR.capabilities.includes(capability), true)
+  }
 })
 
 test("provider registry global lookup remains copilot-scoped for providerID matching", () => {
