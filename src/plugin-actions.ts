@@ -4,14 +4,10 @@ import { applyCommonSettingsAction } from "./common-settings-actions.js"
 import type { CommonSettingsStore } from "./common-settings-store.js"
 
 function isCommonSettingsAction(action: MenuAction): action is Extract<MenuAction,
-  { type: "toggle-loop-safety" }
-  | { type: "toggle-loop-safety-provider-scope" }
-  | { type: "toggle-experimental-slash-commands" }
+  { type: "toggle-experimental-slash-commands" }
   | { type: "toggle-network-retry" }
 > {
-  return action.type === "toggle-loop-safety"
-    || action.type === "toggle-loop-safety-provider-scope"
-    || action.type === "toggle-experimental-slash-commands"
+  return action.type === "toggle-experimental-slash-commands"
     || action.type === "toggle-network-retry"
 }
 

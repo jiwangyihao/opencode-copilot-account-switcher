@@ -98,8 +98,6 @@ function toSharedRuntimeAction(action: UiMenuAction): RuntimeMenuAction | undefi
   if (action.type === "remove-all") return { type: "remove-all" }
   if (action.type === "switch") return { type: "switch", account: action.account }
   if (action.type === "remove") return { type: "remove", account: action.account }
-  if (action.type === "toggle-loop-safety") return { type: "provider", name: "toggle-loop-safety" }
-  if (action.type === "toggle-loop-safety-provider-scope") return { type: "provider", name: "toggle-loop-safety-provider-scope" }
   if (action.type === "toggle-experimental-slash-commands") return { type: "provider", name: "toggle-experimental-slash-commands" }
   if (action.type === "toggle-network-retry") return { type: "provider", name: "toggle-network-retry" }
   if (action.type === "toggle-wechat-notifications") return { type: "provider", name: "toggle-wechat-notifications" }
@@ -542,8 +540,6 @@ async function createAccountSwitcherPlugin(
         lastQuotaRefresh: store.lastQuotaRefresh,
         modelAccountAssignmentCount: Object.keys(store.modelAccountAssignments ?? {}).length,
         defaultAccountGroupCount: store.activeAccountNames?.length ?? (store.active ? 1 : 0),
-        loopSafetyEnabled: common?.loopSafetyEnabled ?? store.loopSafetyEnabled === true,
-        loopSafetyProviderScope: common?.loopSafetyProviderScope ?? store.loopSafetyProviderScope,
         experimentalSlashCommandsEnabled: common?.experimentalSlashCommandsEnabled ?? store.experimentalSlashCommandsEnabled,
         networkRetryEnabled: common?.networkRetryEnabled ?? store.networkRetryEnabled === true,
         syntheticAgentInitiatorEnabled: store.syntheticAgentInitiatorEnabled === true,
@@ -597,8 +593,6 @@ async function createAccountSwitcherPlugin(
       const action = await showMenu(accounts, {
         provider: "codex",
         refresh: { enabled: store.autoRefresh === true, minutes: store.refreshMinutes ?? 15 },
-        loopSafetyEnabled: common?.loopSafetyEnabled ?? true,
-        loopSafetyProviderScope: common?.loopSafetyProviderScope,
         experimentalSlashCommandsEnabled: common?.experimentalSlashCommandsEnabled,
         networkRetryEnabled: common?.networkRetryEnabled === true,
       })

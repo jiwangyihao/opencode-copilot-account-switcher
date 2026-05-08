@@ -17,13 +17,11 @@ function buildPluginHooks(input = {}) {
     auth: input.auth ?? { provider: "github-copilot", methods: [] },
     loadStoreSync: input.loadStoreSync ?? (() => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: true,
     })),
     loadStore: input.loadStore ?? (async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: true,
     })),
@@ -194,7 +192,6 @@ test("/copilot-stop-tool warns and bails when syntheticAgentInitiatorEnabled is 
   const plugin = buildPluginHooks({
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: false,
     }),
@@ -528,7 +525,6 @@ test("/copilot-stop-tool patches completed tool transcript after abort before co
   const plugin = buildPluginHooks({
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: true,
     }),
@@ -598,7 +594,6 @@ test("/copilot-stop-tool patches error tool transcript after abort before contin
   const plugin = buildPluginHooks({
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: true,
     }),
@@ -748,7 +743,6 @@ test("/copilot-stop-tool reports unstable tool state timeout and does not contin
   const plugin = buildPluginHooks({
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: true,
     }),
@@ -807,7 +801,6 @@ test("/copilot-stop-tool does not continue when transcript patch update fails", 
   const plugin = buildPluginHooks({
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: true,
     }),
@@ -873,7 +866,6 @@ test("/copilot-stop-tool keeps patched transcript when promptAsync fails", async
   const plugin = buildPluginHooks({
     loadStore: async () => ({
       accounts: {},
-      loopSafetyEnabled: false,
       experimentalSlashCommandsEnabled: true,
       syntheticAgentInitiatorEnabled: true,
     }),
