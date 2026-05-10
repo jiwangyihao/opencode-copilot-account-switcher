@@ -1,10 +1,10 @@
-import test from "node:test"
 import assert from "node:assert/strict"
 import { execFile } from "node:child_process"
-import { existsSync, promises as fs } from "node:fs"
 import { randomUUID } from "node:crypto"
+import { existsSync, promises as fs } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
+import test from "node:test"
 import { setTimeout as delay } from "node:timers/promises"
 import { pathToFileURL } from "node:url"
 import { promisify } from "node:util"
@@ -13,7 +13,7 @@ import { strFromU8, unzipSync } from "fflate"
 import { ACCOUNT_SWITCH_TTL_MS } from "../dist/copilot-retry-notifier.js"
 import { applyMenuAction } from "../dist/plugin-actions.js"
 import { buildPluginHooks as buildPluginHooksRaw } from "../dist/plugin-hooks.js"
-import { CODEX_PROVIDER_DESCRIPTOR, COPILOT_PROVIDER_DESCRIPTOR } from "../dist/providers/descriptor.js"
+import { COPILOT_PROVIDER_DESCRIPTOR } from "../dist/providers/descriptor.js"
 import { getProviderDescriptorByKey, getProviderDescriptorByProviderID, listProviderDescriptors } from "../dist/providers/registry.js"
 import { buildCandidateAccountLoads } from "../dist/routing-state.js"
 import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
@@ -587,13 +587,45 @@ test("source tree no longer keeps local codex oauth implementation", () => {
   assert.equal(exists, false)
 })
 
+test("root Copilot package has no Codex runtime artifacts after build", () => {
+  const codexArtifacts = [
+    "../src/codex-auth-source.ts",
+    "../src/codex-store.ts",
+    "../src/codex-status-fetcher.ts",
+    "../src/codex-status-command.ts",
+    "../src/codex-invalid-account.ts",
+    "../src/codex-network-retry.ts",
+    "../src/retry/codex-policy.ts",
+    "../src/providers/codex-menu-adapter.ts",
+    "../src/upstream/codex-loader-adapter.ts",
+    "../src/upstream/codex-plugin.snapshot.ts",
+    "../scripts/sync-codex-upstream.mjs",
+    "../dist/codex-store.js",
+    "../dist/codex-status-command.js",
+    "../dist/providers/codex-menu-adapter.js",
+    "../dist/upstream/codex-plugin.snapshot.js",
+  ]
+
+  for (const relative of codexArtifacts) {
+    assert.equal(existsSync(new URL(relative, import.meta.url)), false, relative)
+  }
+})
+
+test("root public entries do not export OpenAICodexAccountSwitcher", async () => {
+  const indexExports = await import("../dist/index.js")
+  const pluginExports = await import("../dist/plugin.js")
+
+  assert.equal("OpenAICodexAccountSwitcher" in indexExports, false)
+  assert.equal("OpenAICodexAccountSwitcher" in pluginExports, false)
+})
+
 test("copilot package has no stale notify-tool artifacts after build", () => {
   assert.equal(existsSync(new URL("../src/notify-tool.ts", import.meta.url)), false)
   assert.equal(existsSync(new URL("../dist/notify-tool.js", import.meta.url)), false)
   assert.equal(existsSync(new URL("../dist/notify-tool.d.ts", import.meta.url)), false)
 })
 
-test("npm pack dry run excludes notify-tool artifacts", async () => {
+test("npm pack dry run excludes Codex and notify-tool artifacts", async () => {
   const command = process.platform === "win32" ? "cmd.exe" : "npm"
   const args = process.platform === "win32"
     ? ["/d", "/s", "/c", "npm pack --dry-run --json"]
@@ -602,10 +634,19 @@ test("npm pack dry run excludes notify-tool artifacts", async () => {
     cwd: process.cwd(),
     windowsHide: true,
   })
-  const pack = JSON.parse(stdout)
-  const files = pack[0].files.map((entry) => entry.path)
+  const files = JSON.parse(stdout)[0].files.map((entry) => entry.path)
+  const forbiddenPackNeedles = [
+    "dist/codex-",
+    "dist/providers/codex-menu-adapter",
+    "dist/upstream/codex-",
+    "codex-plugin.snapshot",
+    "sync-codex-upstream",
+  ]
 
   assert.equal(files.some((filePath) => filePath.includes("notify-tool")), false)
+  for (const needle of forbiddenPackNeedles) {
+    assert.equal(files.some((filePath) => filePath.replace(/\\/g, "/").includes(needle)), false, needle)
+  }
 })
 
 test("plugin chat headers append internal session id for plugin-local routing", async () => {
@@ -617,7 +658,7 @@ test("plugin chat headers append internal session id for plugin-local routing", 
     loadStore: async () => ({
       accounts: {},
     }),
-    loadOfficialChatHeaders: async () => async (input, output) => {
+    loadOfficialChatHeaders: async () => async (_input, output) => {
       output.headers["x-initiator"] = "agent"
       output.headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
     },
@@ -1475,104 +1516,40 @@ test("plugin auth loader wraps official fetch when network retry is enabled", as
   assert.equal(options?.fetch, wrappedFetch)
 })
 
-test("openai provider loader uses codex official adapter and codex retry enhancer when retry enabled", async () => {
-  const calls = {
-    codexOfficial: 0,
-    codexRetry: 0,
-    copilotOfficial: 0,
-    copilotFinalize: 0,
-    copilotRouting: 0,
-  }
-  const codexOfficialFetch = async () => new Response("{}", {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  })
-
+test("unsupported provider chain never executes copilot routing or auth-loader semantics", async () => {
+  let loadStoreCalls = 0
+  let loadCommonSettingsCalls = 0
   const plugin = buildPluginHooks({
     auth: {
       provider: "openai",
       methods: [],
     },
-    loadStore: async () => ({
-      accounts: {},
-      networkRetryEnabled: false,
-    }),
-    loadCommonSettings: async () => ({
-      networkRetryEnabled: true,
-    }),
-    loadOfficialConfig: async () => {
-      calls.codexOfficial += 1
+    loadStore: async () => {
+      loadStoreCalls += 1
       return {
-        apiKey: "",
-        fetch: codexOfficialFetch,
+        active: "main",
+        accounts: {
+          main: {
+            name: "main",
+            refresh: "refresh",
+            access: "access",
+            expires: 0,
+          },
+        },
+        networkRetryEnabled: true,
+        activeAccountNames: ["main"],
+        modelAccountAssignments: { "gpt-5": ["main"] },
       }
     },
-    createRetryFetch: (nextFetch) => {
-      calls.codexRetry += 1
-      assert.equal(nextFetch, codexOfficialFetch)
-      return async (request, init) => nextFetch(request, init)
+    loadCommonSettings: async () => {
+      loadCommonSettingsCalls += 1
+      return {
+        networkRetryEnabled: true,
+      }
     },
-    finalizeRequestForSelection: async () => {
-      calls.copilotFinalize += 1
-      return undefined
+    loadOfficialConfig: async () => {
+      throw new Error("unsupported provider should not load official config")
     },
-    loadCandidateAccountLoads: async () => {
-      calls.copilotRouting += 1
-      return undefined
-    },
-    loadOfficialChatHeaders: async () => {
-      calls.copilotOfficial += 1
-      return async () => {}
-    },
-  })
-
-  const options = await plugin.auth?.loader?.(
-    async () => ({ type: "oauth", refresh: "r", access: "a", expires: 0 }),
-    { models: {} },
-  )
-
-  await options?.fetch?.("https://api.openai.com/v1/responses", {
-    method: "POST",
-    body: JSON.stringify({ model: "gpt-5" }),
-  })
-
-  assert.equal(calls.codexOfficial, 1)
-  assert.equal(calls.codexRetry, 1)
-  assert.equal(calls.copilotOfficial, 0)
-  assert.equal(calls.copilotFinalize, 0)
-  assert.equal(calls.copilotRouting, 0)
-})
-
-test("openai provider chain never executes copilot routing or auth-loader semantics", async () => {
-  const plugin = buildPluginHooks({
-    auth: {
-      provider: "openai",
-      methods: [],
-    },
-    loadStore: async () => ({
-      active: "main",
-      accounts: {
-        main: {
-          name: "main",
-          refresh: "refresh",
-          access: "access",
-          expires: 0,
-        },
-      },
-      networkRetryEnabled: true,
-      activeAccountNames: ["main"],
-      modelAccountAssignments: { "gpt-5": ["main"] },
-    }),
-    loadCommonSettings: async () => ({
-      networkRetryEnabled: true,
-    }),
-    loadOfficialConfig: async () => ({
-      apiKey: "",
-      fetch: async () => new Response("{}", {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-    }),
     finalizeRequestForSelection: async () => {
       throw new Error("copilot finalize should not run")
     },
@@ -1590,21 +1567,14 @@ test("openai provider chain never executes copilot routing or auth-loader semant
     },
   })
 
-  const options = await plugin.auth?.loader?.(
-    async () => ({ type: "oauth", refresh: "r", access: "a", expires: 0 }),
-    { models: {} },
-  )
-
-  await assert.doesNotReject(async () => options?.fetch?.("https://api.openai.com/v1/responses", {
-    method: "POST",
-    body: JSON.stringify({ model: "gpt-5" }),
-  }))
+  assert.equal(plugin.auth?.loader, undefined)
+  assert.equal(loadStoreCalls, 0)
+  assert.equal(loadCommonSettingsCalls, 0)
 })
 
-test("networkRetryEnabled from common settings enables retry for both copilot and openai providers", async () => {
+test("networkRetryEnabled from common settings enables retry for copilot provider", async () => {
   const calls = {
     copilotRetry: 0,
-    codexRetry: 0,
   }
 
   const copilot = buildPluginHooks({
@@ -1637,38 +1607,7 @@ test("networkRetryEnabled from common settings enables retry for both copilot an
     { models: {} },
   )
 
-  const codex = buildPluginHooks({
-    auth: {
-      provider: "openai",
-      methods: [],
-    },
-    loadStore: async () => ({
-      accounts: {},
-      networkRetryEnabled: false,
-    }),
-    loadCommonSettings: async () => ({
-      networkRetryEnabled: true,
-    }),
-    loadOfficialConfig: async () => ({
-      apiKey: "",
-      fetch: async () => new Response("{}", {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-    }),
-    createRetryFetch: (nextFetch) => {
-      calls.codexRetry += 1
-      return nextFetch
-    },
-  })
-
-  await codex.auth?.loader?.(
-    async () => ({ type: "oauth", refresh: "r", access: "a", expires: 0 }),
-    { models: {} },
-  )
-
   assert.equal(calls.copilotRetry, 1)
-  assert.equal(calls.codexRetry, 1)
 })
 
 test("plugin auth loader suppresses first-use agent initiator once and restores agent initiator on later requests", async () => {
@@ -6621,24 +6560,18 @@ test("plugin shared runtime action mapping includes wechat-export-debug-bundle",
   )
 })
 
-test("provider adapters lazy-load wechat bind flow", async () => {
+test("copilot provider adapter lazy-loads wechat bind flow", async () => {
   const copilotSource = await fs.readFile(new URL("../dist/providers/copilot-menu-adapter.js", import.meta.url), "utf8")
-  const codexSource = await fs.readFile(new URL("../dist/providers/codex-menu-adapter.js", import.meta.url), "utf8")
 
   assert.doesNotMatch(copilotSource, /from "\.\.\/wechat\/bind-flow\.js"/)
-  assert.doesNotMatch(codexSource, /from "\.\.\/wechat\/bind-flow\.js"/)
   assert.match(copilotSource, /await import\("\.\.\/wechat\/bind-flow\.js"\)/)
-  assert.match(codexSource, /await import\("\.\.\/wechat\/bind-flow\.js"\)/)
 })
 
-test("provider adapters lazy-load wechat-export-debug-bundle flow", async () => {
+test("copilot provider adapter lazy-loads wechat-export-debug-bundle flow", async () => {
   const copilotSource = await fs.readFile(new URL("../dist/providers/copilot-menu-adapter.js", import.meta.url), "utf8")
-  const codexSource = await fs.readFile(new URL("../dist/providers/codex-menu-adapter.js", import.meta.url), "utf8")
 
   assert.doesNotMatch(copilotSource, /from "\.\.\/wechat\/debug-bundle-flow\.js"/)
-  assert.doesNotMatch(codexSource, /from "\.\.\/wechat\/debug-bundle-flow\.js"/)
   assert.match(copilotSource, /await import\("\.\.\/wechat\/debug-bundle-flow\.js"\)/)
-  assert.match(codexSource, /await import\("\.\.\/wechat\/debug-bundle-flow\.js"\)/)
 })
 
 test("real plugin menu entrypoints forward structured wechat debug bundle results", async () => {
@@ -7019,70 +6952,6 @@ test("copilot menu adapter surfaces stable Chinese export failure when state roo
   assert.equal(existsSync(outputRootDir), false)
 })
 
-test("codex menu adapter preserves structured wechat debug bundle failure result without human logs", async (t) => {
-  const missingStateRoot = join(tmpdir(), `wechat-debug-bundle-codex-missing-root-${randomUUID()}`)
-  const outputRootDir = join(tmpdir(), `wechat-debug-bundle-codex-missing-root-output-${randomUUID()}`)
-  t.after(async () => {
-    await fs.rm(missingStateRoot, { recursive: true, force: true })
-    await fs.rm(outputRootDir, { recursive: true, force: true })
-  })
-
-  const { createCodexMenuAdapter } = await import("../dist/providers/codex-menu-adapter.js")
-  const toasts = []
-  const logCapture = captureConsoleLog()
-  t.after(() => logCapture.restore())
-  const adapter = createCodexMenuAdapter({
-    client: {
-      auth: { set: async () => {} },
-      tui: {
-        showToast: async (options) => {
-          toasts.push(options)
-        },
-      },
-    },
-    readCommonSettings: async () => ({}),
-    writeCommonSettings: async () => {},
-  })
-
-  const result = await adapter.applyAction?.({
-    accounts: {},
-    active: undefined,
-    autoRefresh: false,
-    refreshMinutes: 15,
-  }, {
-    type: "provider",
-    name: "wechat-export-debug-bundle",
-    payload: {
-      mode: "sanitized",
-      stateRoot: missingStateRoot,
-      outputRootDir,
-      now: new Date("2026-04-11T08:30:00.000Z"),
-      cwd: outputRootDir,
-      pluginVersion: "0.14.38-test",
-      gitHead: "head-adapter",
-      nodeVersion: "v24.0.0-test",
-      platform: "linux-test",
-    },
-  })
-
-  assert.deepEqual(result, {
-    handled: true,
-    result: {
-      ok: false,
-      mode: "sanitized",
-      code: "missing-state-root",
-      message: "微信状态目录不存在，无法导出调试包",
-    },
-  })
-  assert.deepEqual(toasts, [{
-    body: {
-      message: "微信状态目录不存在，无法导出调试包",
-      variant: "warning",
-    },
-  }])
-  assert.deepEqual(logCapture.lines, [])
-})
-
 test("plugin auth loader default clearAccountSwitchContext reloads and persists matching switch timestamp", async () => {
   const officialFetch = async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
   const staleStore = {
@@ -7322,26 +7191,16 @@ test("provider descriptor includes required copilot fields", () => {
 
 test("provider registry global lookup remains copilot-scoped for providerID matching", () => {
   const descriptors = listProviderDescriptors()
-  assert.equal(descriptors.length, 2)
+  assert.equal(descriptors.length, 1)
   assert.equal(descriptors[0]?.key, "copilot")
-  assert.equal(descriptors[1]?.key, "codex")
   assert.equal(getProviderDescriptorByKey("copilot")?.key, "copilot")
-  assert.equal(getProviderDescriptorByKey("codex")?.key, "codex")
+  assert.equal(getProviderDescriptorByKey("codex"), undefined)
   assert.equal(getProviderDescriptorByProviderID("github-copilot")?.key, "copilot")
   assert.equal(getProviderDescriptorByProviderID("github-copilot-enterprise")?.key, "copilot")
-  assert.equal(getProviderDescriptorByProviderID("openai")?.key, "codex")
+  assert.equal(getProviderDescriptorByProviderID("openai"), undefined)
 })
 
-test("codex descriptor declares independent menu capabilities", () => {
-  assert.equal(CODEX_PROVIDER_DESCRIPTOR.key, "codex")
-  assert.deepEqual(CODEX_PROVIDER_DESCRIPTOR.providerIDs, ["openai"])
-  assert.deepEqual(CODEX_PROVIDER_DESCRIPTOR.commands, ["codex-status"])
-  assert.deepEqual(CODEX_PROVIDER_DESCRIPTOR.menuEntries, ["switch-account", "add-account", "refresh-snapshot"])
-  assert.deepEqual(CODEX_PROVIDER_DESCRIPTOR.capabilities, ["auth", "chat-headers", "network-retry", "slash-commands"])
-  assert.equal(CODEX_PROVIDER_DESCRIPTOR.storeNamespace, "codex")
-})
-
-test("provider registry exposes both Copilot and Codex descriptors", async () => {
+test("provider registry exposes only Copilot descriptor", async () => {
   const registry = await import(`../dist/provider-registry.js?provider-registry-${Date.now()}`)
 
   assert.equal(typeof registry.createProviderRegistry, "function")
@@ -7353,12 +7212,11 @@ test("provider registry exposes both Copilot and Codex descriptors", async () =>
 
   assert.equal(typeof providers?.copilot?.descriptor, "object")
   assert.equal(providers?.copilot?.descriptor?.auth?.provider, "github-copilot")
-  assert.equal(providers?.codex?.descriptor?.auth?.provider, "openai")
-  assert.equal(providers?.codex?.descriptor?.enabledByDefault, true)
+  assert.equal(providers?.codex, undefined)
 })
 
 test("provider registry maps descriptor capabilities into buildPluginHooks runtime options", async () => {
-  let captured = []
+  const captured = []
   const registry = await import(`../dist/provider-registry.js?provider-runtime-${Date.now()}`)
 
   const providers = registry.createProviderRegistry({
@@ -7377,11 +7235,9 @@ test("provider registry maps descriptor capabilities into buildPluginHooks runti
     },
   })
 
+  assert.equal(providers.codex, undefined)
   providers.copilot.descriptor.buildPluginHooks({
     auth: { provider: "github-copilot", methods: [] },
-  })
-  providers.codex.descriptor.buildPluginHooks({
-    auth: { provider: "openai", methods: [] },
   })
 
   assert.deepEqual(captured, [
@@ -7389,14 +7245,6 @@ test("provider registry maps descriptor capabilities into buildPluginHooks runti
       provider: "github-copilot",
       authLoaderMode: "copilot",
       enableModelRouting: true,
-      hasOfficialConfig: true,
-      hasOfficialChatHeaders: true,
-      hasRetryFetch: true,
-    },
-    {
-      provider: "openai",
-      authLoaderMode: "codex",
-      enableModelRouting: false,
       hasOfficialConfig: true,
       hasOfficialChatHeaders: true,
       hasRetryFetch: true,
@@ -7444,26 +7292,6 @@ test("CopilotAccountSwitcher 在非 bridge-capable（没有 serverUrl/bridge 语
   await Promise.resolve()
 
   assert.equal(calls.length, 0)
-})
-
-test("openai auth provider is wired to Codex menu entry and codex auth loader", async () => {
-  const { OpenAICodexAccountSwitcher } = await import(`../dist/plugin.js?codex-auth-${Date.now()}`)
-
-  const plugin = await OpenAICodexAccountSwitcher({
-    client: {
-      auth: {
-        set: async () => {},
-      },
-    },
-    directory: process.cwd(),
-    ensureWechatBrokerStarted: async () => ({ endpoint: "fake-endpoint" }),
-  })
-
-  assert.equal(plugin.auth?.provider, "openai")
-  assert.equal(typeof plugin.auth?.loader, "function")
-  assert.deepEqual(plugin.auth?.methods?.map((method) => method.label), [
-    "Manage OpenAI Codex accounts",
-  ])
 })
 
 test("CopilotAccountSwitcher 只有在 bridge-capable 时才会 eager ensure broker", async () => {
@@ -7712,28 +7540,18 @@ test("CopilotAccountSwitcher 在 broker 启动失败时会给出最小 toast 提
   }
 })
 
-test("provider descriptor contract keeps Copilot assembled and Codex enabled", async () => {
+test("provider descriptor contract keeps Copilot assembled without Codex facade", async () => {
   const descriptors = await import(`../dist/provider-descriptor.js?provider-descriptor-${Date.now()}`)
 
-  assert.equal(typeof descriptors.CODEX_PROVIDER_DESCRIPTOR, "object")
+  assert.equal("CODEX_PROVIDER_DESCRIPTOR" in descriptors, false)
   assert.equal(typeof descriptors.createCopilotProviderDescriptor, "function")
-  assert.equal(typeof descriptors.createCodexProviderDescriptor, "function")
+  assert.equal("createCodexProviderDescriptor" in descriptors, false)
 
   const copilot = descriptors.createCopilotProviderDescriptor({
     buildPluginHooks,
   })
-  const codex = descriptors.createCodexProviderDescriptor({
-    buildPluginHooks,
-    enabled: true,
-  })
 
   assert.equal(copilot.auth.provider, "github-copilot")
-  assert.deepEqual(descriptors.CODEX_PROVIDER_DESCRIPTOR.providerIDs, ["openai"])
-  assert.deepEqual(descriptors.CODEX_PROVIDER_DESCRIPTOR.commands, ["codex-status"])
-  assert.deepEqual(descriptors.CODEX_PROVIDER_DESCRIPTOR.menuEntries, ["switch-account", "add-account", "refresh-snapshot"])
-  assert.deepEqual(descriptors.CODEX_PROVIDER_DESCRIPTOR.capabilities, ["auth", "chat-headers", "network-retry", "slash-commands"])
-  assert.equal(descriptors.CODEX_PROVIDER_DESCRIPTOR.storeNamespace, "codex")
-  assert.equal(codex.enabledByDefault, true)
 })
 
 

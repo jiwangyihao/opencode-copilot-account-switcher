@@ -17,14 +17,10 @@ test("getMenuCopy returns English copy when requested", () => {
   assert.equal(copy.switchLanguageLabel, "切换到中文")
 })
 
-test("getMenuCopy returns Codex-specific titles without Copilot-only wording", () => {
-  const enCopy = getMenuCopy("en", "codex")
-  const zhCopy = getMenuCopy("zh", "codex")
+test("root Copilot menu copy no longer exposes Codex provider title", () => {
+  const copy = getMenuCopy("en")
 
-  assert.equal(enCopy.menuTitle, "OpenAI Codex accounts")
-  assert.equal(zhCopy.menuTitle, "OpenAI Codex 账号")
-  assert.doesNotMatch(enCopy.retryOff, /Copilot/i)
-  assert.doesNotMatch(zhCopy.retryOff, /Copilot/i)
+  assert.equal(copy.menuTitle, "GitHub Copilot accounts")
 })
 
 test("getMenuCopy keeps network retry copy provider-agnostic for Copilot", () => {
@@ -306,49 +302,6 @@ test("experimental slash commands hint includes compact and stop-tool commands",
   assert.match(toggle?.hint ?? "", /copilot-stop-tool/)
 })
 
-test("buildMenuItems keeps common settings visible for Codex provider", () => {
-  const items = buildMenuItems({
-    provider: "codex",
-    accounts: [],
-    refresh: { enabled: false, minutes: 15 },
-    lastQuotaRefresh: undefined,
-    experimentalSlashCommandsEnabled: true,
-    networkRetryEnabled: false,
-    language: "en",
-  })
-
-  const labels = items.map((item) => item.label)
-  assert.equal(labels.includes("Guided Loop Safety: Off"), false)
-  assert.equal(labels.includes("Policy default scope: Current provider only"), false)
-  assert.equal(labels.includes("Experimental slash commands: On"), true)
-  assert.equal(labels.includes("Network Retry: Off"), true)
-  assert.equal(labels.includes("Send synthetic messages as agent: Off"), false)
-  assert.equal(labels.includes("Assign account groups per model"), false)
-  assert.equal(labels.includes("Sync available models"), false)
-})
-
-test("buildMenuItems ignores provider-only capability overrides for Codex provider", () => {
-  const items = buildMenuItems({
-    provider: "codex",
-    capabilities: {
-      checkModels: true,
-      assignModels: true,
-      networkRetry: true,
-    },
-    accounts: [],
-    refresh: { enabled: false, minutes: 15 },
-    lastQuotaRefresh: undefined,
-    networkRetryEnabled: true,
-    language: "en",
-  })
-
-  const labels = items.map((item) => item.label)
-  assert.equal(labels.includes("Guided Loop Safety: Off"), false)
-  assert.equal(labels.includes("Network Retry: On"), true)
-  assert.equal(labels.includes("Assign account groups per model"), false)
-  assert.equal(labels.includes("Sync available models"), false)
-})
-
 test("buildMenuItems keeps section order stable for Copilot", () => {
   const items = buildMenuItems({
     provider: "copilot",
@@ -378,21 +331,19 @@ test("buildMenuItems keeps section order stable for Copilot", () => {
   assert.equal(accountsHeadingIndex < dangerHeadingIndex, true)
 })
 
-test("buildAccountActionItems keeps Codex account submenu free of Copilot-only model wording", () => {
+test("buildAccountActionItems keeps account submenu actions stable", () => {
   const items = buildAccountActionItems({
-    name: "codex-main",
+    name: "copilot-main",
     index: 0,
     plan: "team",
     modelList: {
       available: ["gpt-5"],
       disabled: [],
     },
-  }, {
-    provider: "codex",
   })
 
   const labels = items.map((item) => item.label)
-  assert.equal(labels.includes("View models"), false)
+  assert.equal(labels.includes("View models"), true)
   assert.equal(labels.includes("Switch to this account"), true)
   assert.equal(labels.includes("Remove this account"), true)
 })
@@ -436,34 +387,28 @@ test("showMenu maps account submenu remove to remove action", async () => {
   assert.deepEqual(result, { type: "remove", account })
 })
 
-test("showMenu keeps provider-specific account submenu dispatch for codex and copilot", async () => {
+test("showMenu keeps Copilot account submenu dispatch", async () => {
   const account = { name: "alpha", index: 0 }
   const providers = []
 
-  const run = async (provider) => {
-    const menuSelections = [
-      { type: "switch", account },
-      { type: "cancel" },
-    ]
-    return showMenuWithDeps([account], { provider }, {
-      select: async () => menuSelections.shift() ?? { type: "cancel" },
-      showAccountActions: async (_account, input) => {
-        providers.push(input.provider)
-        return "back"
-      },
-      confirm: async () => true,
-    })
-  }
+  const menuSelections = [
+    { type: "switch", account },
+    { type: "cancel" },
+  ]
+  await showMenuWithDeps([account], { provider: "copilot" }, {
+    select: async () => menuSelections.shift() ?? { type: "cancel" },
+    showAccountActions: async (_account, input) => {
+      providers.push(input.provider)
+      return "back"
+    },
+    confirm: async () => true,
+  })
 
-  await run("copilot")
-  await run("codex")
-
-  assert.deepEqual(providers, ["copilot", "codex"])
+  assert.deepEqual(providers, ["copilot"])
 })
 
-test("buildMenuItems shows codex workspaceName first in account hint", () => {
+test("buildMenuItems shows workspaceName first in account hint", () => {
   const items = buildMenuItems({
-    provider: "codex",
     accounts: [{
       name: "acct_workspace",
       index: 0,

@@ -1,24 +1,24 @@
-import test from "node:test"
 import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
+import test from "node:test"
 
-test("package root source exports OpenAI/Codex account switcher", async () => {
+test("package root source exports only Copilot account switcher", async () => {
   const source = await readFile(new URL("../src/index.ts", import.meta.url), "utf8")
 
-  assert.match(source, /OpenAICodexAccountSwitcher/)
+  assert.match(source, /CopilotAccountSwitcher/)
+  assert.doesNotMatch(source, /OpenAICodexAccountSwitcher/)
 })
 
-test("package root dist exports both Copilot and OpenAI/Codex switchers", async () => {
+test("package root dist exports only Copilot switcher", async () => {
   const indexExports = await import("../dist/index.js")
   const pluginExports = await import("../dist/plugin.js")
   const distTypeSource = await readFile(new URL("../dist/index.d.ts", import.meta.url), "utf8")
 
   assert.equal(typeof indexExports.CopilotAccountSwitcher, "function")
   assert.equal(indexExports.CopilotAccountSwitcher, pluginExports.CopilotAccountSwitcher)
-
-  assert.equal(typeof indexExports.OpenAICodexAccountSwitcher, "function")
-  assert.equal(indexExports.OpenAICodexAccountSwitcher, pluginExports.OpenAICodexAccountSwitcher)
+  assert.equal("OpenAICodexAccountSwitcher" in indexExports, false)
+  assert.equal("OpenAICodexAccountSwitcher" in pluginExports, false)
 
   assert.match(distTypeSource, /CopilotAccountSwitcher/)
-  assert.match(distTypeSource, /OpenAICodexAccountSwitcher/)
+  assert.doesNotMatch(distTypeSource, /OpenAICodexAccountSwitcher/)
 })
