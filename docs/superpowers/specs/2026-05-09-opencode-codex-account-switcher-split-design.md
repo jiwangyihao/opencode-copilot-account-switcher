@@ -1,4 +1,4 @@
-# opencode-codex-account-switcher 拆分设计
+# opencode-openai-account-switcher 拆分设计
 
 ## 背景
 
@@ -11,11 +11,11 @@
 3. `plugin.ts`、`plugin-hooks.ts`、provider registry 和菜单 adapter 持续混合 Copilot / Codex / WeChat 逻辑，后续维护需要过多全局上下文。
 4. Codex 与 Copilot 的运行时语义不同。Codex 不应继承 Copilot header rewrite、`x-initiator`、模型账号映射或 Copilot session repair。
 
-本设计采用用户批准的“边界优先”方案：先划清 Codex 与 Copilot 包的所有权，再迁移文件、测试与包产物边界。本轮不发布 release，不推送非主分支。
+本设计采用用户批准的“边界优先”方案：先划清 Codex 与 Copilot 包的所有权，再迁移文件、测试与包产物边界。原候选包名 `opencode-codex-account-switcher` 已被他人发布且当前 npm 账号不是 maintainer，因此独立包改名为 `opencode-openai-account-switcher`，并为该新包补齐完整发布链路；root Copilot 包不在这条链路中发布。
 
 ## 已确认决策
 
-1. 独立包名使用 `opencode-codex-account-switcher`。
+1. 独立包名使用 `opencode-openai-account-switcher`。
 2. 新包第一版只承接 Codex / OpenAI 账号切换能力。
 3. Codex 插件入口继续命名为 `OpenAICodexAccountSwitcher`。
 4. Root `opencode-copilot-account-switcher` 回迁为 Copilot-only，只导出 `CopilotAccountSwitcher`。
@@ -25,13 +25,14 @@
 8. 微信集成留到后续 `opencode-wechat` 拆分，通过公开协议或显式 adapter 重新设计。
 9. Codex 数据路径保持兼容，继续使用 `~/.config/opencode/account-switcher/codex-accounts.json`。
 10. 继续兼容 legacy `~/.config/opencode/codex-store.json` 读取。
-11. 本轮不发布 GitHub Release、不发布 npm、不创建 tag。
-12. 本轮不推送 `split/opencode-codex-account-switcher` 或任何其他非主分支。
-13. 规格审查通过后，后续计划与实现必须迁回主分支工作区执行，不继续在 `.worktrees/opencode-codex-account-switcher-split` 中开发。
+11. Codex / OpenAI 独立包走完整首发链路：fresh 验证、初始 git commit、GitHub repo、npm publish、Trusted Publisher、tag push 与 GitHub Release。
+12. Root `opencode-copilot-account-switcher` 不随 Codex / OpenAI 独立包首发发布。
+13. 本轮不推送 `split/opencode-codex-account-switcher` 或任何其他非主分支。
+14. 规格审查通过后，后续计划与实现必须迁回主分支工作区执行，不继续在 `.worktrees/opencode-codex-account-switcher-split` 中开发。
 
 ## 目标
 
-1. 新建可独立构建、测试和打包的 `opencode-codex-account-switcher` 包。
+1. 新建可独立构建、测试、打包和发布的 `opencode-openai-account-switcher` 包。
 2. 迁移 Codex 运行时：账号 store、auth source、status fetcher、status command、invalid account recovery、network retry、retry policy、menu adapter、upstream loader adapter 与 upstream snapshot。
 3. 迁移 Codex snapshot 同步脚本：`sync:codex-snapshot` 与 `check:codex-sync`。
 4. 迁移 `test/codex-*.test.js`，让 Codex 行为在新包内独立验证。
@@ -41,7 +42,7 @@
 
 ## 非目标
 
-1. 不在本轮发布任何 release。
+1. 不发布 root `opencode-copilot-account-switcher`。
 2. 不推送非主分支。
 3. 不把 Copilot 功能拆成多个用户可见插件。
 4. 不抽取新的共享库。
@@ -55,7 +56,7 @@
 
 ### Codex 包
 
-安装并启用 `opencode-codex-account-switcher` 后，用户获得独立 Codex 账号切换插件：
+安装并启用 `opencode-openai-account-switcher` 后，用户获得独立 Codex 账号切换插件：
 
 1. 插件导出 `OpenAICodexAccountSwitcher`。
 2. 账号 provider 仍是 `openai`。
@@ -78,7 +79,7 @@
 
 ## 运行时边界
 
-### `opencode-codex-account-switcher` 拥有
+### `opencode-openai-account-switcher` 拥有
 
 1. `OpenAICodexAccountSwitcher` 插件入口。
 2. `openai` provider descriptor，逻辑 key 为 `codex`。
@@ -90,9 +91,9 @@
 8. Codex network retry 与 retry policy。
 9. Codex upstream loader adapter 与 committed upstream snapshot。
 10. Codex snapshot sync / check script。
-11. Codex tests、README 与未来 release notes。
+11. Codex tests、README、release notes、publishing 文档与 release workflow。
 
-### `opencode-codex-account-switcher` 不拥有
+### `opencode-openai-account-switcher` 不拥有
 
 1. Copilot auth loader。
 2. Copilot header rewrite、`x-initiator` 或 session repair。
@@ -146,24 +147,25 @@
 5. 不推送任何非主分支。
 6. 当前临时 split worktree / branch 在规格和计划迁回主分支、且不再需要后，应按用户确认的清理节奏删除；如存在对应远端非主分支，也必须删除。
 
-这些约束不构成发布授权。进入 `writing-plans` 或实现阶段仍不得创建 tag、不得发布 npm、不得创建 GitHub Release。
+这些约束不授权 root Copilot 包发布，也不授权推送非主分支。Codex / OpenAI 独立包的发布链路只面向 `opencode-openai-account-switcher@0.1.0`，发布前必须重新确认 npm/GitHub 可用性、fresh 验证证据和用户对外部发布动作的授权。
 
 ## 命名约定
 
 为避免实现阶段混淆，本设计使用以下固定含义：
 
-1. `opencode-codex-account-switcher`：新的 Codex 独立 npm 包。
-2. `OpenAICodexAccountSwitcher`：Codex 包对外导出的 OpenCode 插件入口。
-3. `openai`：OpenCode auth 中的 provider ID，Codex 包只写这个 provider。
-4. `codex`：Codex 包内部逻辑 key、store namespace 与 menu/provider descriptor key。
-5. `opencode-copilot-account-switcher`：回迁后的 Copilot 专属 root 包，只导出 `CopilotAccountSwitcher`。
+1. `opencode-openai-account-switcher`：新的 OpenAI / Codex 独立 npm 包。
+2. `opencode-codex-account-switcher`：已被他人发布的旧候选名，本轮不再使用。
+3. `OpenAICodexAccountSwitcher`：Codex 包对外导出的 OpenCode 插件入口。
+4. `openai`：OpenCode auth 中的 provider ID，Codex 包只写这个 provider。
+5. `codex`：Codex 包内部逻辑 key、store namespace 与 menu/provider descriptor key。
+6. `opencode-copilot-account-switcher`：回迁后的 Copilot 专属 root 包，只导出 `CopilotAccountSwitcher`。
 
 ### Codex 包源码
 
 目标源码结构：
 
 ```text
-opencode-codex-account-switcher/
+opencode-openai-account-switcher/
   package.json
   tsconfig.json
   tsconfig.build.json
@@ -358,15 +360,14 @@ npm pack --dry-run --json
 
 ## Release 与发布约束
 
-本轮只完成拆分设计与后续实现计划，不发布 release。审查通过后进入 `writing-plans` 或实现阶段，也不构成 release、tag、npm publish 或 GitHub Release 授权。
-
-未来如果进入发布阶段，必须遵循仓库级 release 护栏：
+Codex / OpenAI 独立包首发必须遵循仓库级 release 护栏，并把以下动作作为同一条链路处理：
 
 1. GitHub Release 正文以 `docs/release-notes-template.md` 为唯一模板来源。
 2. Release 正文必须包含一句价值导语、`## 适合谁升级`、`## 你会看到的变化`、`## 升级方式`。
-3. `## 升级方式` 必须给出带明确版本号的命令，不能只写 `latest` 或裸包名。
-4. 发版前必须有 fresh 验证证据。
-5. 版本 bump、release commit、tag、push、npm publish 与 GitHub Release 是同一条完整链路。
+3. `## 升级方式` 必须给出明确版本命令：`opencode plugin opencode-openai-account-switcher@0.1.0 --force -g`。
+4. 发版前必须有 fresh `npm test`、`npm run typecheck`、`npm pack --dry-run --json` 和实际 tarball install/import smoke 证据。
+5. 独立包需要初始 git commit、GitHub repo `jiwangyihao/opencode-openai-account-switcher`、npm publish、Trusted Publisher、tag push 与 GitHub Release。
+6. Root `opencode-copilot-account-switcher` 不作为这次首发链路的一部分发布。
 
 ## 风险与缓解
 
@@ -404,7 +405,7 @@ npm pack --dry-run --json
 
 拆分完成时必须满足：
 
-1. `opencode-codex-account-switcher` 可独立构建、typecheck、测试和 pack。
+1. `opencode-openai-account-switcher` 可独立构建、typecheck、测试、pack 和发布。
 2. `OpenAICodexAccountSwitcher` 只从 Codex 包导出。
 3. Codex 包保留账号、status、retry、upstream snapshot、store compatibility 和 sync script 行为。
 4. Codex 包不包含 Copilot routing/header rewrite/model-account 语义。
@@ -413,6 +414,8 @@ npm pack --dry-run --json
 7. Root Copilot 包源码、`dist/` 与 pack 清单不包含 Codex 家族 artifacts。
 8. Root Copilot 包现有 Copilot 行为测试继续通过。
 9. 实现前已确认主工作区位于 `master`，工作区 clean，且远端只保留主分支。
-10. 未发布 release，未创建 tag，未发布 npm，未创建 GitHub Release，未推送非主分支。
-11. 临时 split worktree / branch 已按用户确认的清理节奏处理，且没有遗留远端非主分支。
-12. 所有新增或变更文档无占位符、无互相矛盾的范围描述。
+10. Codex / OpenAI 独立包 release notes、publishing 文档和 release workflow 已随包提交。
+11. Codex / OpenAI 独立包 npm publish、tag push 与 GitHub Release 已完成并验证远端状态，或在缺少明确发布授权时停在可审查的本地待发布状态。
+12. Root Copilot 包未发布，且未推送任何非主分支。
+13. 临时 split worktree / branch 已按用户确认的清理节奏处理，且没有遗留远端非主分支。
+14. 所有新增或变更文档无占位符、无互相矛盾的范围描述。

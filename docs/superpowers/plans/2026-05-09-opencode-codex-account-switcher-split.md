@@ -1,12 +1,12 @@
-# opencode-codex-account-switcher 拆分实现计划
+# opencode-openai-account-switcher 拆分与首发实现计划
 
 > **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。所有新启动的子代理提示词必须超过 2000 字，并包含本计划与规格的完整路径。
 
-**目标：** 将 Codex / OpenAI 账号切换能力从 `opencode-copilot-account-switcher` 拆成独立包 `opencode-codex-account-switcher`，并把当前 root 包回迁为 Copilot-only。
+**目标：** 将 Codex / OpenAI 账号切换能力从 `opencode-copilot-account-switcher` 拆成独立包 `opencode-openai-account-switcher@0.1.0`，把当前 root 包回迁为 Copilot-only，并为 Codex / OpenAI 独立包补齐首发发布链路。
 
-**架构：** 新 Codex 包拥有 `OpenAICodexAccountSwitcher`、`openai` provider、Codex store、status、retry、upstream snapshot、菜单和 snapshot sync；root Copilot 包删除 Codex export、provider wiring、hook 分支、tests、scripts 与打包产物。首轮不抽 shared-core，必要的稳定公共运行时代码按最小集合复制到 Codex 包；Codex 菜单直接移除微信相关动作。
+**架构：** 新 Codex / OpenAI 包拥有 `OpenAICodexAccountSwitcher`、`openai` provider、Codex store、status、retry、upstream snapshot、菜单和 snapshot sync；root Copilot 包删除 Codex export、provider wiring、hook 分支、tests、scripts 与打包产物。首轮不抽 shared-core，必要的稳定公共运行时代码按最小集合复制到 Codex 包；Codex 菜单直接移除微信相关动作。首发链路只发布 `opencode-openai-account-switcher@0.1.0`，不发布 root Copilot 包。
 
-**技术栈：** TypeScript、Node.js 24、ESM、`@opencode-ai/plugin`、`@opencode-ai/sdk`、Node test runner、npm pack dry-run、临时 tarball import smoke、PowerShell、Git（所有 git 命令必须设置 `$env:GIT_MASTER='1'`）。
+**技术栈：** TypeScript、Node.js 24、ESM、`@opencode-ai/plugin`、Node test runner、npm pack dry-run、临时 tarball import smoke、PowerShell、Git（所有 git 命令必须设置 `$env:GIT_MASTER='1'`）、npm publish、npm Trusted Publisher、GitHub CLI。
 
 ---
 
@@ -16,17 +16,20 @@
 - 计划：`C:\Users\34404\Documents\GitHub\opencode-copilot-analysis\copilot-account-switcher\docs\superpowers\plans\2026-05-09-opencode-codex-account-switcher-split.md`
 - 主工作区：`C:\Users\34404\Documents\GitHub\opencode-copilot-analysis\copilot-account-switcher`
 - 新 Codex 包目录：`C:\Users\34404\Documents\GitHub\opencode-codex-account-switcher`
+- 新 npm 包名：`opencode-openai-account-switcher`
+- 旧候选包名：`opencode-codex-account-switcher`，已被他人发布且当前 npm 用户不是 maintainer，本轮不再使用。
 - 临时 split worktree：`C:\Users\34404\Documents\GitHub\opencode-copilot-analysis\copilot-account-switcher\.worktrees\opencode-codex-account-switcher-split`，只作为已审查规格来源，不用于实现。
 
 ## 全局执行约束
 
 - 直接在主工作区的 `master` 上修改 root Copilot 包；不创建新的 worktree，不在现有 split worktree 中实现。
 - 新 Codex 包目录是普通 sibling 目录，不是当前仓库的 worktree。若目录已存在且非空，先读取内容并确认没有用户未整合工作，再继续。
-- 不推送非主分支，不创建 tag，不发布 npm，不创建 GitHub Release。
+- 不推送非主分支；root `opencode-copilot-account-switcher` 仅保留本地拆分与文档提交，任何 root 发版动作都排除在 Codex / OpenAI 首发链路之外。
+- Codex / OpenAI 独立包 `opencode-openai-account-switcher@0.1.0` 需要在 fresh 验证后执行首发链路：初始化 git、创建 GitHub repo、发布 npm、配置 Trusted Publisher、推送 tag、创建并验证 GitHub Release。执行外部发布动作前必须确认用户授权。
 - 写实现前先运行：`$env:GIT_MASTER='1'; git status --short --branch` 与 `$env:GIT_MASTER='1'; git ls-remote --heads origin`，确认 root 在 `master...origin/master` 且远端只有 `refs/heads/master`。
-- 当前用户尚未单独授权创建 git commit。计划中的提交检查点只在本轮后续获得明确提交授权时执行；未授权时只完成文件修改和验证，不运行 `git commit`。
+- 用户已授权本地 commit；push、npm publish、tag 和 GitHub Release 属于外部发布动作，执行前需要再次确认授权。
 - 每个行为变更按 TDD：先写或翻转测试，运行确认失败，再写最小实现，最后运行 targeted 测试和相关 build/typecheck。
-- 每个新启动的子代理必须收到完整规格路径、完整计划路径、当前任务编号、工作目录、禁止 release / 非主分支 push / worktree 实现的约束，并且提示词超过 2000 字。
+- 每个新启动的子代理必须收到完整规格路径、完整计划路径、当前任务编号、工作目录、禁止 root release、禁止非主分支 push、禁止未经授权执行外部发布动作和禁止 worktree 实现的约束，并且提示词超过 2000 字。
 - 子代理完成任务后，父会话必须检查 diff、运行对应验证，再进入下一任务。
 - 所有 pack 边界验证必须先 `npm run build` 触发 clean-dist，再执行 `npm pack --dry-run --json`，解析第一个结果的 `files[].path`。
 - Windows WeChat real-host gate 若出现 `AttachConsole failed`，按既有环境 caveat 记录 fresh 输出；Codex 自身迁移测试不能依赖该 gate。
@@ -49,7 +52,12 @@
 - 复制并精简最小公共运行时：`src\store-paths.ts`、`src\common-settings-store.ts`、`src\common-settings-actions.ts`、`src\menu-runtime.ts`、`src\ui\menu.ts`、`src\ui\select.ts`、`src\ui\ansi.ts`、`src\ui\confirm.ts`；新建 Codex-only `src\auth-store.ts`，只提供 `readAuth()` 与 `AccountEntry`。不得复制 root `src\store.ts` 到 Codex 包，因为它读写 `copilot-accounts.json`；复制后删除 Codex 包中无法触达的 Copilot / WeChat 分支，只保留 Codex 需要的公共 settings、auth 读取、菜单渲染、删除确认与选择器。
 - 迁入测试：`test\codex-auth-source.test.js`、`test\codex-invalid-account.test.js`、`test\codex-loader-adapter.test.js`、`test\codex-menu-adapter.test.js`、`test\codex-network-retry.test.js`、`test\codex-plugin-config.test.js`、`test\codex-status-command.test.js`、`test\codex-status-fetcher.test.js`、`test\codex-store.test.js`、`test\codex-sync.test.js`。
 - 创建：`test\index-exports.test.js`、`test\package-boundary.test.js` 和 Codex-only `test\menu.test.js`。
-- 创建：`README.md`：Codex 独立包说明，不包含发布步骤。
+- 创建：`README.md`：Codex / OpenAI 独立包说明，包含明确版本号安装命令和发布资料入口。
+- 创建：`docs\release-notes-template.md`：Codex / OpenAI 独立包 GitHub Release 正文模板。
+- 创建：`docs\release-notes-v0.1.0.md`：首发 GitHub Release 正文。
+- 创建：`docs\publishing.md`：fresh 验证、npm publish、Trusted Publisher、GitHub Release、部分失败恢复流程。
+- 创建：`.github\workflows\release.yml`：GitHub Release published 触发的 npm Trusted Publishing workflow。
+- 创建：`.gitignore`：排除 `node_modules/`、`dist/` 和临时 `.tgz`。
 - 复制：`LICENSE`：沿用 root 包 MPL-2.0 授权文本。
 
 ### Root Copilot 包
@@ -114,7 +122,7 @@ if (Test-Path -LiteralPath $target) {
 
 ```json
 {
-  "name": "opencode-codex-account-switcher",
+  "name": "opencode-openai-account-switcher",
   "version": "0.1.0",
   "description": "OpenAI Codex account switcher plugin for OpenCode",
   "type": "module",
@@ -533,7 +541,7 @@ npm run typecheck
 在 `test/package-boundary.test.js` 增加实际 `npm pack --json`、临时目录 `npm install <tarball>`、`node smoke.mjs` 的 smoke。`smoke.mjs` 内容必须验证：
 
 ```js
-import * as pkg from "opencode-codex-account-switcher"
+import * as pkg from "opencode-openai-account-switcher"
 if (typeof pkg.OpenAICodexAccountSwitcher !== "function") throw new Error("missing codex export")
 if ("CopilotAccountSwitcher" in pkg) throw new Error("unexpected copilot export")
 ```
@@ -542,10 +550,10 @@ if ("CopilotAccountSwitcher" in pkg) throw new Error("unexpected copilot export"
 
 - [ ] **步骤 2：写 README 最小使用说明**
 
-`README.md` 必须包含：包名、用途、导出入口、不会包含微信动作、当前任务不发布 release。确认 `LICENSE` 已复制到 Codex 包根目录，因为 `package.json` 的 `files` 白名单会把它作为必需文件打包。示例导入：
+`README.md` 必须包含：包名、用途、明确版本号安装命令、导出入口、不会包含微信动作、发布资料入口。确认 `LICENSE` 已复制到 Codex 包根目录，因为 `package.json` 的 `files` 白名单会把它作为必需文件打包。示例导入：
 
 ```md
-import { OpenAICodexAccountSwitcher } from "opencode-codex-account-switcher"
+import { OpenAICodexAccountSwitcher } from "opencode-openai-account-switcher"
 ```
 
 - [ ] **步骤 3：运行 Codex 包完整验证**
@@ -848,20 +856,24 @@ if ($smokeExitCode -ne 0) { throw "Codex tarball smoke failed with exit code $sm
 
 - [ ] **步骤 1：更新 root README 边界说明**
 
-Root README 中若存在 Codex / OpenAI 账号切换用法，改为指向新包 `opencode-codex-account-switcher`。root README 继续只描述 Copilot 能力、微信尚未拆分能力，以及 wait / notify / loop-safety 独立插件关系。
+Root README 中若存在 Codex / OpenAI 账号切换用法，改为指向新包 `opencode-openai-account-switcher`。root README 继续只描述 Copilot 能力、微信尚未拆分能力，以及 wait / notify / loop-safety 独立插件关系。不要暗示 root Copilot 包随 Codex / OpenAI 独立包首发发布。
 
 - [ ] **步骤 2：补齐 Codex README**
 
 Codex README 至少包含：
 
 ```text
-# opencode-codex-account-switcher
+# opencode-openai-account-switcher
 
-OpenAI Codex account switcher plugin for OpenCode.
+OpenAI / Codex account switcher plugin for OpenCode.
+
+## Install
+
+    opencode plugin opencode-openai-account-switcher@0.1.0 --force -g
 
 ## Usage
 
-    import { OpenAICodexAccountSwitcher } from "opencode-codex-account-switcher"
+    import { OpenAICodexAccountSwitcher } from "opencode-openai-account-switcher"
 
 ## Scope
 
@@ -906,12 +918,67 @@ Set-Location "C:\Users\34404\Documents\GitHub\opencode-codex-account-switcher"
 Get-ChildItem -LiteralPath . -Force | Select-Object Name
 ```
 
-预期：root 仅包含本次拆分相关文件变更；新 Codex 包目录结构完整；无 release、tag、npm publish、GitHub Release、非主分支 push。
+预期：root 仅包含本次拆分相关文件变更；新 Codex 包目录结构完整；root 未 release、未 tag、未 npm publish、未 GitHub Release，且没有非主分支 push。
+
+## 任务 9：Codex / OpenAI 独立包首发链路
+
+**文件与远端：**
+- 操作：`C:\Users\34404\Documents\GitHub\opencode-codex-account-switcher`
+- 操作：GitHub repo `jiwangyihao/opencode-openai-account-switcher`
+- 操作：npm package `opencode-openai-account-switcher@0.1.0`
+
+- [ ] **步骤 1：首发前 fresh 验证**
+
+```powershell
+Set-Location "C:\Users\34404\Documents\GitHub\opencode-codex-account-switcher"
+npm run build
+npm run typecheck
+npm test
+npm pack --dry-run --json
+npm view opencode-openai-account-switcher@0.1.0 version --json
+```
+
+预期：前三类验证退出码为 0；pack 清单包含 Codex runtime、upstream snapshot 和 sync script，不包含 Copilot、WeChat、Loop Safety、wait、notify；`npm view` 在首发前返回 404。如果版本已存在，停止并重新确认版本策略。
+
+- [ ] **步骤 2：驱动实际 tarball install/import surface**
+
+必须重新执行实际 tarball 安装 smoke，导入包名为 `opencode-openai-account-switcher`，并断言只导出 `OpenAICodexAccountSwitcher`、不导出 `CopilotAccountSwitcher`。
+
+- [ ] **步骤 3：本地初始提交**
+
+```powershell
+$env:GIT_MASTER = "1"
+git init
+git branch -M master
+git add .
+git commit -m "feat(openai): 初始化 Codex 账号切换独立包"
+```
+
+预期：提交只包含 Codex / OpenAI 独立包源码、测试、README、release notes、publishing 文档、workflow 和 lockfile。
+
+- [ ] **步骤 4：外部发布链路**
+
+在用户确认允许外部发布后执行：
+
+```powershell
+gh repo create jiwangyihao/opencode-openai-account-switcher --public --source . --remote origin --push
+npm whoami
+npm publish --access public
+npm view opencode-openai-account-switcher@0.1.0 version --json
+npm exec --package npm@11 -- npm trust github opencode-openai-account-switcher --file release.yml --repo jiwangyihao/opencode-openai-account-switcher --yes
+npm exec --package npm@11 -- npm trust list opencode-openai-account-switcher --json
+$env:GIT_MASTER = "1"; git tag v0.1.0
+$env:GIT_MASTER = "1"; git push origin v0.1.0
+gh release create v0.1.0 --repo jiwangyihao/opencode-openai-account-switcher --target master --title "v0.1.0" --notes-file docs/release-notes-v0.1.0.md
+gh release view v0.1.0 --repo jiwangyihao/opencode-openai-account-switcher --json tagName,publishedAt,isDraft,isPrerelease,body
+```
+
+预期：npm 远端 version 返回 `"0.1.0"`；Trusted Publisher 指向 `jiwangyihao/opencode-openai-account-switcher` 和 `release.yml`；GitHub Release 已发布、非 draft、非 prerelease，正文包含三个必需章节和明确版本号安装命令。
 
 ## 审查门禁与 notify 报告
 
 - 进入实现前、关键实现任务完成后、最终交付前，都要并行启动 3-5 个只读 review 子代理。至少覆盖架构边界、测试与 pack、流程约束、文档清晰度。
-- 每个新 review 子代理提示词必须超过 2000 字，并包含完整规格路径、完整计划路径、审查范围、禁止编辑、禁止 commit、禁止 release、禁止非主分支 push、禁止 worktree 实现等约束。
+- 每个新 review 子代理提示词必须超过 2000 字，并包含完整规格路径、完整计划路径、审查范围、禁止编辑、禁止 commit、禁止 root release、禁止未经授权执行外部发布动作、禁止非主分支 push、禁止 worktree 实现等约束。
 - Review 子代理只读审查，不得修改文件，不得运行破坏性命令，不得创建 commit。
 - 如果任一 review 子代理 FAIL，父会话先修复计划或实现，再对失败维度重新发起复审。
 - 全部 review 子代理 PASS 后，父会话可以自动进入下一阶段，无需再次询问用户。
@@ -923,19 +990,20 @@ Get-ChildItem -LiteralPath . -Force | Select-Object Name
 1. 子代理 A：任务 1-4，新 Codex 包骨架、runtime、plugin、pack smoke。
 2. 子代理 B：任务 5-6，root Copilot 包红灯测试和回迁实现。
 3. 子代理 C：任务 7，双包验证与 pack/import smoke。
-4. 子代理 D：任务 8，README、临时 worktree 清理准备和交接检查。
+4. 子代理 D：任务 8，README、发布资料、临时 worktree 清理准备和交接检查。
+5. 父会话：任务 9，外部发布链路必须由父会话在获得用户确认后执行。
 
-每个新子代理提示词必须包括本规格与计划完整路径、任务编号、禁止 release、禁止非主分支 push、直接在主工作区修改 root、不得使用 worktree 实现、新包目录不是 worktree、以及该子代理负责的精确文件清单。提示词长度必须超过 2000 字。子代理不得创建 commit，除非父会话已经获得用户明确提交授权。
+每个新子代理提示词必须包括本规格与计划完整路径、任务编号、禁止 root release、禁止未经授权执行外部发布动作、禁止非主分支 push、直接在主工作区修改 root、不得使用 worktree 实现、新包目录不是 worktree、以及该子代理负责的精确文件清单。提示词长度必须超过 2000 字。子代理不得创建 commit，除非父会话已经获得用户明确提交授权。
 
 ## 自检清单
 
-- [ ] 规格中的每个目标都有对应任务：Codex 包创建、Codex runtime 迁入、Codex tests 迁入、root 回迁、pack 边界、import smoke、无 release / 无非主分支 push。
+- [ ] 规格中的每个目标都有对应任务：Codex 包创建、Codex runtime 迁入、Codex tests 迁入、root 回迁、pack 边界、import smoke、Codex / OpenAI 独立包首发链路、root 不发布、无非主分支 push。
 - [ ] 每个任务都有精确文件路径。
 - [ ] 每个行为变更都有先红后绿的测试步骤。
 - [ ] Pack 验证都要求先 fresh `npm run build`，再解析 `npm pack --dry-run --json` 的 `files[].path`。
 - [ ] Codex 包移除微信功能有明确测试和源码负向断言。
 - [ ] Root 包移除 Codex export 有 public import negative smoke。
-- [ ] 计划中没有未决标记、矛盾范围或 release 授权。
+- [ ] 计划中没有未决标记、矛盾范围或把 root Copilot 包误纳入 Codex / OpenAI 首发链路的描述。
 
 
 

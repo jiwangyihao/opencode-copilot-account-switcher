@@ -38,9 +38,9 @@
 
 ## 包边界说明
 
-本包现在只描述和承载 GitHub Copilot 账号切换能力。如果你需要 OpenAI Codex / `openai` provider 的账号切换，请使用独立包 `opencode-codex-account-switcher`；它的 public entry 导出 `OpenAICodexAccountSwitcher`，并拥有 Codex store、status、retry、upstream snapshot 与 snapshot sync。
+本包现在只描述和承载 GitHub Copilot 账号切换能力。如果你需要 OpenAI Codex / `openai` provider 的账号切换，请使用独立包 `opencode-openai-account-switcher`；它的 public entry 导出 `OpenAICodexAccountSwitcher`，并拥有 Codex store、status、retry、upstream snapshot 与 snapshot sync。
 
-`opencode-codex-account-switcher` 不包含 GitHub Copilot routing、header rewrite、模型账号映射或微信绑定动作。本次拆分只完成代码与打包边界，不代表已经发布新的 npm 版本、Git tag 或 GitHub Release。
+`opencode-openai-account-switcher` 不包含 GitHub Copilot routing、header rewrite、模型账号映射或微信绑定动作。它的独立发布链路应包含 fresh 验证、npm publish、tag push 与 GitHub Release；root Copilot 包不随这条链路发布。
 
 ## 微信通知功能
 
@@ -292,9 +292,9 @@ Default behavior and optional switches:
 
 ## Package Boundary
 
-This package now documents and owns GitHub Copilot account switching only. OpenAI Codex / `openai` provider account switching belongs to the standalone `opencode-codex-account-switcher` package, whose public entry exports `OpenAICodexAccountSwitcher` and owns the Codex store, status command, retry policy, upstream snapshot, and snapshot sync script.
+This package now documents and owns GitHub Copilot account switching only. OpenAI Codex / `openai` provider account switching belongs to the standalone `opencode-openai-account-switcher` package, whose public entry exports `OpenAICodexAccountSwitcher` and owns the Codex store, status command, retry policy, upstream snapshot, and snapshot sync script.
 
-`opencode-codex-account-switcher` does not include GitHub Copilot routing, header rewrite, model-account assignments, or WeChat binding actions. This split only establishes the code and package boundary; it does not publish a new npm version, Git tag, or GitHub Release.
+`opencode-openai-account-switcher` does not include GitHub Copilot routing, header rewrite, model-account assignments, or WeChat binding actions. Its standalone release chain should include fresh verification, npm publish, tag push, and a GitHub Release; the root Copilot package is not released as part of that chain.
 
 ## WeChat Notifications
 
