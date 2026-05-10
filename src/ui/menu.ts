@@ -59,7 +59,7 @@ export type MenuAction =
 
 export type MenuLanguage = "zh" | "en"
 
-export type MenuProvider = "copilot" | "codex"
+export type MenuProvider = "copilot"
 
 export type MenuWechatPrimaryBinding = {
   accountId: string
@@ -108,21 +108,7 @@ type MenuCapabilities = {
   wechatNotificationsMenu: boolean
 }
 
-function defaultMenuCapabilities(provider: MenuProvider): MenuCapabilities {
-  if (provider === "codex") {
-    return {
-      importAuth: false,
-      quota: true,
-      refreshIdentity: false,
-      checkModels: false,
-      defaultAccountGroup: false,
-      assignModels: false,
-      experimentalSlashCommands: true,
-      networkRetry: true,
-      syntheticAgentInitiator: false,
-      wechatNotificationsMenu: true,
-    }
-  }
+function defaultMenuCapabilities(): MenuCapabilities {
   return {
     importAuth: true,
     quota: true,
@@ -137,102 +123,7 @@ function defaultMenuCapabilities(provider: MenuProvider): MenuCapabilities {
   }
 }
 
-export function getMenuCopy(language: MenuLanguage = "zh", provider: MenuProvider = "copilot") {
-  if (provider === "codex") {
-    if (language === "en") {
-      return {
-        menuTitle: "OpenAI Codex accounts",
-        menuSubtitle: "Select an action or account",
-        switchLanguageLabel: "切换到中文",
-        actionsHeading: "Actions",
-        commonSettingsHeading: "Common settings",
-        providerSettingsHeading: "Provider settings",
-        addAccount: "Add account",
-        addAccountHint: "OpenAI OAuth login",
-        importAuth: "Import from auth.json",
-        checkQuotas: "Refresh snapshots",
-        refreshIdentity: "Sync account identity",
-        checkModels: "Sync available models",
-        defaultAccountGroup: "Default account group",
-        assignModels: "Assign account groups per model",
-        autoRefreshOn: "Auto refresh: On",
-        autoRefreshOff: "Auto refresh: Off",
-        setRefresh: "Set refresh interval",
-        experimentalSlashCommandsOn: "Experimental slash commands: On",
-        experimentalSlashCommandsOff: "Experimental slash commands: Off",
-        experimentalSlashCommandsHint: "Experimental provider-specific slash commands",
-        retryOn: "Network Retry: On",
-        retryOff: "Network Retry: Off",
-        retryHint: "Helps recover some requests after retries or malformed responses",
-        syntheticInitiatorOn: "Send synthetic messages as agent: On",
-        syntheticInitiatorOff: "Send synthetic messages as agent: Off",
-        syntheticInitiatorHint: "Changes upstream behavior; misuse may increase billing risk or trigger abuse signals",
-         wechatNotificationsHeading: "WeChat notifications",
-         wechatBind: "Bind / Rebind WeChat",
-         wechatExportDebugBundle: "Export WeChat debug bundle",
-         wechatDebugBundleModeTitle: "Choose debug bundle type",
-         wechatDebugBundleSanitized: "Sanitized bundle",
-         wechatDebugBundleFull: "Full bundle",
-         wechatNotificationsOn: "WeChat notifications: On",
-         wechatNotificationsOff: "WeChat notifications: Off",
-         wechatQuestionNotifyOn: "Question notifications: On",
-        wechatQuestionNotifyOff: "Question notifications: Off",
-        wechatPermissionNotifyOn: "Permission notifications: On",
-        wechatPermissionNotifyOff: "Permission notifications: Off",
-        wechatSessionErrorNotifyOn: "Session error notifications: On",
-        wechatSessionErrorNotifyOff: "Session error notifications: Off",
-        accountsHeading: "Accounts",
-        dangerHeading: "Danger zone",
-        removeAll: "Remove all accounts",
-      }
-    }
-    return {
-      menuTitle: "OpenAI Codex 账号",
-      menuSubtitle: "请选择操作或账号",
-      switchLanguageLabel: "Switch to English",
-      actionsHeading: "操作",
-      commonSettingsHeading: "通用设置",
-      providerSettingsHeading: "Provider 专属设置",
-      addAccount: "添加账号",
-      addAccountHint: "OpenAI OAuth 登录",
-      importAuth: "从 auth.json 导入",
-      checkQuotas: "刷新快照",
-      refreshIdentity: "同步账号身份信息",
-      checkModels: "同步可用模型列表",
-      defaultAccountGroup: "配置默认账号组",
-      assignModels: "为模型配置账号组",
-      autoRefreshOn: "自动刷新：已开启",
-      autoRefreshOff: "自动刷新：已关闭",
-      setRefresh: "设置刷新间隔",
-      experimentalSlashCommandsOn: "实验性 Slash Commands：已开启",
-      experimentalSlashCommandsOff: "实验性 Slash Commands：已关闭",
-      experimentalSlashCommandsHint: "当前 provider 的实验性 Slash Commands 开关",
-      retryOn: "Network Retry：已开启",
-      retryOff: "Network Retry：已关闭",
-      retryHint: "请求异常时可自动重试并修复部分请求",
-      syntheticInitiatorOn: "synthetic 消息按 agent 身份发送：已开启",
-      syntheticInitiatorOff: "synthetic 消息按 agent 身份发送：已关闭",
-      syntheticInitiatorHint: "会改变与 upstream 的默认行为；误用可能带来异常计费或 abuse 风险",
-       wechatNotificationsHeading: "微信通知",
-       wechatBind: "绑定 / 重绑微信",
-       wechatExportDebugBundle: "导出微信调试包",
-       wechatDebugBundleModeTitle: "选择调试包类型",
-       wechatDebugBundleSanitized: "脱敏包",
-       wechatDebugBundleFull: "完整包",
-       wechatNotificationsOn: "微信通知总开关：已开启",
-       wechatNotificationsOff: "微信通知总开关：已关闭",
-       wechatQuestionNotifyOn: "问题通知：已开启",
-      wechatQuestionNotifyOff: "问题通知：已关闭",
-      wechatPermissionNotifyOn: "权限通知：已开启",
-      wechatPermissionNotifyOff: "权限通知：已关闭",
-      wechatSessionErrorNotifyOn: "会话错误通知：已开启",
-      wechatSessionErrorNotifyOff: "会话错误通知：已关闭",
-      accountsHeading: "账号",
-      dangerHeading: "危险操作",
-      removeAll: "删除全部账号",
-    }
-  }
-
+export function getMenuCopy(language: MenuLanguage = "zh") {
   if (language === "en") {
     return {
       menuTitle: "GitHub Copilot accounts",
@@ -369,18 +260,10 @@ export function buildMenuItems(input: {
   capabilities?: Partial<MenuCapabilities>
   language?: MenuLanguage
 }): MenuItem<MenuAction>[] {
-  const provider = input.provider ?? "copilot"
-  const copy = getMenuCopy(input.language, provider)
+  const copy = getMenuCopy(input.language)
   const capabilities = {
-    ...defaultMenuCapabilities(provider),
+    ...defaultMenuCapabilities(),
     ...input.capabilities,
-  }
-  if (provider === "codex") {
-    capabilities.refreshIdentity = false
-    capabilities.checkModels = false
-    capabilities.defaultAccountGroup = false
-    capabilities.assignModels = false
-    capabilities.syntheticAgentInitiator = false
   }
   const quotaHint = input.lastQuotaRefresh ? `last ${formatRelativeTime(input.lastQuotaRefresh)}` : undefined
   const experimentalSlashCommandsEnabled = input.experimentalSlashCommandsEnabled !== false
@@ -481,7 +364,7 @@ export function buildMenuItems(input: {
         ? ` ${ANSI.dim}[${format(account.quota.premium)}|${format(account.quota.chat)}|${format(account.quota.completions)}]${ANSI.reset}`
         : ""
       const numbered = `${account.index + 1}. ${account.name}`
-      const label = `${numbered}${currentBadge}${statusBadge ? " " + statusBadge : ""}${quotaBadge}`
+      const label = `${numbered}${currentBadge}${statusBadge ? ` ${statusBadge}` : ""}${quotaBadge}`
       const detail = [
         account.workspaceName,
         account.lastUsed ? formatRelativeTime(account.lastUsed) : undefined,
@@ -680,7 +563,7 @@ export async function showMenuWithDeps(
 
   while (true) {
     const provider = input.provider ?? "copilot"
-    const copy = getMenuCopy(currentLanguage, provider)
+    const copy = getMenuCopy(currentLanguage)
     const items = buildMenuItems({
       provider,
       accounts,
@@ -716,7 +599,7 @@ export async function showMenuWithDeps(
       ])
 
       const capabilities = {
-        ...defaultMenuCapabilities(provider),
+        ...defaultMenuCapabilities(),
         ...input.capabilities,
       }
 
@@ -795,7 +678,7 @@ export async function showAccountActions(account: AccountInfo, input: {
 } = {}): Promise<"switch" | "remove" | "back"> {
   const provider = input.provider ?? "copilot"
   const badge = getStatusBadge(account.status)
-  const header = `${account.name}${badge ? " " + badge : ""}`
+  const header = `${account.name}${badge ? ` ${badge}` : ""}`
   const info = [
     `Added: ${formatDate(account.addedAt)} | Last used: ${formatRelativeTime(account.lastUsed)}`,
     account.plan ? `Plan: ${account.plan}` : undefined,
