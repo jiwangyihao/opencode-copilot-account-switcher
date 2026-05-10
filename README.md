@@ -36,6 +36,12 @@
 - **`/copilot-status`** — 默认开启；实验性 slash command，会先弹出“正在拉取”toast，再弹出 quota 结果或错误 toast
 - **无需模型配置** — 使用官方 provider，无需改模型
 
+## 包边界说明
+
+本包现在只描述和承载 GitHub Copilot 账号切换能力。如果你需要 OpenAI Codex / `openai` provider 的账号切换，请使用独立包 `opencode-codex-account-switcher`；它的 public entry 导出 `OpenAICodexAccountSwitcher`，并拥有 Codex store、status、retry、upstream snapshot 与 snapshot sync。
+
+`opencode-codex-account-switcher` 不包含 GitHub Copilot routing、header rewrite、模型账号映射或微信绑定动作。本次拆分只完成代码与打包边界，不代表已经发布新的 npm 版本、Git tag 或 GitHub Release。
+
 ## 微信通知功能
 
 微信通知现在会覆盖 5 类常见场景。你看到通知时，可以先判断它是不是可回复入口，再决定是直接在微信里继续，还是回到电脑端处理。
@@ -283,6 +289,12 @@ Default behavior and optional switches:
 - **Synthetic Agent Initiator** — optional and off by default; experimental switch that diverges from stable upstream behavior, sends or overrides `x-initiator=agent`, and carries billing/abuse risk
 - **`/copilot-status`** — enabled by default; experimental slash command that shows a loading toast first and then a quota result or error toast
 - **Zero model config** — no model changes required (official provider only)
+
+## Package Boundary
+
+This package now documents and owns GitHub Copilot account switching only. OpenAI Codex / `openai` provider account switching belongs to the standalone `opencode-codex-account-switcher` package, whose public entry exports `OpenAICodexAccountSwitcher` and owns the Codex store, status command, retry policy, upstream snapshot, and snapshot sync script.
+
+`opencode-codex-account-switcher` does not include GitHub Copilot routing, header rewrite, model-account assignments, or WeChat binding actions. This split only establishes the code and package boundary; it does not publish a new npm version, Git tag, or GitHub Release.
 
 ## WeChat Notifications
 
