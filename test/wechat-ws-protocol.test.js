@@ -1,7 +1,7 @@
-import test, { after } from "node:test"
 import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import path from "node:path"
+import test, { after } from "node:test"
 import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
 const isolatedWechatStateRoot = await setupIsolatedWechatStateRoot("wechat-ws-protocol-")
@@ -142,11 +142,13 @@ test("default npm test: 新 WS 模型下完整测试集可以自然结束", asyn
 
   assert.equal(typeof packageJson.scripts?.test, "string")
   assert.equal(typeof packageJson.scripts?.["test:serial:wechat-ws-core"], "string")
+  assert.equal(typeof packageJson.scripts?.["test:serial:wechat-openclaw-task3"], "string")
   assert.equal(typeof packageJson.scripts?.["test:parallel:shard"], "string")
 
   assert.match(packageJson.scripts.test, /npm run test:serial:wechat-status-flow:early/)
   assert.match(packageJson.scripts.test, /npm run test:serial:wechat-ws-core/)
   assert.match(packageJson.scripts.test, /npm run test:serial:wechat-notification-flow/)
+  assert.match(packageJson.scripts.test, /npm run test:serial:wechat-openclaw-task3/)
   assert.match(packageJson.scripts.test, /npm run test:serial:wechat-status-flow:late/)
   assert.match(packageJson.scripts.test, /npm run test:parallel:shard/)
   assert.doesNotMatch(packageJson.scripts.test, /--watch/)
@@ -154,5 +156,7 @@ test("default npm test: 新 WS 模型下完整测试集可以自然结束", asyn
   assert.match(packageJson.scripts["test:serial:wechat-ws-core"], /test\/wechat-ws-protocol\.test\.js/)
   assert.match(packageJson.scripts["test:serial:wechat-ws-core"], /test\/wechat-broker-state-store\.test\.js/)
   assert.match(packageJson.scripts["test:serial:wechat-ws-core"], /test\/wechat-broker-ws-lifecycle\.test\.js/)
+  assert.match(packageJson.scripts["test:serial:wechat-openclaw-task3"], /test\/wechat-openclaw-task3\.test\.js/)
+  assert.doesNotMatch(packageJson.scripts["test:parallel:shard"], /test\/wechat-openclaw-task3\.test\.js/)
   assert.match(packageJson.scripts["test:parallel:shard"], /test\/wechat-plugin-hooks-status\.test\.js/)
 })
