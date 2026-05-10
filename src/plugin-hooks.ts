@@ -4,7 +4,6 @@ import type { Hooks } from "@opencode-ai/plugin"
 import { createHash } from "node:crypto"
 import { OpencodeClient as OpencodeV2Client } from "@opencode-ai/sdk/v2/client"
 import { COPILOT_PROVIDER_DESCRIPTOR } from "./providers/descriptor.js"
-import { CODEX_PROVIDER_DESCRIPTOR } from "./providers/descriptor.js"
 import {
   createCopilotRetryingFetch,
   cleanupLongIdsForAccountSwitch,
@@ -13,7 +12,6 @@ import {
   type CopilotRetryContext,
   type FetchLike,
 } from "./copilot-network-retry.js"
-import { createCodexRetryingFetch } from "./codex-network-retry.js"
 import { createCopilotRetryNotifier } from "./copilot-retry-notifier.js"
 import { resolveCopilotModelAccounts, type ResolvedModelAccountCandidate } from "./model-account-map.js"
 import { normalizeDomain } from "./copilot-api-helpers.js"
@@ -26,14 +24,9 @@ import {
   type OfficialCopilotConfig,
   type OfficialChatHeadersHook,
 } from "./upstream/copilot-loader-adapter.js"
-import {
-  loadOfficialCodexConfig,
-  loadOfficialCodexChatHeaders,
-} from "./upstream/codex-loader-adapter.js"
 import type { CommonSettingsStore } from "./common-settings-store.js"
 import { refreshActiveAccountQuota, type RefreshActiveAccountQuotaResult } from "./active-account-quota.js"
 import { handleStatusCommand, showStatusToast } from "./status-command.js"
-import { handleCodexStatusCommand } from "./codex-status-command.js"
 import {
   handleCompactCommand,
   handleStopToolCommand,
@@ -88,7 +81,6 @@ type CopilotPluginHooksWithChatHeaders = CopilotPluginHooks & {
 }
 
 type StatusCommandHandler = typeof handleStatusCommand
-type CodexStatusCommandHandler = typeof handleCodexStatusCommand
 type CompactCommandHandler = typeof handleCompactCommand
 type StopToolCommandHandler = typeof handleStopToolCommand
 type RefreshQuota = (store: StoreFile) => Promise<RefreshActiveAccountQuotaResult>
@@ -337,10 +329,6 @@ type RetryStoreContext = {
 
 function isCopilotProviderID(providerID: string) {
   return COPILOT_PROVIDER_DESCRIPTOR.providerIDs.includes(providerID)
-}
-
-function isCodexProviderID(providerID: string) {
-  return CODEX_PROVIDER_DESCRIPTOR.providerIDs.includes(providerID)
 }
 
 type DebugPart = {
@@ -950,7 +938,6 @@ export function buildPluginHooks(input: {
   now?: () => number
   refreshQuota?: RefreshQuota
   handleStatusCommandImpl?: StatusCommandHandler
-  handleCodexStatusCommandImpl?: CodexStatusCommandHandler
   handleCompactCommandImpl?: CompactCommandHandler
   handleStopToolCommandImpl?: StopToolCommandHandler
   loadCandidateAccountLoads?: (input: {
@@ -968,14 +955,13 @@ export function buildPluginHooks(input: {
   touchWriteCacheIdleTtlMs?: number
   touchWriteCacheMaxEntries?: number
   random?: () => number
-  authLoaderMode?: "copilot" | "codex" | "none"
+  authLoaderMode?: "copilot" | "none"
   enableModelRouting?: boolean
 }): CopilotPluginHooksWithChatHeaders {
   const authProvider = input.auth.provider ?? COPILOT_PROVIDER_DESCRIPTOR.providerIDs[0] ?? "github-copilot"
   const authLoaderMode = input.authLoaderMode
-    ?? (isCopilotProviderID(authProvider) ? "copilot" : isCodexProviderID(authProvider) ? "codex" : "none")
+    ?? (isCopilotProviderID(authProvider) ? "copilot" : "none")
   const enableCopilotAuthLoader = authLoaderMode === "copilot"
-  const enableCodexAuthLoader = authLoaderMode === "codex"
   const enableModelRouting = input.enableModelRouting ?? enableCopilotAuthLoader
   const loadStore = input.loadStore ?? readStoreSafe
   const loadStoreSync = input.loadStoreSync ?? readStoreSafeSync
@@ -987,7 +973,6 @@ export function buildPluginHooks(input: {
   }
   const refreshQuota = input.refreshQuota ?? ((store: StoreFile) => refreshActiveAccountQuota({ store }))
   const handleStatusCommandImpl = input.handleStatusCommandImpl ?? handleStatusCommand
-  const handleCodexStatusCommandImpl = input.handleCodexStatusCommandImpl ?? handleCodexStatusCommand
   const handleCompactCommandImpl = input.handleCompactCommandImpl ?? handleCompactCommand
   const handleStopToolCommandImpl = input.handleStopToolCommandImpl ?? handleStopToolCommand
   const loadOfficialConfigForCopilot = (args: {
@@ -1001,33 +986,10 @@ export function buildPluginHooks(input: {
     }
     return loadOfficialCopilotConfig(args)
   }
-  const loadOfficialConfigForCodex = (args: {
-    getAuth: () => Promise<CopilotAuthState | undefined>
-    provider?: CopilotProviderConfig
-    baseFetch?: typeof fetch
-    version?: string
-  }) => {
-    if (input.loadOfficialConfig) {
-      return (input.loadOfficialConfig as (input: typeof args) => Promise<{ fetch: FetchLike } | undefined>)(args)
-    }
-    return loadOfficialCodexConfig({
-      getAuth: args.getAuth,
-      baseFetch: args.baseFetch,
-      version: args.version,
-      client: input.client as {
-        auth?: {
-          set?: (value: unknown) => Promise<unknown>
-        }
-      } | undefined,
-    })
-  }
   const resolveOfficialChatHeaders: LoadOfficialChatHeaders = enableCopilotAuthLoader
     ? input.loadOfficialChatHeaders ?? loadOfficialCopilotChatHeaders
-    : enableCodexAuthLoader
-    ? loadOfficialCodexChatHeaders as unknown as LoadOfficialChatHeaders
     : (async () => async () => {})
-  const createRetryFetch = input.createRetryFetch
-    ?? (enableCodexAuthLoader ? createCodexRetryingFetch : createCopilotRetryingFetch)
+  const createRetryFetch = input.createRetryFetch ?? createCopilotRetryingFetch
   const now = input.now ?? (() => Date.now())
   const random = input.random ?? Math.random
   const modelAccountFirstUse = new Set<string>()
@@ -1227,8 +1189,7 @@ export function buildPluginHooks(input: {
     const finalHeaderCapture = new AsyncLocalStorage<((headers: Record<string, string>) => void) | undefined>()
     const getScopedAuth = async () => authOverride.getStore() ?? getAuth()
     const providerConfig = provider as unknown as CopilotProviderConfig | undefined
-    const loadOfficialConfig = enableCodexAuthLoader ? loadOfficialConfigForCodex : loadOfficialConfigForCopilot
-    const config = await loadOfficialConfig({
+    const config = await loadOfficialConfigForCopilot({
       getAuth: getScopedAuth as () => Promise<CopilotAuthState | undefined>,
       provider: providerConfig,
       ...(input.loadOfficialConfig == null
@@ -1256,7 +1217,7 @@ export function buildPluginHooks(input: {
                 }
               | undefined
 
-            const captureConfig = await loadOfficialConfig({
+            const captureConfig = await loadOfficialConfigForCopilot({
               getAuth: getScopedAuth as () => Promise<CopilotAuthState | undefined>,
               provider: providerConfig,
               baseFetch: async (nextRequest, nextInit) => {
@@ -1329,7 +1290,7 @@ export function buildPluginHooks(input: {
         && typeof modelID === "string"
         && modelID.length > 0
         && latestStore.modelAccountAssignments
-        && Object.prototype.hasOwnProperty.call(latestStore.modelAccountAssignments, modelID),
+        && Object.hasOwn(latestStore.modelAccountAssignments, modelID),
       )
       const hasUsableExplicitModelCandidate = candidates.some((item) => item.source === "model")
       if (hasExplicitModelGroup && !hasUsableExplicitModelCandidate) {
@@ -1506,10 +1467,11 @@ export function buildPluginHooks(input: {
             decisionLoads = loadMapToRecord(nextLoads, candidateNames)
             const currentLoad = nextLoads.get(resolved.name) ?? (loads.get(resolved.name) ?? 0)
             const replacementCandidates = [...candidates].filter((item) => item.name !== resolved.name)
+            const snapshot = routingSnapshot
             const cooledCandidates = replacementCandidates
               .filter((item) => item.name !== resolved.name)
               .filter((item) => isAccountRateLimitCooledDown({
-                snapshot: routingSnapshot!,
+                snapshot,
                 accountName: item.name,
                 now: observedAt,
                 cooldownMs: RATE_LIMIT_COOLDOWN_MS,
@@ -1723,26 +1685,7 @@ export function buildPluginHooks(input: {
     }
   }
 
-  const codexLoader: AuthLoader = async (getAuth) => {
-    const config = await loadOfficialConfigForCodex({
-      getAuth: getAuth as () => Promise<CopilotAuthState | undefined>,
-    }).catch(() => undefined)
-    if (!config || typeof config.fetch !== "function") return {}
-
-    if (await isNetworkRetryEnabled()) {
-      return {
-        ...config,
-        fetch: createRetryFetch(config.fetch as FetchLike),
-      }
-    }
-
-    return {
-      ...config,
-      fetch: config.fetch as FetchLike,
-    }
-  }
-
-  const officialChatHeaders = (enableCopilotAuthLoader || enableCodexAuthLoader)
+  const officialChatHeaders = enableCopilotAuthLoader
     ? resolveOfficialChatHeaders({
         client: input.client,
         directory: input.directory,
@@ -1751,12 +1694,6 @@ export function buildPluginHooks(input: {
 
   const chatHeaders: ChatHeadersHook = async (hookInput, output) => {
     trackWechatBridgeInteractedSession(wechatBridgeSessionContext, hookInput.sessionID)
-
-    if (enableCodexAuthLoader) {
-      if (hookInput.model.providerID !== authProvider) return
-      await (await officialChatHeaders)(hookInput, output)
-      return
-    }
 
     if (!enableCopilotAuthLoader || !isCopilotProviderID(hookInput.model.providerID)) return
     const headersBeforeOfficial = { ...output.headers }
@@ -1876,19 +1813,13 @@ export function buildPluginHooks(input: {
       ...input.auth,
       provider: authProvider,
       methods: input.auth.methods,
-      loader: enableCopilotAuthLoader ? loader : (enableCodexAuthLoader ? codexLoader : undefined),
+      loader: enableCopilotAuthLoader ? loader : undefined,
     } as AuthProvider extends never ? never : NonNullable<CopilotPluginHooks["auth"]>,
     config: async (config) => {
       if (!config.command) config.command = {}
       const store = loadMergedStoreSync()
       if (!areExperimentalSlashCommandsEnabled(store)) {
         return
-      }
-      if (enableCodexAuthLoader) {
-        config.command["codex-status"] = {
-          template: "Show the current Codex status and usage snapshot via the experimental status path.",
-          description: "Experimental Codex status command",
-        }
       }
       if (enableCopilotAuthLoader) {
         config.command["copilot-status"] = {
@@ -1916,14 +1847,6 @@ export function buildPluginHooks(input: {
           loadStore,
           writeStore: persistStore,
           refreshQuota,
-        })
-      }
-
-      if (hookInput.command === "codex-status") {
-        if (!enableCodexAuthLoader) return
-        if (!areExperimentalSlashCommandsEnabled(store)) return
-        await handleCodexStatusCommandImpl({
-          client: input.client,
         })
       }
 
