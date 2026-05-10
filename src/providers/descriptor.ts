@@ -57,28 +57,6 @@ export const COPILOT_PROVIDER_DESCRIPTOR: ProviderDescriptor = {
   ],
 }
 
-export const CODEX_PROVIDER_DESCRIPTOR: ProviderDescriptor = {
-  key: "codex",
-  providerIDs: [
-    "openai",
-  ],
-  storeNamespace: "codex",
-  commands: [
-    "codex-status",
-  ],
-  menuEntries: [
-    "switch-account",
-    "add-account",
-    "refresh-snapshot",
-  ],
-  capabilities: [
-    "auth",
-    "chat-headers",
-    "network-retry",
-    "slash-commands",
-  ],
-}
-
 export function createCopilotProviderDescriptor(input: {
   buildPluginHooks: BuildPluginHooks
 }): AssembledProviderDescriptor {
@@ -89,19 +67,5 @@ export function createCopilotProviderDescriptor(input: {
     },
     buildPluginHooks: input.buildPluginHooks,
     enabledByDefault: true,
-  }
-}
-
-export function createCodexProviderDescriptor(input: {
-  buildPluginHooks: BuildPluginHooks
-  enabled?: boolean
-}): AssembledProviderDescriptor {
-  return {
-    key: "codex",
-    auth: {
-      provider: "openai",
-    },
-    buildPluginHooks: input.buildPluginHooks,
-    enabledByDefault: input.enabled !== false,
   }
 }

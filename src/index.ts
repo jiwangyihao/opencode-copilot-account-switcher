@@ -1,1 +1,1 @@
-export { CopilotAccountSwitcher, OpenAICodexAccountSwitcher } from "./plugin.js"
+export { CopilotAccountSwitcher } from "./plugin.js"

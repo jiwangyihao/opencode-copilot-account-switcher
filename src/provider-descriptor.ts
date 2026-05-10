@@ -1,7 +1,5 @@
 export {
-  CODEX_PROVIDER_DESCRIPTOR,
   COPILOT_PROVIDER_DESCRIPTOR,
-  createCodexProviderDescriptor,
   createCopilotProviderDescriptor,
 } from "./providers/descriptor.js"
 export type {
