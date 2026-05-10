@@ -17,14 +17,11 @@ import {
   readCommonSettingsStore,
   readCommonSettingsStoreSync,
   writeCommonSettingsStore,
-  type CommonSettingsStore,
 } from "./common-settings-store.js"
 import { connectOrSpawnBroker } from "./wechat/broker-launcher.js"
 import { brokerStartupDiagnosticsPath, ensureWechatStateLayout } from "./wechat/state-paths.js"
-import { createCodexMenuAdapter } from "./providers/codex-menu-adapter.js"
 import { createCopilotMenuAdapter } from "./providers/copilot-menu-adapter.js"
 import { createProviderRegistry } from "./providers/registry.js"
-import { loadOfficialCodexAuthMethods } from "./upstream/codex-loader-adapter.js"
 import { isTTY } from "./ui/ansi.js"
 import { showMenu, type AccountInfo, type MenuAction as UiMenuAction } from "./ui/menu.js"
 import { select, selectMany } from "./ui/select.js"
@@ -63,7 +60,7 @@ function formatBrokerStartupError(error: unknown) {
 }
 
 async function recordBrokerStartupFailure(input: {
-  provider: "github-copilot" | "openai"
+  provider: "github-copilot"
   diagnosticsPath: string
   error: unknown
   showToast?: (options: { body: { message: string; variant: "warning" } }) => Promise<unknown>
@@ -383,7 +380,6 @@ export async function activateAddedAccount(input: {
 
 async function createAccountSwitcherPlugin(
   input: Parameters<Plugin>[0],
-  provider: "github-copilot" | "openai",
 ) {
   const client = input.client
   const directory = input.directory
@@ -417,7 +413,7 @@ async function createAccountSwitcherPlugin(
 
       void brokerEnsurePromise
         .catch((error) => recordBrokerStartupFailure({
-          provider,
+          provider: "github-copilot",
           diagnosticsPath,
           error,
           showToast,
@@ -432,29 +428,6 @@ async function createAccountSwitcherPlugin(
     initialWechatBrokerPromise = brokerEnsurePromiseInProcess
   }
   const persistStore = (store: StoreFile, meta?: StoreWriteDebugMeta) => writeStore(store, { debug: meta })
-  const codexClient = {
-    auth: {
-      set: async (options: {
-        path: { id: string }
-        body: {
-          type: "oauth"
-          refresh?: string
-          access?: string
-          expires?: number
-          accountId?: string
-        }
-      }) => client.auth.set({
-        path: options.path,
-        body: {
-          type: "oauth",
-          refresh: options.body.refresh ?? options.body.access ?? "",
-          access: options.body.access ?? options.body.refresh ?? "",
-          expires: options.body.expires ?? 0,
-          ...(options.body.accountId ? { accountId: options.body.accountId } : {}),
-        },
-      }),
-    },
-  }
   const copilotMethods = [
     {
       type: "oauth" as const,
@@ -474,32 +447,6 @@ async function createAccountSwitcherPlugin(
               access: entry.access,
               expires: entry.expires,
               ...(entry.enterpriseUrl ? { enterpriseUrl: entry.enterpriseUrl } : {}),
-            }
-          },
-        }
-      },
-    },
-  ]
-
-  const codexMethods = [
-    {
-      type: "oauth" as const,
-      label: "Manage OpenAI Codex accounts",
-      async authorize() {
-        const entry = await runCodexMenu()
-        return {
-          url: "",
-          instructions: "",
-          method: "auto" as const,
-          async callback() {
-            if (!entry) return { type: "failed" as const }
-            return {
-              type: "success" as const,
-              provider: "openai",
-              refresh: entry.refresh ?? "",
-              access: entry.access ?? entry.refresh ?? "",
-              expires: entry.expires ?? 0,
-              ...(entry.accountId ? { accountId: entry.accountId } : {}),
             }
           },
         }
@@ -567,61 +514,15 @@ async function createAccountSwitcherPlugin(
     })
   }
 
-  async function runCodexMenu() {
-    if (!isTTY()) {
-      console.log("Interactive menu requires a TTY terminal")
-      return
-    }
-
-    const adapter = createCodexMenuAdapter({
-      client: codexClient,
-      loadOfficialCodexAuthMethods: () => loadOfficialCodexAuthMethods({
-        client: {
-          auth: {
-            set: async (value) => client.auth.set(value as Parameters<typeof client.auth.set>[0]),
-          },
-        },
-      }),
-      readCommonSettings: readCommonSettingsStore,
-      writeCommonSettings: async (settings) => {
-        await writeCommonSettingsStore(settings)
-      },
-    })
-
-    const toRuntimeAction = async (accounts: AccountInfo[], store: Awaited<ReturnType<typeof adapter.loadStore>>): Promise<RuntimeMenuAction> => {
-      const common: CommonSettingsStore | undefined = await readCommonSettingsStore().catch(() => undefined)
-      const action = await showMenu(accounts, {
-        provider: "codex",
-        refresh: { enabled: store.autoRefresh === true, minutes: store.refreshMinutes ?? 15 },
-        experimentalSlashCommandsEnabled: common?.experimentalSlashCommandsEnabled,
-        networkRetryEnabled: common?.networkRetryEnabled === true,
-      })
-
-      const shared = toSharedRuntimeAction(action)
-      if (shared) return shared
-      if (action.type === "quota") return { type: "provider", name: "refresh-snapshot" }
-      if (action.type === "toggle-refresh") return { type: "provider", name: "toggle-refresh" }
-      if (action.type === "set-interval") return { type: "provider", name: "set-interval" }
-      return { type: "cancel" }
-    }
-
-    return runProviderMenu({
-      adapter,
-      showMenu: toRuntimeAction,
-      onProviderActionResult: handleProviderActionResult,
-      now,
-    })
-  }
-
   const registry = createProviderRegistry({
     buildPluginHooks,
   })
-  const assembled = provider === "github-copilot" ? registry.copilot.descriptor : registry.codex.descriptor
+  const assembled = registry.copilot.descriptor
 
   return assembled.buildPluginHooks({
     auth: {
-      provider,
-      methods: provider === "github-copilot" ? copilotMethods : codexMethods,
+      provider: "github-copilot",
+      methods: copilotMethods,
     },
     client,
     directory,
@@ -635,9 +536,5 @@ async function createAccountSwitcherPlugin(
 }
 
 export const CopilotAccountSwitcher: Plugin = async (input) => {
-  return createAccountSwitcherPlugin(input, "github-copilot")
-}
-
-export const OpenAICodexAccountSwitcher: Plugin = async (input) => {
-  return createAccountSwitcherPlugin(input, "openai")
+  return createAccountSwitcherPlugin(input)
 }
