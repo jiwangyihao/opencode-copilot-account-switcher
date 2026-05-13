@@ -45,23 +45,9 @@
     "build": "tsc -p tsconfig.build.json",
     "sync:copilot-snapshot": "node scripts/sync-copilot-upstream.mjs --output src/upstream/copilot-plugin.snapshot.ts",
     "check:copilot-sync": "node scripts/sync-copilot-upstream.mjs --output src/upstream/copilot-plugin.snapshot.ts --check",
-    "wechat:smoke:self-test": "npm run build && node --input-type=module -e \"import('./dist/wechat/compat/openclaw-smoke.js').then(async (m) => { const results = await m.runOpenClawSmoke('self-test'); console.log(JSON.stringify(results, null, 2)); })\"",
-    "wechat:smoke:real-account": "npm run build && node --input-type=module -e \"import('./dist/wechat/compat/openclaw-smoke.js').then(async (m) => { const dryRun = process.argv.includes('--dry-run'); const results = await m.runOpenClawSmoke('real-account', { dryRun }); console.log(JSON.stringify(results, null, 2)); })\" --",
-    "wechat:smoke:guided": "npm run build && node dist/wechat/compat/openclaw-guided-smoke.js",
-    "test:wechat-real-host-gate": "npm run build && node --test test/wechat-opencode-real-host-gate.test.js",
-    "test:serial:wechat-status-flow:early": "node --import ./scripts/set-status-flow-phase-early.mjs --test --test-concurrency=1 test/wechat-status-flow.test.js",
-    "test:serial:wechat-status-flow:late-a": "node --import ./scripts/set-status-flow-phase-late.mjs --test --test-concurrency=1 --test-name-pattern \"^broker-entry slash handler: (/reply s3 会路由到 natural-stop reply 分支|natural-stop 回复后再次 /reply s3 返回固定终结原因|两个实例 natural-stop handle 全局唯一且 /reply 唯一命中对应 reply target|旧 binding 残留 active natural-stop 时，新 binding handle 仍全局唯一并命中新 reply target|同一 replyTarget 旧 natural-stop 进入 continued 后，旧 handle 返回固定终结原因，新 active 必须拿新 s\\*|旧 terminal s1 保留期内仍返回固定终结原因，新 active natural-stop 必须拿新 s\\*|natural-stop 已过期后返回固定已过期提示|旧 handle 已结束后再次 /allow 返回稳定已结束提示|permission rejected 经 terminal 同步后 /allow 仍返回已在电脑端拒绝)$\" test/wechat-status-flow.test.js",
-    "test:serial:wechat-status-flow:late-b": "node --import ./scripts/set-status-flow-phase-late.mjs --test --test-concurrency=1 --test-name-pattern \"^(broker-entry slash handler: recovery 后旧 qid 已结束并提示已被新入口替代|broker-entry slash handler: /recover 即使旧 handle 空闲也会分配 fresh handle 与 fresh route|broker-entry slash handler: /recover 会把恢复作为单一 recoveryMutation 提交|broker-entry slash handler: /recover 入队等待期间 fresh handle/route 被占用时会在队列内重新分配|recover mutation: commit 写入 fresh request 后失败时会清理 fresh route 并写 failed metadata|recover mutation: rollback 失败时仍会尝试写 failed metadata 并暴露 rollback 错误|recover mutation: failed metadata 落盘失败时会暴露错误|broker-entry slash handler: /recover 在 mutation 中途失败时会回滚 fresh request 并持久化 failed 状态|broker-entry slash handler: /recover 会 suppress 旧 routeKey 的 pending notification，后续 drain 不会发送旧 handle|notification dispatcher: recover 并发窗口下旧 pending request 缺失时会 suppress，不发送旧 handle|notification dispatcher: 发送成功后 sent 持久化失败不会在后续 drain 重发|broker-entry runtime lifecycle: 旧通知缺少 scopeKey 时 delivery failure callback 仍会回填 immutable scopeKey)$\" test/wechat-status-flow.test.js",
-    "test:serial:wechat-status-flow:late": "npm run test:serial:wechat-status-flow:late-a && npm run test:serial:wechat-status-flow:late-b",
-    "test:serial:wechat-ws-core": "node --test --test-concurrency=1 test/wechat-ws-protocol.test.js test/wechat-broker-state-store.test.js test/wechat-broker-ws-lifecycle.test.js",
-    "test:serial:wechat-broker-lifecycle": "node --test --test-concurrency=1 test/wechat-broker-lifecycle.test.js",
-    "test:serial:wechat-notification-flow": "node --test --test-concurrency=1 test/wechat-notification-flow.test.js",
     "test:serial:plugin": "node --test --test-concurrency=1 test/plugin.test.js",
-    "test:serial:wechat-openclaw-guided-smoke": "node --test --test-concurrency=1 test/wechat-openclaw-guided-smoke.test.js",
-    "test:serial:wechat-openclaw-task3": "node --test --test-concurrency=1 test/wechat-openclaw-task3.test.js",
-    "test:serial:wechat-opencode-real-host-gate": "node --test --test-concurrency=1 test/wechat-opencode-real-host-gate.test.js",
-    "test:parallel:shard": "node --test test/active-account-quota.test.js test/common-settings-actions.test.js test/common-settings-store.test.js test/copilot-network-retry.test.js test/copilot-sync.test.js test/index-exports.test.js test/menu-runtime.test.js test/menu.test.js test/model-account-map.test.js test/routing-state.test.js test/select.test.js test/session-control-command.test.js test/status-command.test.js test/store.test.js test/ui-menu-wechat.test.js test/wechat-bind-flow.test.js test/wechat-dead-letter-store.test.js test/wechat-debug-bundle.test.js test/wechat-jiti-loader.test.js test/wechat-notification-store.test.js test/wechat-openclaw-account-helpers.test.js test/wechat-openclaw-public-helpers.test.js test/wechat-openclaw-qr-gateway.test.js test/wechat-openclaw-smoke.test.js test/wechat-openclaw-sync-buf.test.js test/wechat-openclaw-updates-send.test.js test/wechat-operator-store.test.js test/wechat-plugin-hooks-status.test.js test/wechat-qrcode-terminal-loader.test.js test/wechat-request-store.test.js test/wechat-session-digest.test.js test/wechat-state-paths.test.js test/wechat-state-root.test.js test/wechat-token-store-atomic-write.test.js test/wechat-token-store.test.js",
-    "test": "npm run build && npm run test:serial:wechat-status-flow:early && npm run test:serial:wechat-ws-core && npm run test:serial:wechat-broker-lifecycle && npm run test:serial:wechat-notification-flow && npm run test:serial:plugin && npm run test:serial:wechat-openclaw-guided-smoke && npm run test:serial:wechat-openclaw-task3 && npm run test:serial:wechat-opencode-real-host-gate && npm run test:serial:wechat-status-flow:late && npm run test:parallel:shard",
+    "test:parallel:shard": "node --test test/active-account-quota.test.js test/common-settings-actions.test.js test/common-settings-store.test.js test/copilot-network-retry.test.js test/copilot-sync.test.js test/index-exports.test.js test/menu-runtime.test.js test/menu.test.js test/model-account-map.test.js test/root-package-boundary.test.js test/routing-state.test.js test/select.test.js test/session-control-command.test.js test/status-command.test.js test/store.test.js",
+    "test": "npm run build && npm run test:serial:plugin && npm run test:parallel:shard",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
@@ -75,9 +61,6 @@
   "dependencies": {
     "@opencode-ai/plugin": "^1.2.26",
     "@opencode-ai/sdk": "^1.2.26",
-    "@tencent-weixin/openclaw-weixin": "2.0.1",
-    "fflate": "^0.8.2",
-    "openclaw": "2026.3.22",
     "xdg-basedir": "^5.1.0"
   }
 }
