@@ -8,7 +8,6 @@ import test from "node:test"
 import { setTimeout as delay } from "node:timers/promises"
 import { pathToFileURL } from "node:url"
 import { promisify } from "node:util"
-import { strFromU8, unzipSync } from "fflate"
 
 import { ACCOUNT_SWITCH_TTL_MS } from "../dist/copilot-retry-notifier.js"
 import { applyMenuAction } from "../dist/plugin-actions.js"
@@ -16,7 +15,6 @@ import { buildPluginHooks as buildPluginHooksRaw } from "../dist/plugin-hooks.js
 import { COPILOT_PROVIDER_DESCRIPTOR } from "../dist/providers/descriptor.js"
 import { getProviderDescriptorByKey, getProviderDescriptorByProviderID, listProviderDescriptors } from "../dist/providers/registry.js"
 import { buildCandidateAccountLoads } from "../dist/routing-state.js"
-import { setupIsolatedWechatStateRoot } from "./helpers/wechat-state-root.js"
 
 const execFileAsync = promisify(execFile)
 
@@ -27,10 +25,6 @@ function createTempRoutingStateDirectory() {
 function buildPluginHooks(input = {}) {
   return buildPluginHooksRaw({
     ...input,
-    ensureWechatBrokerStarted: input.ensureWechatBrokerStarted ?? (async () => ({ endpoint: "test-broker" })),
-    createWechatBridgeLifecycleImpl: input.createWechatBridgeLifecycleImpl ?? (async () => ({
-      close: async () => {},
-    })),
     routingStateDirectory: input.routingStateDirectory ?? createTempRoutingStateDirectory(),
   })
 }
@@ -81,29 +75,6 @@ test("waitForCondition 会等待异步谓词真正满足", async () => {
   assert.equal(ready, true)
 })
 
-async function captureRejectedError(run) {
-  try {
-    await run()
-  } catch (error) {
-    return error
-  }
-  assert.fail("expected rejection")
-}
-
-function captureConsoleLog() {
-  const lines = []
-  const original = console.log
-  console.log = (...args) => {
-    lines.push(args.map((value) => String(value)).join(" "))
-  }
-  return {
-    lines,
-    restore() {
-      console.log = original
-    },
-  }
-}
-
 function createBridgeCapablePluginClient(extra = {}) {
   const base = {
     auth: {
@@ -143,32 +114,6 @@ function createBridgeCapablePluginClient(extra = {}) {
       ...(extra.permission ?? {}),
     },
   }
-}
-
-async function createNoopWechatBridgeLifecycle() {
-  return {
-    close: async () => {},
-  }
-}
-
-async function replaceActiveWechatBridgeLifecycleForTest() {
-  buildPluginHooksRaw({
-    auth: {
-      provider: "github-copilot",
-      methods: [],
-    },
-    client: createBridgeCapablePluginClient(),
-    directory: `${process.cwd()}-${Date.now()}-${Math.random()}`,
-    serverUrl: new URL("http://127.0.0.1:4096"),
-    ensureWechatBrokerStarted: async () => ({ endpoint: "fake-endpoint" }),
-    createWechatBridgeLifecycleImpl: async () => ({
-      close: async () => {},
-    }),
-  })
-
-  await Promise.resolve()
-  await Promise.resolve()
-  await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
 test("plugin exposes auth and chat headers without Loop Safety hooks", () => {
@@ -6535,421 +6480,35 @@ test("copilot menu runtime toggle actions keep write semantics", async () => {
   ])
 })
 
-test("plugin shared runtime action mapping includes wechat bind actions", async () => {
+test("plugin shared runtime action mapping excludes WeChat provider actions", async () => {
   const pluginSource = await fs.readFile(new URL("../dist/plugin.js", import.meta.url), "utf8")
+  const wechatActionPrefix = ["we", "chat"].join("")
 
-  assert.match(pluginSource, /if \(action\.type === "wechat-bind"\)\s*return \{ type: "provider", name: "wechat-bind" \}/)
-  assert.match(pluginSource, /if \(action\.type === "wechat-rebind"\)\s*return \{ type: "provider", name: "wechat-rebind" \}/)
+  for (const needle of [
+    `${wechatActionPrefix}-bind`,
+    `${wechatActionPrefix}-rebind`,
+    `toggle-${wechatActionPrefix}-notifications`,
+    `toggle-${wechatActionPrefix}-question-notify`,
+    `toggle-${wechatActionPrefix}-permission-notify`,
+    `toggle-${wechatActionPrefix}-session-error-notify`,
+    `${wechatActionPrefix}-export-debug-bundle`,
+  ]) {
+    assert.equal(pluginSource.includes(needle), false, needle)
+  }
 })
 
-test("plugin shared runtime action mapping includes wechat notification toggles", async () => {
-  const pluginSource = await fs.readFile(new URL("../dist/plugin.js", import.meta.url), "utf8")
-
-  assert.match(pluginSource, /if \(action\.type === "toggle-wechat-notifications"\)\s*return \{ type: "provider", name: "toggle-wechat-notifications" \}/)
-  assert.match(pluginSource, /if \(action\.type === "toggle-wechat-question-notify"\)\s*return \{ type: "provider", name: "toggle-wechat-question-notify" \}/)
-  assert.match(pluginSource, /if \(action\.type === "toggle-wechat-permission-notify"\)\s*return \{ type: "provider", name: "toggle-wechat-permission-notify" \}/)
-  assert.match(pluginSource, /if \(action\.type === "toggle-wechat-session-error-notify"\)\s*return \{ type: "provider", name: "toggle-wechat-session-error-notify" \}/)
-})
-
-test("plugin shared runtime action mapping includes wechat-export-debug-bundle", async () => {
-  const pluginSource = await fs.readFile(new URL("../dist/plugin.js", import.meta.url), "utf8")
-
-  assert.match(
-    pluginSource,
-    /if \(action\.type === "wechat-export-debug-bundle"\)\s*return \{ type: "provider", name: "wechat-export-debug-bundle", payload: \{ mode: action\.mode \} \}/,
-  )
-})
-
-test("copilot provider adapter lazy-loads wechat bind flow", async () => {
+test("copilot provider adapter does not load WeChat flows", async () => {
   const copilotSource = await fs.readFile(new URL("../dist/providers/copilot-menu-adapter.js", import.meta.url), "utf8")
+  const wechatActionPrefix = ["we", "chat"].join("")
+  const forbiddenActionPattern = new RegExp([
+    `${wechatActionPrefix}-bind`,
+    `${wechatActionPrefix}-rebind`,
+    `${wechatActionPrefix}-export-debug-bundle`,
+    `toggle-${wechatActionPrefix}`,
+  ].join("|"))
 
-  assert.doesNotMatch(copilotSource, /from "\.\.\/wechat\/bind-flow\.js"/)
-  assert.match(copilotSource, /await import\("\.\.\/wechat\/bind-flow\.js"\)/)
-})
-
-test("copilot provider adapter lazy-loads wechat-export-debug-bundle flow", async () => {
-  const copilotSource = await fs.readFile(new URL("../dist/providers/copilot-menu-adapter.js", import.meta.url), "utf8")
-
-  assert.doesNotMatch(copilotSource, /from "\.\.\/wechat\/debug-bundle-flow\.js"/)
-  assert.match(copilotSource, /await import\("\.\.\/wechat\/debug-bundle-flow\.js"\)/)
-})
-
-test("real plugin menu entrypoints forward structured wechat debug bundle results", async () => {
-  const pluginSource = await fs.readFile(new URL("../dist/plugin.js", import.meta.url), "utf8")
-
-  assert.match(pluginSource, /onProviderActionResult:\s*handleProviderActionResult/)
-  assert.match(pluginSource, /if \(output\.name !== "wechat-export-debug-bundle"\)\s*return/)
-  assert.match(pluginSource, /console\.log\(JSON\.stringify\(\{/) 
-  assert.match(pluginSource, /type:\s*"wechat-export-debug-bundle"/)
-  assert.match(pluginSource, /ok:\s*true/)
-  assert.match(pluginSource, /ok:\s*false/)
-  assert.match(pluginSource, /bundlePath:\s*result\.bundlePath/)
-  assert.match(pluginSource, /code:\s*result\.code/)
-  assert.match(pluginSource, /archivePath:\s*result\.archivePath/)
-})
-
-test("wechat debug bundle flow returns generated local zip path", async (t) => {
-  const sandbox = await setupIsolatedWechatStateRoot("wechat-debug-bundle-flow-")
-  const outputRootDir = join(tmpdir(), `wechat-debug-bundle-output-${randomUUID()}`)
-  t.after(async () => {
-    await sandbox.restore()
-    await fs.rm(outputRootDir, { recursive: true, force: true })
-  })
-
-  await fs.mkdir(sandbox.stateRoot, { recursive: true })
-  await fs.writeFile(
-    join(sandbox.stateRoot, "broker.json"),
-    `${JSON.stringify({ contextToken: "ctx-secret", wechatAccountId: "wx-primary" }, null, 2)}\n`,
-    "utf8",
-  )
-  await fs.writeFile(
-    join(sandbox.stateRoot, "wechat-status-runtime.diagnostics.jsonl"),
-    `${JSON.stringify({ contextToken: "ctx-log", messageBody: "hello world" })}\n`,
-    "utf8",
-  )
-  await fs.writeFile(
-    join(sandbox.stateRoot, "wechat-status-runtime.diagnostics.jsonl"),
-    `${JSON.stringify({ contextToken: "ctx-log", messageBody: "hello world" })}\n`,
-    "utf8",
-  )
-
-  const flowModule = await import("../dist/wechat/debug-bundle-flow.js").catch((error) => ({
-    __importError: error,
-  }))
-  assert.equal(
-    flowModule.__importError,
-    undefined,
-    `debug bundle flow module should exist: ${flowModule.__importError?.message ?? "missing"}`,
-  )
-  assert.equal(typeof flowModule.runWechatDebugBundleFlow, "function")
-
-  const result = await flowModule.runWechatDebugBundleFlow({
-    mode: "sanitized",
-    now: new Date("2026-04-11T08:30:00.000Z"),
-    cwd: outputRootDir,
-    outputRootDir,
-    pluginVersion: "0.14.38-test",
-    gitHead: "head-flow",
-    nodeVersion: "v24.0.0-test",
-    platform: "linux-test",
-  })
-
-  assert.equal(result.mode, "sanitized")
-  assert.equal(existsSync(result.bundlePath), true)
-  assert.match(basename(result.bundlePath), /^wechat-debug-bundle-sanitized-2026-04-11T08-30-00\.zip$/)
-  assert.match(result.message, /微信调试包已生成：/)
-
-  const archive = unzipSync(await fs.readFile(result.bundlePath))
-  assert.match(strFromU8(archive["state/broker.json"]), /\[REDACTED_CONTEXT_TOKEN\]/)
-  assert.equal(JSON.parse(strFromU8(archive["manifest.json"])).mode, "sanitized")
-  assert.equal(JSON.parse(strFromU8(archive["environment-summary.json"])).gitHead, "head-flow")
-
-  const second = await flowModule.runWechatDebugBundleFlow({
-    mode: "sanitized",
-    now: new Date("2026-04-11T08:30:00.000Z"),
-    cwd: outputRootDir,
-    outputRootDir,
-    pluginVersion: "0.14.38-test",
-    gitHead: "head-flow",
-    nodeVersion: "v24.0.0-test",
-    platform: "linux-test",
-  })
-
-  assert.notEqual(second.bundlePath, result.bundlePath)
-  assert.match(basename(second.bundlePath), /^wechat-debug-bundle-sanitized-2026-04-11T08-30-00-2\.zip$/)
-  assert.equal(existsSync(second.bundlePath), true)
-})
-
-test("wechat debug bundle flow removes partial bundle file after write failure", async (t) => {
-  const sandbox = await setupIsolatedWechatStateRoot("wechat-debug-bundle-partial-")
-  const outputRootDir = join(tmpdir(), `wechat-debug-bundle-partial-output-${randomUUID()}`)
-  t.after(async () => {
-    await sandbox.restore()
-    await fs.rm(outputRootDir, { recursive: true, force: true })
-  })
-
-  await fs.mkdir(sandbox.stateRoot, { recursive: true })
-  await fs.writeFile(
-    join(sandbox.stateRoot, "broker.json"),
-    `${JSON.stringify({ contextToken: "ctx-secret", wechatAccountId: "wx-primary" }, null, 2)}\n`,
-    "utf8",
-  )
-  await fs.writeFile(
-    join(sandbox.stateRoot, "wechat-status-runtime.diagnostics.jsonl"),
-    `${JSON.stringify({ contextToken: "ctx-log", messageBody: "hello world" })}\n`,
-    "utf8",
-  )
-
-  const flowModule = await import("../dist/wechat/debug-bundle-flow.js")
-  const expectedBundlePath = join(outputRootDir, "wechat-debug-bundle-sanitized-2026-04-11T08-30-00.zip")
-
-  const error = await captureRejectedError(
-    () => flowModule.runWechatDebugBundleFlow({
-      mode: "sanitized",
-      now: new Date("2026-04-11T08:30:00.000Z"),
-      cwd: outputRootDir,
-      outputRootDir,
-      pluginVersion: "0.14.38-test",
-      gitHead: "head-flow",
-      nodeVersion: "v24.0.0-test",
-      platform: "linux-test",
-    }, {
-      writeArchiveFile: async (filePath, content, options) => {
-        await fs.writeFile(filePath, content, options)
-        throw new Error("disk-full")
-      },
-    }),
-  )
-
-  assert.equal(error.message, "创建压缩包失败")
-  assert.doesNotMatch(error.message, /disk-full|E[A-Z]+/)
-  assert.deepEqual(flowModule.toWechatDebugBundleFailureResult(error, { mode: "sanitized" }), {
-    ok: false,
-    mode: "sanitized",
-    code: "zip-write-failed",
-    message: "创建压缩包失败",
-    details: {
-      archivePath: expectedBundlePath,
-      writeCause: "disk-full",
-    },
-  })
-
-  assert.equal(existsSync(expectedBundlePath), false)
-})
-
-test("wechat debug bundle flow reports cleanup failure when partial bundle removal also fails", async (t) => {
-  const sandbox = await setupIsolatedWechatStateRoot("wechat-debug-bundle-partial-cleanup-")
-  const outputRootDir = join(tmpdir(), `wechat-debug-bundle-partial-cleanup-output-${randomUUID()}`)
-  t.after(async () => {
-    await sandbox.restore()
-    await fs.rm(outputRootDir, { recursive: true, force: true })
-  })
-
-  await fs.mkdir(sandbox.stateRoot, { recursive: true })
-  await fs.writeFile(
-    join(sandbox.stateRoot, "broker.json"),
-    `${JSON.stringify({ contextToken: "ctx-secret", wechatAccountId: "wx-primary" }, null, 2)}\n`,
-    "utf8",
-  )
-  await fs.writeFile(
-    join(sandbox.stateRoot, "wechat-status-runtime.diagnostics.jsonl"),
-    `${JSON.stringify({ contextToken: "ctx-log", messageBody: "hello world" })}\n`,
-    "utf8",
-  )
-
-  const flowModule = await import("../dist/wechat/debug-bundle-flow.js")
-  const expectedBundlePath = join(outputRootDir, "wechat-debug-bundle-sanitized-2026-04-11T08-30-00.zip")
-
-  const error = await captureRejectedError(
-    () => flowModule.runWechatDebugBundleFlow({
-      mode: "sanitized",
-      now: new Date("2026-04-11T08:30:00.000Z"),
-      cwd: outputRootDir,
-      outputRootDir,
-      pluginVersion: "0.14.38-test",
-      gitHead: "head-flow",
-      nodeVersion: "v24.0.0-test",
-      platform: "linux-test",
-    }, {
-      writeArchiveFile: async (filePath, content, options) => {
-        await fs.writeFile(filePath, content, options)
-        throw new Error("disk-full")
-      },
-      removeArchiveFile: async () => {
-        throw new Error("remove-denied")
-      },
-    }),
-  )
-
-  assert.equal(error.message, `创建压缩包失败，请手动删除残留压缩包：${expectedBundlePath}`)
-  assert.doesNotMatch(error.message, /disk-full|remove-denied|E[A-Z]+/)
-  assert.deepEqual(flowModule.toWechatDebugBundleFailureResult(error, { mode: "sanitized" }), {
-    ok: false,
-    mode: "sanitized",
-    code: "zip-cleanup-failed",
-    message: `创建压缩包失败，请手动删除残留压缩包：${expectedBundlePath}`,
-    archivePath: expectedBundlePath,
-    details: {
-      archivePath: expectedBundlePath,
-      writeCause: "disk-full",
-      cleanupCause: "remove-denied",
-    },
-  })
-
-  assert.equal(existsSync(expectedBundlePath), true)
-})
-
-test("wechat debug bundle flow fails with stable Chinese error when diagnostics are missing", async (t) => {
-  const sandbox = await setupIsolatedWechatStateRoot("wechat-debug-bundle-no-diagnostics-")
-  const outputRootDir = join(tmpdir(), `wechat-debug-bundle-no-diagnostics-output-${randomUUID()}`)
-  t.after(async () => {
-    await sandbox.restore()
-    await fs.rm(outputRootDir, { recursive: true, force: true })
-  })
-
-  await fs.mkdir(sandbox.stateRoot, { recursive: true })
-  await fs.writeFile(
-    join(sandbox.stateRoot, "broker.json"),
-    `${JSON.stringify({ contextToken: "ctx-secret", wechatAccountId: "wx-primary" }, null, 2)}\n`,
-    "utf8",
-  )
-
-  const flowModule = await import("../dist/wechat/debug-bundle-flow.js")
-
-  const error = await captureRejectedError(
-    () => flowModule.runWechatDebugBundleFlow({
-      mode: "sanitized",
-      now: new Date("2026-04-11T08:30:00.000Z"),
-      cwd: outputRootDir,
-      outputRootDir,
-      pluginVersion: "0.14.38-test",
-      gitHead: "head-flow",
-      nodeVersion: "v24.0.0-test",
-      platform: "linux-test",
-    }),
-  )
-
-  assert.equal(error.message, "没有可导出的微信诊断文件")
-  assert.deepEqual(flowModule.toWechatDebugBundleFailureResult(error, { mode: "sanitized" }), {
-    ok: false,
-    mode: "sanitized",
-    code: "missing-diagnostics",
-    message: "没有可导出的微信诊断文件",
-  })
-
-  assert.equal(existsSync(outputRootDir), false)
-})
-
-test("copilot menu adapter preserves structured wechat debug bundle result", async (t) => {
-  const sandbox = await setupIsolatedWechatStateRoot("wechat-debug-bundle-adapter-")
-  const outputRootDir = join(tmpdir(), `wechat-debug-bundle-adapter-output-${randomUUID()}`)
-  t.after(async () => {
-    await sandbox.restore()
-    await fs.rm(outputRootDir, { recursive: true, force: true })
-  })
-
-  await fs.mkdir(sandbox.stateRoot, { recursive: true })
-  await fs.writeFile(
-    join(sandbox.stateRoot, "broker.json"),
-    `${JSON.stringify({ contextToken: "ctx-secret", wechatAccountId: "wx-primary" }, null, 2)}\n`,
-    "utf8",
-  )
-  await fs.writeFile(
-    join(sandbox.stateRoot, "wechat-status-runtime.diagnostics.jsonl"),
-    `${JSON.stringify({ contextToken: "ctx-log", messageBody: "hello world" })}\n`,
-    "utf8",
-  )
-
-  const { createCopilotMenuAdapter } = await import("../dist/providers/copilot-menu-adapter.js")
-  const toasts = []
-  const logCapture = captureConsoleLog()
-  t.after(() => logCapture.restore())
-  const adapter = createCopilotMenuAdapter({
-    client: {
-      auth: { set: async () => {} },
-      tui: {
-        showToast: async (options) => {
-          toasts.push(options)
-        },
-      },
-    },
-    readStore: async () => ({ active: "main", autoRefresh: false, refreshMinutes: 15, accounts: {} }),
-    writeStore: async () => {},
-    readAuth: async () => ({}),
-    readCommonSettings: async () => ({}),
-    writeCommonSettings: async () => {},
-  })
-
-  const result = await adapter.applyAction?.({}, {
-    type: "provider",
-    name: "wechat-export-debug-bundle",
-    payload: {
-      mode: "sanitized",
-      outputRootDir,
-      now: new Date("2026-04-11T08:30:00.000Z"),
-      cwd: outputRootDir,
-      pluginVersion: "0.14.38-test",
-      gitHead: "head-adapter",
-      nodeVersion: "v24.0.0-test",
-      platform: "linux-test",
-    },
-  })
-
-  assert.deepEqual(result?.handled, true)
-  assert.equal(result?.result?.mode, "sanitized")
-  assert.equal(typeof result?.result?.bundlePath, "string")
-  assert.match(result?.result?.message ?? "", /微信调试包已生成：/)
-  assert.equal(existsSync(result?.result?.bundlePath ?? ""), true)
-  assert.deepEqual(toasts, [{
-    body: {
-      message: result.result.message,
-      variant: "success",
-    },
-  }])
-  assert.deepEqual(logCapture.lines, [])
-})
-
-test("copilot menu adapter surfaces stable Chinese export failure when state root is missing", async (t) => {
-  const missingStateRoot = join(tmpdir(), `wechat-debug-bundle-missing-root-${randomUUID()}`)
-  const outputRootDir = join(tmpdir(), `wechat-debug-bundle-missing-root-output-${randomUUID()}`)
-  t.after(async () => {
-    await fs.rm(missingStateRoot, { recursive: true, force: true })
-    await fs.rm(outputRootDir, { recursive: true, force: true })
-  })
-
-  const { createCopilotMenuAdapter } = await import("../dist/providers/copilot-menu-adapter.js")
-  const toasts = []
-  const logCapture = captureConsoleLog()
-  t.after(() => logCapture.restore())
-  const adapter = createCopilotMenuAdapter({
-    client: {
-      auth: { set: async () => {} },
-      tui: {
-        showToast: async (options) => {
-          toasts.push(options)
-        },
-      },
-    },
-    readStore: async () => ({ active: "main", autoRefresh: false, refreshMinutes: 15, accounts: {} }),
-    writeStore: async () => {},
-    readAuth: async () => ({}),
-    readCommonSettings: async () => ({}),
-    writeCommonSettings: async () => {},
-  })
-
-  const result = await adapter.applyAction?.({}, {
-    type: "provider",
-    name: "wechat-export-debug-bundle",
-    payload: {
-      mode: "sanitized",
-      stateRoot: missingStateRoot,
-      outputRootDir,
-      now: new Date("2026-04-11T08:30:00.000Z"),
-      cwd: outputRootDir,
-      pluginVersion: "0.14.38-test",
-      gitHead: "head-adapter",
-      nodeVersion: "v24.0.0-test",
-      platform: "linux-test",
-    },
-  })
-
-  assert.deepEqual(result, {
-    handled: true,
-    result: {
-      ok: false,
-      mode: "sanitized",
-      code: "missing-state-root",
-      message: "微信状态目录不存在，无法导出调试包",
-    },
-  })
-  assert.deepEqual(toasts, [{
-    body: {
-      message: "微信状态目录不存在，无法导出调试包",
-      variant: "warning",
-    },
-  }])
-  assert.deepEqual(logCapture.lines, [])
-  assert.equal(existsSync(outputRootDir), false)
+  assert.doesNotMatch(copilotSource, /\.\.\/wechat\//)
+  assert.doesNotMatch(copilotSource, forbiddenActionPattern)
 })
 
 test("plugin auth loader default clearAccountSwitchContext reloads and persists matching switch timestamp", async () => {
@@ -7262,7 +6821,6 @@ test("github-copilot auth methods no longer include Codex entry", async () => {
       },
     },
     directory: process.cwd(),
-    ensureWechatBrokerStarted: async () => ({ endpoint: "fake-endpoint" }),
   })
 
   assert.equal(plugin.auth?.provider, "github-copilot")
@@ -7271,273 +6829,29 @@ test("github-copilot auth methods no longer include Codex entry", async () => {
   ])
 })
 
-test("CopilotAccountSwitcher 在非 bridge-capable（没有 serverUrl/bridge 语义）时不应急切拉起 broker", async () => {
-  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-no-bridge-${Date.now()}`)
+test("CopilotAccountSwitcher does not call WeChat broker or bridge seams when loaded", async () => {
+  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-wechat-absence-${Date.now()}`)
   const calls = []
 
   await CopilotAccountSwitcher({
-    client: {
-      auth: {
-        set: async () => {},
-      },
-    },
-    directory: process.cwd(),
+    client: createBridgeCapablePluginClient(),
+    directory: `${process.cwd()}-wechat-absence-${Date.now()}`,
+    serverUrl: new URL("http://127.0.0.1:4096"),
     ensureWechatBrokerStarted: async () => {
-      calls.push("copilot")
+      calls.push("ensureWechatBrokerStarted")
       return { endpoint: "fake-endpoint" }
+    },
+    createWechatBridgeLifecycleImpl: async () => {
+      calls.push("createWechatBridgeLifecycleImpl")
+      return { close: async () => {} }
     },
   })
 
   await Promise.resolve()
   await Promise.resolve()
+  await new Promise((resolve) => setTimeout(resolve, 0))
 
-  assert.equal(calls.length, 0)
-})
-
-test("CopilotAccountSwitcher 只有在 bridge-capable 时才会 eager ensure broker", async () => {
-  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-bridge-capable-${Date.now()}`)
-  const calls = []
-
-  try {
-    await CopilotAccountSwitcher({
-      client: createBridgeCapablePluginClient(),
-      directory: process.cwd(),
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      createWechatBridgeLifecycleImpl: createNoopWechatBridgeLifecycle,
-      ensureWechatBrokerStarted: async () => {
-        calls.push("copilot")
-        return { endpoint: "fake-endpoint" }
-      },
-    })
-
-    await Promise.resolve()
-    await Promise.resolve()
-
-    assert.equal(calls.length, 1)
-  } finally {
-    await replaceActiveWechatBridgeLifecycleForTest()
-  }
-})
-
-test("CopilotAccountSwitcher 在顺序两次 bridge-capable 加载时，cold-start broker promise 只应 eager ensure 一次", async () => {
-  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-promise-${Date.now()}`)
-  const ensureCalls = []
-  const initialBrokerEndpoints = []
-  const createWechatBridgeLifecycleImpl = async (input) => {
-    initialBrokerEndpoints.push((await input.initialBrokerPromise)?.endpoint)
-    return {
-      close: async () => {},
-    }
-  }
-
-  try {
-    await CopilotAccountSwitcher({
-      client: createBridgeCapablePluginClient(),
-      directory: `${process.cwd()}-cold-start-a-${Date.now()}`,
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      createWechatBridgeLifecycleImpl,
-      ensureWechatBrokerStarted: async () => {
-        ensureCalls.push("first")
-        return { endpoint: "fake-endpoint-first" }
-      },
-    })
-
-    await Promise.resolve()
-    await Promise.resolve()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    await CopilotAccountSwitcher({
-      client: createBridgeCapablePluginClient(),
-      directory: `${process.cwd()}-cold-start-b-${Date.now()}`,
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      createWechatBridgeLifecycleImpl,
-      ensureWechatBrokerStarted: async () => {
-        ensureCalls.push("second")
-        return { endpoint: "fake-endpoint-second" }
-      },
-    })
-
-    await Promise.resolve()
-    await Promise.resolve()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    assert.deepEqual(ensureCalls, ["first"])
-    assert.deepEqual(initialBrokerEndpoints, ["fake-endpoint-first", undefined])
-  } finally {
-    await replaceActiveWechatBridgeLifecycleForTest()
-  }
-})
-
-test("CopilotAccountSwitcher 在 eager ensure 首次失败时仍会回退到 bridge lifecycle 的正常 launcher 路径", async () => {
-  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-eager-fallback-${Date.now()}`)
-  const { createWechatBridgeLifecycle } = await import(`../dist/wechat/bridge.js?copilot-broker-eager-fallback-${Date.now()}`)
-  let launcherCalls = 0
-  const connectedEndpoints = []
-
-  try {
-    await CopilotAccountSwitcher({
-      client: createBridgeCapablePluginClient(),
-      directory: `${process.cwd()}-eager-fallback-${Date.now()}`,
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      ensureWechatBrokerStarted: async () => {
-        throw new Error("eager ensure failed once")
-      },
-      createWechatBridgeLifecycleImpl: (input) => createWechatBridgeLifecycle(input, {
-        connectOrSpawnBrokerImpl: async () => {
-          launcherCalls += 1
-          return { endpoint: "fake-endpoint-from-launcher" }
-        },
-        connectImpl: async (endpoint) => {
-          connectedEndpoints.push(endpoint)
-          return {
-            registerInstance: async () => ({ sessionToken: "token", registeredAt: Date.now(), brokerPid: process.pid }),
-            heartbeat: async () => ({}),
-            close: async () => {},
-          }
-        },
-        setIntervalImpl: () => ({ id: Symbol("timer") }),
-        clearIntervalImpl: () => {},
-      }),
-    })
-
-    await Promise.resolve()
-    await Promise.resolve()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    assert.equal(launcherCalls, 1)
-    assert.deepEqual(connectedEndpoints, ["fake-endpoint-from-launcher"])
-  } finally {
-    await replaceActiveWechatBridgeLifecycleForTest()
-  }
-})
-
-test("CopilotAccountSwitcher 在 eager handoff broker 已失效时仍会回退到 bridge lifecycle 的正常 launcher 路径", async () => {
-  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-stale-handoff-${Date.now()}`)
-  const { createWechatBridgeLifecycle } = await import(`../dist/wechat/bridge.js?copilot-broker-stale-handoff-${Date.now()}`)
-  let launcherCalls = 0
-  const connectedEndpoints = []
-  const registeredEndpoints = []
-  const closedEndpoints = []
-
-  try {
-    await CopilotAccountSwitcher({
-      client: createBridgeCapablePluginClient(),
-      directory: `${process.cwd()}-stale-handoff-${Date.now()}`,
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      ensureWechatBrokerStarted: async () => ({ endpoint: "fake-endpoint-stale" }),
-      createWechatBridgeLifecycleImpl: (input) => createWechatBridgeLifecycle(input, {
-        connectOrSpawnBrokerImpl: async () => {
-          launcherCalls += 1
-          return { endpoint: "fake-endpoint-from-launcher" }
-        },
-        connectImpl: async (endpoint) => {
-          connectedEndpoints.push(endpoint)
-          return {
-            registerInstance: async () => {
-              registeredEndpoints.push(endpoint)
-              if (endpoint === "fake-endpoint-stale") {
-                throw new Error("stale broker register failed")
-              }
-              return { sessionToken: "token", registeredAt: Date.now(), brokerPid: process.pid }
-            },
-            heartbeat: async () => ({}),
-            close: async () => {
-              closedEndpoints.push(endpoint)
-            },
-          }
-        },
-        setIntervalImpl: () => ({ id: Symbol("timer") }),
-        clearIntervalImpl: () => {},
-      }),
-    })
-
-    await Promise.resolve()
-    await Promise.resolve()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    assert.equal(launcherCalls, 1)
-    assert.deepEqual(connectedEndpoints, ["fake-endpoint-stale", "fake-endpoint-from-launcher"])
-    assert.deepEqual(registeredEndpoints, ["fake-endpoint-stale", "fake-endpoint-from-launcher"])
-    assert.deepEqual(closedEndpoints, ["fake-endpoint-stale"])
-  } finally {
-    await replaceActiveWechatBridgeLifecycleForTest()
-  }
-})
-
-test("CopilotAccountSwitcher 在 broker 启动失败时会稳定写入诊断文件并保持 fail-open", async () => {
-  const sandbox = await setupIsolatedWechatStateRoot("wechat-plugin-broker-diagnostics-")
-  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-diagnostics-${Date.now()}`)
-  const { brokerStartupDiagnosticsPath } = await import(`../dist/wechat/state-paths.js?copilot-broker-diagnostics-${Date.now()}`)
-  const diagnosticsPath = brokerStartupDiagnosticsPath()
-  await fs.rm(diagnosticsPath, { force: true })
-
-  try {
-    await CopilotAccountSwitcher({
-      client: createBridgeCapablePluginClient(),
-      directory: process.cwd(),
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      createWechatBridgeLifecycleImpl: createNoopWechatBridgeLifecycle,
-      ensureWechatBrokerStarted: async () => {
-        throw new Error("broker bootstrap failed for test")
-      },
-    })
-
-    await waitForCondition(async () => {
-      try {
-        const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
-        return diagnostics.includes("broker bootstrap failed for test")
-      } catch {
-        return false
-      }
-    })
-    const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
-    assert.match(diagnostics, /broker bootstrap failed for test/)
-  } finally {
-    await replaceActiveWechatBridgeLifecycleForTest()
-    await sandbox.restore()
-  }
-})
-
-test("CopilotAccountSwitcher 在 broker 启动失败时会给出最小 toast 提示并保持 fail-open", async () => {
-  const sandbox = await setupIsolatedWechatStateRoot("wechat-plugin-broker-toast-")
-  const { CopilotAccountSwitcher } = await import(`../dist/plugin.js?copilot-broker-toast-${Date.now()}`)
-  const { brokerStartupDiagnosticsPath } = await import(`../dist/wechat/state-paths.js?copilot-broker-toast-${Date.now()}`)
-  const diagnosticsPath = brokerStartupDiagnosticsPath()
-  const toasts = []
-
-  try {
-    await CopilotAccountSwitcher({
-      client: createBridgeCapablePluginClient({
-        tui: {
-          showToast: async (options) => {
-            toasts.push(options)
-          },
-        },
-      }),
-      directory: process.cwd(),
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      createWechatBridgeLifecycleImpl: createNoopWechatBridgeLifecycle,
-      ensureWechatBrokerStarted: async () => {
-        throw new Error("broker bootstrap failed for toast")
-      },
-    })
-
-    await waitForCondition(() => toasts.some((options) => options?.body?.variant === "warning"))
-    await waitForCondition(async () => {
-      try {
-        const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
-        return diagnostics.includes("broker bootstrap failed for toast")
-      } catch {
-        return false
-      }
-    })
-    const warningToasts = toasts.filter((options) => options?.body?.variant === "warning")
-    assert.equal(warningToasts.length, 1)
-    assert.match(String(warningToasts[0]?.body?.message ?? ""), /broker|微信|wechat/i)
-  } finally {
-    await replaceActiveWechatBridgeLifecycleForTest()
-    await sandbox.restore()
-  }
+  assert.deepEqual(calls, [])
 })
 
 test("provider descriptor contract keeps Copilot assembled without Codex facade", async () => {
