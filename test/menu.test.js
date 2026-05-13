@@ -1,5 +1,5 @@
-import test from "node:test"
 import assert from "node:assert/strict"
+import test from "node:test"
 
 import { buildAccountActionItems, buildMenuItems, getMenuCopy, showMenuWithDeps } from "../dist/ui/menu.js"
 
@@ -29,6 +29,21 @@ test("getMenuCopy keeps network retry copy provider-agnostic for Copilot", () =>
 
   assert.doesNotMatch(enCopy.retryOff, /Copilot/i)
   assert.doesNotMatch(zhCopy.retryOff, /Copilot/i)
+})
+
+test("buildMenuItems does not expose WeChat actions", () => {
+  const items = buildMenuItems({
+    accounts: [],
+    refresh: { enabled: false, minutes: 15 },
+    lastQuotaRefresh: undefined,
+    networkRetryEnabled: false,
+    language: "en",
+  })
+
+  const actionTypes = items
+    .map((item) => item.value?.type)
+    .filter((type) => typeof type === "string")
+  assert.deepEqual(actionTypes.filter((type) => /wechat/i.test(type)), [])
 })
 
 test("buildMenuItems no longer renders Loop Safety rows", () => {
