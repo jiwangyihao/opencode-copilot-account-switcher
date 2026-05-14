@@ -3,6 +3,9 @@
 [![npm version](https://img.shields.io/npm/v/opencode-copilot-account-switcher.svg)](https://www.npmjs.com/package/opencode-copilot-account-switcher)
 [![npm downloads](https://img.shields.io/npm/dw/opencode-copilot-account-switcher.svg)](https://www.npmjs.com/package/opencode-copilot-account-switcher)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-brightgreen.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/jiwangyihao/opencode-copilot-account-switcher?style=social)](https://github.com/jiwangyihao/opencode-copilot-account-switcher/stargazers)
+
+套件导航 / Suite: [OpenCode J Super Suite](https://github.com/jiwangyihao/opencode-j-super-suite)
 
 > **Latest in v0.15.0 | v0.15.0 最近更新**
 >
@@ -42,15 +45,15 @@
 
 `opencode-openai-account-switcher` 不包含 GitHub Copilot routing、header rewrite、模型账号映射或微信绑定动作。它的独立发布链路应包含 fresh 验证、npm publish、tag push 与 GitHub Release；root Copilot 包不随这条链路发布。
 
-## 微信远程交互
+## OpenCode Oncall 远程值守
 
-微信远程交互已经拆分到独立插件 `opencode-wechat`。如果你需要微信绑定、通知、`/status`、`/todo`、`/reply`、`/allow`、`/recover`、debug bundle 或 OpenClaw smoke，请安装：
+远程值守与微信 slash 交互已经拆分到独立插件 `opencode-oncall`。如果你需要微信绑定、通知、`/status`、`/todo`、`/reply`、`/allow`、`/recover`、debug bundle 或 OpenClaw smoke，请安装：
 
 ```bash
-opencode plugin opencode-wechat@0.1.0 --force -g
+opencode plugin opencode-oncall@0.1.5 --force -g
 ```
 
-安装后，上述微信远程交互能力由 `opencode-wechat` 提供；本 Copilot 插件继续聚焦账号、配额、routing 与 Copilot 请求增强。
+安装后，上述远程值守能力由 `opencode-oncall` 提供；本 Copilot 插件继续聚焦账号、配额、routing 与 Copilot 请求增强。
 
 ---
 
@@ -273,15 +276,15 @@ This package now documents and owns GitHub Copilot account switching only. OpenA
 
 `opencode-openai-account-switcher` does not include GitHub Copilot routing, header rewrite, model-account assignments, or WeChat binding actions. Its standalone release chain should include fresh verification, npm publish, tag push, and a GitHub Release; the root Copilot package is not released as part of that chain.
 
-## WeChat Remote Interaction
+## OpenCode Oncall Remote Watch
 
-WeChat remote interaction has moved to the standalone `opencode-wechat` plugin. Install it if you need WeChat binding, notifications, `/status`, `/todo`, `/reply`, `/allow`, `/recover`, debug bundle, or OpenClaw smoke support:
+Remote oncall and WeChat slash interaction have moved to the standalone `opencode-oncall` plugin. Install it if you need WeChat binding, notifications, `/status`, `/todo`, `/reply`, `/allow`, `/recover`, debug bundle, or OpenClaw smoke support:
 
 ```bash
-opencode plugin opencode-wechat@0.1.0 --force -g
+opencode plugin opencode-oncall@0.1.5 --force -g
 ```
 
-After installation, those WeChat remote interaction features are provided by `opencode-wechat`; this Copilot plugin remains focused on accounts, quota, routing, and Copilot request enhancements.
+After installation, those remote oncall features are provided by `opencode-oncall`; this Copilot plugin remains focused on accounts, quota, routing, and Copilot request enhancements.
 
 ---
 
