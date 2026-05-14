@@ -22,14 +22,6 @@ export function copilotAccountsPath() {
 	return path.join(accountSwitcherConfigDir(), "copilot-accounts.json");
 }
 
-export function codexAccountsPath() {
-	return path.join(accountSwitcherConfigDir(), "codex-accounts.json");
-}
-
 export function legacyCopilotStorePath() {
 	return path.join(configBaseDir(), "opencode", "copilot-accounts.json");
-}
-
-export function legacyCodexStorePath() {
-	return path.join(configBaseDir(), "opencode", "codex-store.json");
 }

@@ -24,15 +24,27 @@ const FORBIDDEN_WECHAT_PUBLIC_EXPORTS = [
 ]
 
 const FORBIDDEN_ROOT_WECHAT_NEEDLES = [
-  `src/${WECHAT_ACTION_PREFIX}`,
-  `dist/${WECHAT_ACTION_PREFIX}`,
+	`src/${WECHAT_ACTION_PREFIX}`,
+	`dist/${WECHAT_ACTION_PREFIX}`,
   `${WECHAT_ACTION_PREFIX}:smoke`,
   `test/${WECHAT_ACTION_PREFIX}-`,
   `@tencent-weixin/${OPEN_CLAW_PACKAGE_SEGMENT}-weixin`,
   OPEN_CLAW_PACKAGE_SEGMENT,
   `${WECHAT_ACTION_PREFIX}-bind`,
   `${WECHAT_ACTION_PREFIX}-export-debug-bundle`,
-  `toggle-${WECHAT_ACTION_PREFIX}`,
+	`toggle-${WECHAT_ACTION_PREFIX}`,
+]
+
+const FORBIDDEN_ROOT_CODEX_NEEDLES = [
+	"OpenAICodexAccountSwitcher",
+	"CODEX_PROVIDER_DESCRIPTOR",
+	"codexAccountsPath",
+	"legacyCodexStorePath",
+	"codex-accounts.json",
+	"codex-store.json",
+	"codex-status",
+	"sync:codex-snapshot",
+	"test/codex-",
 ]
 
 const FORBIDDEN_README_WECHAT_PATTERNS = [
@@ -111,7 +123,7 @@ function extensionOf(filePath) {
 }
 
 async function collectTextEntries(rootDir, label) {
-  const entries = []
+	const entries = []
 
   async function visit(current) {
     const currentStat = await stat(current).catch((error) => {
@@ -135,17 +147,43 @@ async function collectTextEntries(rootDir, label) {
   }
 
   await visit(rootDir)
-  return entries
+	return entries
 }
 
-function assertNoForbiddenNeedles(entries) {
-  const failures = []
-  for (const entry of entries) {
-    const haystack = normalize(entry.text)
-    for (const needle of FORBIDDEN_ROOT_WECHAT_NEEDLES) {
-      if (haystack.includes(needle)) {
-        failures.push(`${entry.label}:${entry.path} contains ${needle}`)
-      }
+async function collectRelativePaths(rootDir) {
+	const paths = []
+
+	async function visit(current) {
+		const currentStat = await stat(current).catch((error) => {
+			if (error?.code === "ENOENT") return undefined
+			throw error
+		})
+		if (!currentStat) return
+
+		if (currentStat.isDirectory()) {
+			const children = await readdir(current)
+			for (const child of children) {
+				await visit(join(current, child))
+			}
+			return
+		}
+
+		if (!currentStat.isFile()) return
+		paths.push(normalize(current.slice(process.cwd().length + 1)))
+	}
+
+	await visit(rootDir)
+	return paths
+}
+
+function assertNoForbiddenNeedles(entries, needles = FORBIDDEN_ROOT_WECHAT_NEEDLES) {
+	const failures = []
+	for (const entry of entries) {
+		const haystack = normalize(entry.text)
+		for (const needle of needles) {
+			if (haystack.includes(needle)) {
+				failures.push(`${entry.label}:${entry.path} contains ${needle}`)
+			}
     }
   }
 
@@ -250,7 +288,17 @@ test("root package excludes WeChat runtime from source and dist", async () => {
     },
   ]
 
-  assertNoForbiddenNeedles(entries)
+	assertNoForbiddenNeedles(entries)
+	assertNoForbiddenNeedles(entries, FORBIDDEN_ROOT_CODEX_NEEDLES)
+})
+
+test("root tests exclude WeChat and OpenClaw fixture files", async () => {
+	const paths = await collectRelativePaths(join(process.cwd(), "test"))
+	const forbidden = paths.filter((filePath) =>
+		/(?:^|\/)(?:wechat-|ui-menu-wechat|fake-openclaw)|openclaw/i.test(filePath),
+	)
+
+	assert.deepEqual(forbidden, [])
 })
 
 test("README documents WeChat as an independent plugin boundary", async () => {
@@ -310,8 +358,9 @@ test("root package tarball excludes WeChat runtime and imports only Copilot root
       text: filePath,
     }))
 
-    assertNoForbiddenNeedles([...entries, ...manifestEntries])
-  } finally {
-    await rm(tempRoot, { force: true, recursive: true })
-  }
+		assertNoForbiddenNeedles([...entries, ...manifestEntries])
+		assertNoForbiddenNeedles([...entries, ...manifestEntries], FORBIDDEN_ROOT_CODEX_NEEDLES)
+	} finally {
+		await rm(tempRoot, { force: true, recursive: true })
+	}
 })
