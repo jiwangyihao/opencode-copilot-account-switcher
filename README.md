@@ -1,4 +1,4 @@
-# OpenCode GitHub Copilot Account Switcher
+# opencode-copilot-account-switcher
 
 [![npm version](https://img.shields.io/npm/v/opencode-copilot-account-switcher.svg)](https://www.npmjs.com/package/opencode-copilot-account-switcher)
 [![npm downloads](https://img.shields.io/npm/dw/opencode-copilot-account-switcher.svg)](https://www.npmjs.com/package/opencode-copilot-account-switcher)
