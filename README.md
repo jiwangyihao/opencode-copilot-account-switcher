@@ -7,11 +7,11 @@
 
 套件导航 / Suite: [OpenCode J Super Suite](https://github.com/jiwangyihao/opencode-j-super-suite)
 
-> **Latest in v0.15.0 | v0.15.0 最近更新**
+> **Latest in v1.0.0 | v1.0.0 最近更新**
 >
-> - Guided Loop Safety moved to standalone `opencode-loop-safety@0.1.0` | Guided Loop Safety 已拆分为独立插件 `opencode-loop-safety@0.1.0`
-> - Copilot no longer owns Loop Safety hooks, settings, or old slash commands | Copilot 插件不再内置 Loop Safety hooks、设置或旧 slash commands
-> - Separate versioned install commands are documented for Loop Safety / Wait / Notify | 已补充 Loop Safety / Wait / Notify 的独立明确版本安装命令
+> - Stable Copilot-only release for account switching, quota, routing, and Copilot request enhancements | 面向账号切换、配额、routing 与 Copilot 请求增强的稳定版
+> - Migration guidance for extracted plugins lives in the v1.0.0 Release Notes | 已拆分插件的迁移说明集中放在 v1.0.0 Release Notes
+> - README now focuses on install, usage, and Copilot-specific optional switches | README 聚焦安装、使用和 Copilot 专属可选开关
 
 [中文](#中文) | [English](#english)
 
@@ -39,24 +39,6 @@
 - **`/copilot-status`** — 默认开启；实验性 slash command，会先弹出“正在拉取”toast，再弹出 quota 结果或错误 toast
 - **无需模型配置** — 使用官方 provider，无需改模型
 
-## 包边界说明
-
-本包现在只描述和承载 GitHub Copilot 账号切换能力。如果你需要 OpenAI Codex / `openai` provider 的账号切换，请使用独立包 `opencode-openai-account-switcher`；它的 public entry 导出 `OpenAICodexAccountSwitcher`，并拥有 Codex store、status、retry、upstream snapshot 与 snapshot sync。
-
-`opencode-openai-account-switcher` 不包含 GitHub Copilot routing、header rewrite、模型账号映射或微信绑定动作。它的独立发布链路应包含 fresh 验证、npm publish、tag push 与 GitHub Release；root Copilot 包不随这条链路发布。
-
-## OpenCode Oncall 远程值守
-
-远程值守与微信 slash 交互已经拆分到独立插件 `opencode-oncall`。如果你需要微信绑定、通知、`/status`、`/todo`、`/reply`、`/allow`、`/recover`、debug bundle 或 OpenClaw smoke，请安装：
-
-```bash
-opencode plugin opencode-oncall@0.1.5 --force -g
-```
-
-安装后，上述远程值守能力由 `opencode-oncall` 提供；本 Copilot 插件继续聚焦账号、配额、routing 与 Copilot 请求增强。
-
----
-
 ## 安装
 
 <details open>
@@ -77,7 +59,7 @@ opencode plugin opencode-oncall@0.1.5 --force -g
 2. **执行其中带明确版本号的全局命令**。例如当前版本是：
 
    ```bash
-   opencode plugin opencode-copilot-account-switcher@0.15.0 --force -g
+   opencode plugin opencode-copilot-account-switcher@1.0.0 --force -g
    ```
 
 3. **如果你是刻意只想改当前项目目录下的 `.opencode`**，才使用不带 `-g` 的局部命令；否则默认不要省略 `-g`。
@@ -108,7 +90,7 @@ opencode plugin opencode-oncall@0.1.5 --force -g
 2. 直接执行那条命令。默认应使用带 `-g/--global` 的全局命令来更新你平时实际在用的 OpenCode 实例；如果你明确只想改当前项目目录下的 `.opencode`，才省略 `-g`。例如当前版本：
 
    ```bash
-   opencode plugin opencode-copilot-account-switcher@0.15.0 --force -g
+   opencode plugin opencode-copilot-account-switcher@1.0.0 --force -g
    ```
 
 3. 不要手动编辑 OpenCode 配置来安装或升级这个插件，也不要使用裸包名或 `latest`。
@@ -152,21 +134,6 @@ opencode auth login --provider github-copilot
 - **切换账号**
 - **删除账号**
 - **全部删除**
-
-## 独立安装 Loop Safety / Wait / Notify
-
-Guided Loop Safety 已从本 Copilot 插件抽离为独立插件。如果你的工作流需要双通道交互约束、无人值守等待或非阻塞进度通知，请按需分别安装：
-
-```bash
-opencode plugin opencode-loop-safety@0.1.0 --force -g
-opencode plugin opencode-wait@0.1.0 --force -g
-opencode plugin opencode-notify-tool@0.1.0 --force -g
-```
-
-安装后，Loop Safety 的策略注入、compact bypass、`/loop-safety` 菜单和相关设置由 `opencode-loop-safety` 拥有；Copilot 插件继续聚焦账号、配额和 Copilot 请求增强。
-
-
-如果你在切换 Copilot 账号后遇到瞬时 TLS/网络失败，或者遇到由旧 session item ID 残留引起的 `input[*].id too long` 错误，也可以在同一菜单中开启 Copilot Network Retry。它默认关闭。开启后，插件会先保留 upstream 官方 loader 生成的 `baseURL`、认证头和 `fetch` 行为，只在最后一跳 Copilot `fetch` 路径上做最小包装，把可重试的网络类失败归一化成 OpenCode 已有重试链路能识别的形态；对于明确命中的 `input[*].id too long` 400，还会回写命中的 session part，避免旧 item ID 持续污染后续重试。
 
 ## 实验性 `/copilot-status`
 
@@ -270,24 +237,6 @@ Default behavior and optional switches:
 - **`/copilot-status`** — enabled by default; experimental slash command that shows a loading toast first and then a quota result or error toast
 - **Zero model config** — no model changes required (official provider only)
 
-## Package Boundary
-
-This package now documents and owns GitHub Copilot account switching only. OpenAI Codex / `openai` provider account switching belongs to the standalone `opencode-openai-account-switcher` package, whose public entry exports `OpenAICodexAccountSwitcher` and owns the Codex store, status command, retry policy, upstream snapshot, and snapshot sync script.
-
-`opencode-openai-account-switcher` does not include GitHub Copilot routing, header rewrite, model-account assignments, or WeChat binding actions. Its standalone release chain should include fresh verification, npm publish, tag push, and a GitHub Release; the root Copilot package is not released as part of that chain.
-
-## OpenCode Oncall Remote Watch
-
-Remote oncall and WeChat slash interaction have moved to the standalone `opencode-oncall` plugin. Install it if you need WeChat binding, notifications, `/status`, `/todo`, `/reply`, `/allow`, `/recover`, debug bundle, or OpenClaw smoke support:
-
-```bash
-opencode plugin opencode-oncall@0.1.5 --force -g
-```
-
-After installation, those remote oncall features are provided by `opencode-oncall`; this Copilot plugin remains focused on accounts, quota, routing, and Copilot request enhancements.
-
----
-
 ## Installation
 
 <details open>
@@ -308,7 +257,7 @@ First read the latest GitHub Release for opencode-copilot-account-switcher and e
 2. **Run the exact versioned global command** from that section. For the current version, the command is:
 
    ```bash
-   opencode plugin opencode-copilot-account-switcher@0.15.0 --force -g
+   opencode plugin opencode-copilot-account-switcher@1.0.0 --force -g
    ```
 
 3. **Only omit `-g` if you intentionally want to update the current project's `.opencode` instead of the global OpenCode config.**
@@ -339,7 +288,7 @@ First read the latest GitHub Release for opencode-copilot-account-switcher and e
 2. Execute that command directly. By default, use the global command with `-g/--global`; only omit `-g` if you intentionally want to update the current project's `.opencode`. For the current version, the command is:
 
    ```bash
-   opencode plugin opencode-copilot-account-switcher@0.15.0 --force -g
+   opencode plugin opencode-copilot-account-switcher@1.0.0 --force -g
    ```
 
 3. Do not install or upgrade this plugin by hand-editing the OpenCode config, and do not use a bare package name or `latest`.
@@ -383,23 +332,6 @@ You will see an interactive menu. Use the built-in language switch action if you
 - **Switch account**
 - **Delete account**
 - **Delete all**
-
-## Installing Loop Safety / Wait / Notify Separately
-
-Guided Loop Safety has moved out of this Copilot plugin into a standalone plugin. If your workflow needs dual-channel interaction policy, unattended waits, or non-blocking progress notifications, install the companion plugins as needed:
-
-```bash
-opencode plugin opencode-loop-safety@0.1.0 --force -g
-opencode plugin opencode-wait@0.1.0 --force -g
-opencode plugin opencode-notify-tool@0.1.0 --force -g
-```
-
-After installation, policy injection, compact bypass, the `/loop-safety` menu, and related settings are owned by `opencode-loop-safety`; this Copilot plugin remains focused on accounts, quota, and Copilot request enhancements.
-
-
-If you switch Copilot accounts and then hit transient TLS/network failures or `input[*].id too long` errors caused by stale session item IDs, enable Copilot Network Retry from the same menu. It is off by default. When enabled, the plugin keeps the official Copilot header/baseURL behavior from the upstream loader, only wraps the final Copilot `fetch` path, and converts retryable network-like failures into a shape that OpenCode already treats as retryable. It also repairs the matched session part after an `input[*].id too long` 400 so later retries can recover instead of repeatedly failing on stale item IDs.
-
-You can also enable Synthetic Agent Initiator from the same menu. It is off by default. From a user perspective, it changes the request marker by sending or overriding `x-initiator=agent` so requests follow an early version of upstream's still-in-development synthetic initiator semantics instead of the current stable upstream behavior; it does not change who makes the final billing decision, and it does not guarantee the platform will treat those requests as non-billable.
 
 ## Experimental `/copilot-status`
 

@@ -8,7 +8,7 @@ import { promisify } from "node:util"
 
 const execFileAsync = promisify(execFile)
 
-const ROOT_WECHAT_INSTALL_COMMAND = "opencode plugin opencode-wechat@0.1.0 --force -g"
+const ONCALL_INSTALL_COMMAND = "opencode plugin opencode-oncall@0.1.5 --force -g"
 const ALLOWED_ROOT_PUBLIC_EXPORTS = ["CopilotAccountSwitcher"]
 const WECHAT_ACTION_PREFIX = ["we", "chat"].join("")
 const OPEN_CLAW_PACKAGE_SEGMENT = ["open", "claw"].join("")
@@ -203,13 +203,6 @@ function assertOnlyAllowedRootExports(names) {
   assertNoWechatPublicExportNames(sortedNames)
 }
 
-function readSection(content, startHeading, endHeading) {
-  const startIndex = content.indexOf(startHeading)
-  assert.notEqual(startIndex, -1, startHeading)
-  const endIndex = endHeading ? content.indexOf(endHeading, startIndex + startHeading.length) : -1
-  return endIndex === -1 ? content.slice(startIndex) : content.slice(startIndex, endIndex)
-}
-
 async function createDependencyStub(stubsRoot, stub) {
   const stubDir = join(stubsRoot, ...stub.name.split("/"))
   await mkdir(stubDir, { recursive: true })
@@ -301,16 +294,15 @@ test("root tests exclude WeChat and OpenClaw fixture files", async () => {
 	assert.deepEqual(forbidden, [])
 })
 
-test("README documents WeChat as an independent plugin boundary", async () => {
+test("release notes document Oncall migration outside README", async () => {
   const readme = await readFile(join(process.cwd(), "README.md"), "utf8")
-  const chineseWechatSection = readSection(readme, "## 微信远程交互", "---")
-  const englishWechatSection = readSection(readme, "## WeChat Remote Interaction", "---")
+  const releaseNotes = await readFile(join(process.cwd(), "docs", "release-notes-v1.0.0.md"), "utf8")
 
-  assert.match(readme, /## 微信远程交互(?:\r?\n|$)/)
-  assert.match(readme, /## WeChat Remote Interaction\b/)
-  assert.match(readme, new RegExp(`\\b${ROOT_WECHAT_INSTALL_COMMAND.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`))
-  assert.match(chineseWechatSection, new RegExp(`\\b${ROOT_WECHAT_INSTALL_COMMAND.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`))
-  assert.match(englishWechatSection, new RegExp(`\\b${ROOT_WECHAT_INSTALL_COMMAND.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`))
+  assert.doesNotMatch(readme, /## 微信远程交互(?:\r?\n|$)/)
+  assert.doesNotMatch(readme, /## WeChat Remote Interaction\b/)
+  assert.match(releaseNotes, /## 注意事项(?:\r?\n|$)/)
+  assert.match(releaseNotes, /远程值守 \/ 微信 slash 交互/)
+  assert.match(releaseNotes, new RegExp(`\\b${ONCALL_INSTALL_COMMAND.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`))
 
   const failures = []
   for (const pattern of FORBIDDEN_README_WECHAT_PATTERNS) {
